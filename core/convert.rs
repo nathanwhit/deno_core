@@ -1,8 +1,9 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
-use crate::error::StdAnyError;
+use crate::error::{AnyError, StdAnyError};
 use crate::runtime::ops;
 use std::convert::Infallible;
+use std::mem::MaybeUninit;
 
 /// A conversion from a rust value to a v8 value.
 ///
@@ -63,7 +64,7 @@ use std::convert::Infallible;
 /// and they have to be managed by the V8 garbage collector.
 /// Tuples, on the other hand, are keyed by `smi`s, which are immediates
 /// and don't require allocation or garbage collection.
-pub trait ToV8<'a> {
+pub trait ToV8<'a, S = ()> {
   type Error: std::error::Error + Send + Sync + 'static;
 
   /// Converts the value to a V8 value.
@@ -272,4 +273,92 @@ impl<'a> FromV8<'a> for bool {
   ) -> Result<Self, Self::Error> {
     Ok(value.is_true())
   }
+}
+
+impl<'a, T> ToV8<'a> for Vec<T>
+where
+  T: ToV8<'a>,
+{
+  type Error = T::Error;
+
+  fn to_v8(
+    self,
+    scope: &mut v8::HandleScope<'a>,
+  ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+    let buf = self
+      .into_iter()
+      .map(|v| v.to_v8(scope))
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(v8::Array::new_with_elements(scope, &buf).into())
+  }
+}
+
+impl<'a, T> FromV8<'a> for Vec<T>
+where
+  T: FromV8<'a>,
+{
+  type Error = StdAnyError;
+
+  fn from_v8(
+    scope: &mut v8::HandleScope<'a>,
+    value: v8::Local<'a, v8::Value>,
+  ) -> Result<Self, Self::Error> {
+    let arr = v8::Local::<v8::Array>::try_from(value).map_err(|e| {
+      crate::error::type_error(format!("Failed to convert from V8: {e}"))
+    })?;
+    let len = arr.length() as usize;
+
+    let mut out = maybe_uninit_vec::<T>(len);
+
+    for i in 0..len {
+      let v = arr.get_index(scope, i as u32).unwrap();
+      match T::from_v8(scope, v) {
+        Ok(v) => {
+          out[i].write(v);
+        }
+        Err(e) => {
+          // need to drop the elements we've already written
+          for j in 0..i {
+            // SAFETY: we've written to these elements
+            unsafe {
+              out[j].assume_init_drop();
+            }
+          }
+          return Err(AnyError::from(e).into());
+        }
+      }
+    }
+
+    // SAFETY: all elements have been initialized, and `MaybeUninit<T>`
+    // is transmutable to `T`
+    let out = unsafe { transmute_vec::<MaybeUninit<T>, T>(out) };
+
+    Ok(out)
+  }
+}
+
+fn maybe_uninit_vec<T>(len: usize) -> Vec<std::mem::MaybeUninit<T>> {
+  let mut v = Vec::with_capacity(len);
+  // SAFETY: `MaybeUninit` is allowed to be uninitialized and
+  // the length is the same as the capacity.
+  unsafe {
+    v.set_len(len);
+  }
+  v
+}
+
+/// Transmutes a `Vec` of one type to a `Vec` of another type.
+///
+/// # Safety
+/// `T` must be transmutable to `U`
+unsafe fn transmute_vec<T, U>(v: Vec<T>) -> Vec<U> {
+  debug_assert!(std::mem::size_of::<T>() == std::mem::size_of::<U>());
+  debug_assert!(std::mem::align_of::<T>() == std::mem::align_of::<U>());
+
+  // make sure the original vector is not dropped
+  let mut v = std::mem::ManuallyDrop::new(v);
+  let len = v.len();
+  let cap = v.capacity();
+  let ptr = v.as_mut_ptr();
+  unsafe { Vec::from_raw_parts(ptr as *mut U, len, cap) }
 }
