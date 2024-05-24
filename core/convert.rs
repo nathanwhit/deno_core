@@ -318,10 +318,10 @@ where
         }
         Err(e) => {
           // need to drop the elements we've already written
-          for j in 0..i {
-            // SAFETY: we've written to these elements
+          for elem in out.iter_mut().take(i) {
+            // SAFETY: we've initialized these elements
             unsafe {
-              out[j].assume_init_drop();
+              elem.assume_init_drop();
             }
           }
           return Err(AnyError::from(e).into());
@@ -360,5 +360,8 @@ unsafe fn transmute_vec<T, U>(v: Vec<T>) -> Vec<U> {
   let len = v.len();
   let cap = v.capacity();
   let ptr = v.as_mut_ptr();
+
+  // SAFETY: the original vector is not dropped, the caller upholds the
+  // transmutability invariants, and the length and capacity are not changed.
   unsafe { Vec::from_raw_parts(ptr as *mut U, len, cap) }
 }
