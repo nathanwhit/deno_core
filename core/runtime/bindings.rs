@@ -1,5 +1,6 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 use anyhow::Context;
+use std::borrow::Cow;
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
 use std::path::PathBuf;
@@ -171,6 +172,15 @@ pub fn script_origin<'a>(
   s: &mut v8::HandleScope<'a>,
   resource_name: v8::Local<'a, v8::String>,
 ) -> v8::ScriptOrigin<'a> {
+  // eprintln!(
+  //   "script_origin is: {}",
+  //   resource_name.to_rust_string_lossy(s)
+  // );
+  assert!(
+    !resource_name.to_rust_string_lossy(s).starts_with("file://"),
+    "bad file url {}",
+    resource_name.to_rust_string_lossy(s)
+  );
   let source_map_url = v8::String::empty(s);
   v8::ScriptOrigin::new(
     s,
@@ -474,6 +484,12 @@ pub extern "C" fn host_initialize_import_meta_object_callback(
     .get_type_by_module(&module_global)
     .expect("Module not found");
 
+  let name = if name.starts_with('/') {
+    format!("file://{name}")
+  } else {
+    name
+  };
+
   let url_key = URL.v8_string(scope);
   let url_val = v8::String::new(scope, &name).unwrap();
   meta.create_data_property(scope, url_key.into(), url_val.into());
@@ -520,7 +536,8 @@ fn maybe_add_import_meta_filename_dirname(
   name: &str,
 ) {
   // For `file:` URL we provide additional `filename` and `dirname` values
-  let Ok(name_url) = Url::parse(name) else {
+  let Ok(name_url) = Url::parse(&name) else {
+    eprintln!("Bad file path {name}");
     return;
   };
 

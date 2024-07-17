@@ -19,6 +19,7 @@ use crate::OpState;
 use anyhow::Error;
 use serde::Deserialize;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use v8::ValueDeserializerHelper;
@@ -264,13 +265,21 @@ pub fn op_eval_context<'a>(
   source: v8::Local<'a, v8::Value>,
   #[string] specifier: String,
 ) -> Result<v8::Local<'a, v8::Value>, Error> {
+  // eprintln!("eval_context: {specifier}");
   let out = v8::Array::new(scope, 2);
   let state = JsRuntime::state_from(scope);
   let tc_scope = &mut v8::TryCatch::new(scope);
   let source = v8::Local::<v8::String>::try_from(source)
     .map_err(|_| type_error("Invalid source"))?;
   let specifier = resolve_url(&specifier)?;
-  let specifier_v8 = v8::String::new(tc_scope, specifier.as_str()).unwrap();
+  let specifier_v8 = v8::String::new(
+    tc_scope,
+    specifier
+      .as_str()
+      .strip_prefix("file://")
+      .unwrap_or(specifier.as_str()),
+  )
+  .unwrap();
   let origin = script_origin(tc_scope, specifier_v8);
 
   let (maybe_script, maybe_code_cache_hash) = state
@@ -1060,8 +1069,13 @@ pub fn op_apply_source_map(
     return Err(type_error("retBuf must be 8 bytes"));
   }
   let mut source_mapper = state.source_mapper.borrow_mut();
+  let file_name = if file_name.starts_with('/') {
+    Cow::Owned(format!("file://{}", file_name))
+  } else {
+    Cow::Borrowed(file_name)
+  };
   let application =
-    source_mapper.apply_source_map(file_name, line_number, column_number);
+    source_mapper.apply_source_map(&file_name, line_number, column_number);
   match application {
     SourceMapApplication::Unchanged => Ok(0),
     SourceMapApplication::LineAndColumn {

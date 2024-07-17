@@ -167,6 +167,10 @@
       if (res >= 2) {
         callSite.fileName = op_apply_source_map_filename();
       }
+      // add back the file:// prefix to avoid updating a bunch of deno tests that expect a certain format
+      if (callSite.fileName && (callSite.fileName.startsWith("/") || callSite.fileName.startsWith("\\") || callSite.fileName.startsWith("."))) {
+        callSite.fileName = "file://" + callSite.fileName;
+      }
       ArrayPrototypePush(callSiteEvals, callSite);
       stack += `\n    at ${formatCallSiteEval(callSite)}`;
     }
@@ -175,4 +179,83 @@
   }
 
   Error.prepareStackTrace = prepareStackTrace;
+
+// potential solution for bindings issue, causes big perf hit to
+// Error.captureStackTrace but doesn't effect `new Error`. Also doesn't fix callsites package. 
+//
+// const originalCaptureStackTrace = Error.captureStackTrace;
+// const originalPrepareStackTrace = Error.prepareStackTrace;
+
+// Error.captureStackTrace = function (err, cons) {
+//   const prepareStackTrace = Error.prepareStackTrace;
+
+//   if (prepareStackTrace == originalPrepareStackTrace) {
+//     return originalCaptureStackTrace(err, cons);
+//   }
+//   Error.prepareStackTrace = function (error, stack) {
+//     for (let i = 0; i < stack.length; i++) {
+//       const frame = stack[i];
+//       const newFrame = {
+//         getFileName() {
+//           let fileName = frame.getFileName();
+//           if (fileName.indexOf("file://") === 0) {
+//             fileName = fileName.slice(7);
+//           }
+//           return fileName;
+//         },
+//         getThis() {
+//           return frame.getThis();
+//         },
+//         getTypeName() {
+//           return frame.getTypeName();
+//         },
+//         getFunction() {
+//           return frame.getFunction();
+//         },
+//         getFunctionName() {
+//           return frame.getFunctionName();
+//         },
+//         getMethodName() {
+//           return frame.getMethodName();
+//         },
+//         getLineNumber() {
+//           return frame.getLineNumber();
+//         },
+//         getColumnNumber() {
+//           return frame.getColumnNumber();
+//         },
+//         getEvalOrigin() {
+//           return frame.getEvalOrigin();
+//         },
+//         isToplevel() {
+//           return frame.isToplevel();
+//         },
+//         isEval() {
+//           return frame.isEval();
+//         },
+//         isNative() {
+//           return frame.isNative();
+//         },
+//         isConstructor() {
+//           return frame.isConstructor();
+//         },
+//         isAsync() {
+//           return frame.isAsync();
+//         },
+//         isPromiseAll() {
+//           return frame.isPromiseAll();
+//         },
+//         getPromiseIndex() {
+//           return frame.getPromiseIndex();
+//         },
+//       };
+//       stack[i] = newFrame;
+//     }
+//     return prepareStackTrace(error, stack.slice(1));
+//   };
+
+//   return originalCaptureStackTrace(err, cons);
+// };
+
+
 })(this);

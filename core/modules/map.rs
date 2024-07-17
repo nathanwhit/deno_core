@@ -245,6 +245,7 @@ impl ModuleMap {
     name: &str,
     requested_module_type: impl AsRef<RequestedModuleType>,
   ) -> Option<ModuleId> {
+    let name = name.strip_prefix("file://").unwrap_or(name);
     self.data.borrow().get_id(name, requested_module_type)
   }
 
@@ -596,6 +597,11 @@ impl ModuleMap {
       }
     }
 
+    let name = if name.starts_with("file://") {
+      name.strip_prefix("file://").unwrap().to_string().into()
+    } else {
+      name
+    };
     let name_str = name.v8_string(scope);
     let source_str = source.v8_string(scope);
 
@@ -806,13 +812,32 @@ impl ModuleMap {
 
     let referrer_global = v8::Global::new(scope, referrer);
 
-    let referrer_name = module_map
+    let mut referrer_name = module_map
       .data
       .borrow()
       .get_name_by_module(&referrer_global)
       .expect("ModuleInfo not found");
 
+    if referrer_name.starts_with('/') {
+      let mut buf = String::with_capacity(referrer_name.len() + 7);
+      buf.push_str("file://");
+      buf.push_str(&referrer_name);
+      referrer_name = buf;
+    }
+
     let specifier_str = specifier.to_rust_string_lossy(scope);
+    // eprintln!(
+    //   "module_resolve_callback: {} from {}",
+    //   specifier_str, referrer_name
+    // );
+    let specifier_str = if specifier_str.starts_with('/') {
+      let mut buf = String::with_capacity(specifier_str.len() + 7);
+      buf.push_str("file://");
+      buf.push_str(&specifier_str);
+      buf
+    } else {
+      specifier_str
+    };
 
     let assertions = parse_import_attributes(
       scope,
@@ -861,7 +886,13 @@ impl ModuleMap {
       return Err(generic_error(msg));
     }
 
-    self.loader.borrow().resolve(specifier, referrer, kind)
+    let referrer = if referrer.starts_with('/') {
+      Cow::Owned(format!("file://{}", referrer))
+    } else {
+      Cow::Borrowed(referrer)
+    };
+    // eprintln!("loading {specifier} from {referrer}");
+    self.loader.borrow().resolve(specifier, &referrer, kind)
   }
 
   /// Called by `module_resolve_callback` during module instantiation.
@@ -880,6 +911,8 @@ impl ModuleMap {
           return None;
         }
       };
+
+    // eprintln!("resolve_callback resolved {specifier} to {resolved_specifier}");
 
     let module_type =
       get_requested_module_type_from_attributes(&import_attributes);

@@ -310,6 +310,7 @@ impl JsRealm {
     name: impl IntoModuleName,
     source_code: impl IntoModuleCodeString,
   ) -> Result<v8::Global<v8::Value>, Error> {
+    // eprintln!("execute_script");
     let scope = &mut self.0.handle_scope(isolate);
 
     let source = source_code.into_module_code().v8_string(scope);
