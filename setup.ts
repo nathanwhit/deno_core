@@ -227,21 +227,18 @@ for (const file of filesToUpdate) {
   const lines = content.split("\n");
   const newLines = [];
   const name = scenario.toUpperCase();
-  const other = (scenario === "js" ? "objwrap" : "js").toUpperCase();
   let remove = false;
   let alreadyPushed = false;
   let i = 0;
   while (i < lines.length) {
     const current = lines[i];
     if (
-      // (scenario === "clean" && current.includes("END INSERT HERE:")) ||
       current.includes("END INSERT HERE: ")
     ) {
       remove = false;
       alreadyPushed = true;
       newLines.push(current);
     } else if (
-      // (scenario === "clean" && current.includes("INSERT HERE:")) ||
       current.includes("INSERT HERE: ")
     ) {
       remove = true;
@@ -267,6 +264,5 @@ for (const file of filesToUpdate) {
 
     i++;
   }
-  Deno.writeTextFileSync(file + ".bak", content);
   Deno.writeTextFileSync(file, newLines.join("\n"));
 }
