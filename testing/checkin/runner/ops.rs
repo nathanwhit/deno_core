@@ -157,6 +157,15 @@ impl DOMPoint {
   #[setter]
   fn x(&self, _: f64) {}
 
+  #[setter]
+  fn y(&self, _: f64) {}
+
+  #[setter]
+  fn z(&self, _: f64) {}
+
+  #[setter]
+  fn w(&self, _: f64) {}
+
   #[getter]
   fn y(&self) -> f64 {
     self.y
@@ -180,3 +189,6 @@ impl DOMPoint {
 pub fn op_nop_generic<T: SomeType + 'static>(state: &mut OpState) {
   state.take::<T>();
 }
+
+// INSERT HERE: OBJWRAP
+// END INSERT HERE: OBJWRAP

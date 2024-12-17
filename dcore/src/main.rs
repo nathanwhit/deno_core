@@ -8,6 +8,7 @@ use deno_core::anyhow::Error;
 
 use deno_core::RuntimeOptions;
 use deno_core_testing::create_runtime_from_snapshot;
+use deno_core_testing::create_runtime_from_snapshot_with_options;
 
 use std::net::SocketAddr;
 
@@ -51,12 +52,13 @@ fn main() -> Result<(), Error> {
     );
     (
       Some(summary),
-      deno_core_testing::create_runtime_from_snapshot_with_options(
+      create_runtime_from_snapshot_with_options(
         SNAPSHOT,
         inspector_server.is_some(),
         vec![],
         RuntimeOptions {
           op_metrics_factory_fn: Some(op_metrics_factory_fn),
+          skip_op_registration: true,
           ..Default::default()
         },
       ),
@@ -64,10 +66,14 @@ fn main() -> Result<(), Error> {
   } else {
     (
       None,
-      create_runtime_from_snapshot(
+      create_runtime_from_snapshot_with_options(
         SNAPSHOT,
         inspector_server.is_some(),
         vec![],
+        RuntimeOptions {
+          skip_op_registration: true,
+          ..Default::default()
+        },
       ),
     )
   };
