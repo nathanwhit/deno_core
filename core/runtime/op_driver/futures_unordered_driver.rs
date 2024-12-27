@@ -1,4 +1,6 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+mod futures_unordered_unsync;
+
 use super::future_arena::FutureAllocation;
 use super::future_arena::FutureArena;
 use super::op_results::*;
@@ -16,6 +18,7 @@ use futures::stream::FuturesUnordered;
 use futures::task::noop_waker_ref;
 use futures::FutureExt;
 use futures::Stream;
+// use futures_unordered_unsync::FuturesUnordered;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
