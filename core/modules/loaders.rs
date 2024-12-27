@@ -246,14 +246,21 @@ impl ModuleLoader for ExtModuleLoader {
   fn load(
     &self,
     specifier: &ModuleSpecifier,
-    _maybe_referrer: Option<&ModuleSpecifier>,
+    maybe_referrer: Option<&ModuleSpecifier>,
     _is_dyn_import: bool,
     _requested_module_type: RequestedModuleType,
   ) -> ModuleLoadResponse {
     let mut sources = self.sources.borrow_mut();
     let source = match sources.remove(specifier.as_str()) {
       Some(source) => source,
-      None => return ModuleLoadResponse::Sync(Err(anyhow!("Specifier \"{}\" was not passed as an extension module and was not included in the snapshot.", specifier))),
+      None => return ModuleLoadResponse::Sync(
+        Err(
+          anyhow!(
+            "Specifier \"{}\"{} was not passed as an extension module and was not included in the snapshot.",
+            specifier,
+            maybe_referrer.map(|referrer| Cow::Owned(format!(" (referred to by {})", referrer))).unwrap_or(Cow::Borrowed("")))
+          ),
+        )
     };
     ModuleLoadResponse::Sync(Ok(ModuleSource::new(
       ModuleType::JavaScript,
