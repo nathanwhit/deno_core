@@ -1,0 +1,7 @@
+[build]
+rustflags = [
+  # "-Zsplit-lto-unit",
+  "-Clinker-plugin-lto",
+  "-Clink-arg=-fuse-ld=/opt/homebrew/Cellar/lld/19.1.6/bin/ld64.lld",
+  "-Clinker=/Users/nathanwhit/Documents/Code/deno_core/macos-linker.sh",
+]

@@ -1,5 +1,7 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::ops::Range;
+
 use crate::op2::signature::*;
 use proc_macro_rules::rules;
 
@@ -9,6 +11,7 @@ use syn::ReturnType;
 
 use syn::Type;
 use syn::TypeParamBound;
+use syn::TypePath;
 
 /// One level of type unwrapping for a return value. We cannot rely on `proc-macro-rules` to correctly
 /// unwrap `impl Future<...>`, so we do it by hand.
@@ -16,6 +19,50 @@ enum UnwrappedReturn {
   Type(Type),
   Result(Type),
   Future(Type),
+}
+
+pub struct GenericType {
+  pub name: syn::Path,
+  pub generics:
+    syn::punctuated::Punctuated<syn::GenericArgument, syn::Token![,]>,
+}
+
+impl GenericType {
+  fn type_arg(&self, idx: usize) -> Option<&syn::Type> {
+    if let Some(syn::GenericArgument::Type(ty)) = &self.generics.get(idx) {
+      Some(ty)
+    } else {
+      None
+    }
+  }
+}
+
+fn parse_generic_type(
+  ty: &TypePath,
+  name: &str,
+  num_generics: Range<usize>,
+) -> Option<GenericType> {
+  if let Some(segment) = ty.path.segments.last() {
+    if segment.ident.to_string() != name {
+      return None;
+    }
+    let (count, args) = match &segment.arguments {
+      syn::PathArguments::None => (0, Default::default()),
+      syn::PathArguments::AngleBracketed(angle) => {
+        (angle.args.len(), angle.args.clone())
+      }
+      syn::PathArguments::Parenthesized(_) => return None,
+    };
+    if !num_generics.contains(&count) {
+      return None;
+    }
+    Some(GenericType {
+      name: ty.path.clone(),
+      generics: args,
+    })
+  } else {
+    None
+  }
 }
 
 fn unwrap_return(ty: &Type) -> Result<UnwrappedReturn, RetError> {
@@ -39,21 +86,16 @@ fn unwrap_return(ty: &Type) -> Result<UnwrappedReturn, RetError> {
         )))
       }
     }
-    Type::Path(ty) => {
-      rules!(ty.to_token_stream() => {
-        // x::y::Result<Value>, like io::Result and other specialty result types
-        ($($_package:ident ::)* Result < $ty:ty $(,)? >) => {
-          Ok(UnwrappedReturn::Result(ty))
+    Type::Path(ty_path) => {
+      if let Some(result) = parse_generic_type(ty_path, "Result", 1..3) {
+        if let Some(arg) = result.type_arg(0) {
+          Ok(UnwrappedReturn::Result(arg.clone()))
+        } else {
+          Ok(UnwrappedReturn::Type(ty.clone()))
         }
-        // x::y::Result<Value, Error>
-        ($($_package:ident ::)* Result < $ty:ty, $_error:ty $(,)? >) => {
-          Ok(UnwrappedReturn::Result(ty))
-        }
-        // Everything else
-        ($ty:ty) => {
-          Ok(UnwrappedReturn::Type(ty))
-        }
-      })
+      } else {
+        Ok(UnwrappedReturn::Type(ty.clone()))
+      }
     }
     Type::Tuple(_) => Ok(UnwrappedReturn::Type(ty.clone())),
     Type::Ptr(_) => Ok(UnwrappedReturn::Type(ty.clone())),

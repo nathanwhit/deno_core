@@ -10,6 +10,7 @@ use quote::quote;
 use quote::ToTokens;
 use quote::TokenStreamExt;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use syn::parse::Parse;
 use syn::parse::ParseStream;
 
@@ -1245,61 +1246,291 @@ pub fn is_attribute_special(attr: &Attribute) -> bool {
     || attr.path().is_ident("meta")
 }
 
+macro_rules! impl_name {
+  ($id: ident, $name: literal) => {
+    impl Name for $id {
+      fn name() -> &'static str {
+        stringify!($name)
+      }
+    }
+  };
+}
+macro_rules! ident {
+    ($id: ident => $name: literal) => {
+      #[allow(non_camel_case_types)]
+      struct $id;
+      impl_name!($id, $name);
+    };
+    ($v: vis $id: ident => $name: literal) => {
+      #[allow(non_camel_case_types)]
+      $v struct $id;
+      impl_name!($id, $name);
+    };
+}
+
+struct WebIdlDefault {
+  default_kw: syn::Token![default],
+  eq: syn::Token![=],
+  default: syn::Expr,
+}
+
+impl syn::parse::Parse for WebIdlDefault {
+  fn parse(input: ParseStream) -> syn::Result<Self> {
+    Ok(Self {
+      default_kw: input.parse()?,
+      eq: input.parse()?,
+      default: input.parse()?,
+    })
+  }
+}
+
+struct WebIdlOptionPair {
+  key: Ident,
+  eq: syn::Token![=],
+  value: proc_macro2::Literal,
+}
+
+ident!(Options => "options");
+
+struct WebIdlOptions {
+  options_ident: IdentNamed<Options>,
+  l_paren: syn::token::Paren,
+  options: syn::punctuated::Punctuated<WebIdlOptionPair, syn::Token![,]>,
+}
+
+struct WebIdlAttr {
+  options: Option<WebIdlOptions>,
+  comma: Option<syn::Token![,]>,
+  default: Option<WebIdlDefault>,
+}
+
+impl syn::parse::Parse for WebIdlOptionPair {
+  fn parse(input: ParseStream) -> syn::Result<Self> {
+    Ok(Self {
+      key: input.parse()?,
+      eq: input.parse()?,
+      value: input.parse()?,
+    })
+  }
+}
+
+trait Name {
+  fn name() -> &'static str;
+}
+
+struct IdentNamed<T> {
+  ident: syn::Ident,
+  _name: PhantomData<T>,
+}
+
+impl<T: Name> syn::parse::Parse for IdentNamed<T> {
+  fn parse(input: ParseStream) -> syn::Result<Self> {
+    let ident: syn::Ident = input.parse()?;
+    if ident.to_string() != T::name() {
+      Err(syn::Error::new(
+        ident.span(),
+        format!("expected `{}`", T::name()),
+      ))
+    } else {
+      Ok(Self {
+        ident,
+        _name: PhantomData,
+      })
+    }
+  }
+}
+
+impl syn::parse::Parse for WebIdlOptions {
+  fn parse(input: ParseStream) -> syn::Result<Self> {
+    let content;
+    Ok(Self {
+      options_ident: input.parse()?,
+      l_paren: syn::parenthesized!(content in input),
+      options: content
+        .parse_terminated(WebIdlOptionPair::parse, syn::Token![,])?,
+    })
+  }
+}
+
+impl syn::parse::Parse for WebIdlAttr {
+  fn parse(input: ParseStream) -> syn::Result<Self> {
+    let options = if input.peek(syn::Ident) {
+      Some(input.parse()?)
+    } else {
+      None
+    };
+    let comma = if input.peek(syn::Token![,]) {
+      Some(input.parse()?)
+    } else {
+      None
+    };
+    let default = if input.peek(syn::Token![default]) {
+      Some(input.parse()?)
+    } else {
+      None
+    };
+    Ok(Self {
+      options,
+      comma,
+      default,
+    })
+  }
+}
+
+fn parse_buffer_attr(
+  attr: &Attribute,
+  source: BufferSource,
+) -> Result<AttributeModifier, AttributeError> {
+  if let syn::Meta::Path(_) = &attr.meta {
+    return Ok(AttributeModifier::Buffer(BufferMode::Default, source));
+  }
+  let ident = attr
+    .meta
+    .path()
+    .get_ident()
+    .ok_or_else(|| AttributeError::InvalidAttribute(stringify_token(attr)))?;
+
+  let args = attr
+    .parse_args::<Ident>()
+    .map_err(|e| AttributeError::InvalidAttribute(e.to_string()))?;
+  match args.to_string().as_str() {
+    "unsafe" => Ok(AttributeModifier::Buffer(BufferMode::Unsafe, source)),
+    "copy" => Ok(AttributeModifier::Buffer(BufferMode::Copy, source)),
+    "detach" => Ok(AttributeModifier::Buffer(BufferMode::Detach, source)),
+    _ => Err(AttributeError::InvalidAttribute(format!(
+      "{}({})",
+      ident, args
+    ))),
+  }
+}
+
 /// Parses an attribute, returning None if this is an attribute we support but is
 /// otherwise unknown (ie: doc comments).
 fn parse_attribute(
   attr: &Attribute,
 ) -> Result<Option<AttributeModifier>, AttributeError> {
-  let tokens = attr.into_token_stream();
   if matches!(attr.style, AttrStyle::Inner(_)) {
     return Err(AttributeError::InvalidInnerAttribute);
   }
-  let res = std::panic::catch_unwind(|| {
-    rules!(tokens => {
-      (#[bigint]) => Some(AttributeModifier::Bigint),
-      (#[number]) => Some(AttributeModifier::Number),
-      (#[serde]) => Some(AttributeModifier::Serde),
-      (#[webidl]) => Some(AttributeModifier::WebIDL { options: vec![],default: None }),
-      (#[webidl($(default = $default:expr)?$($(,)? options($($key:ident = $value:literal),*))?)]) => Some(AttributeModifier::WebIDL { options: key.map(|key| key.into_iter().zip(value.unwrap().into_iter()).map(|v| WebIDLPairs(v.0, v.1)).collect()).unwrap_or_default(), default: default.map(WebIDLDefault) }),
-      (#[smi]) => Some(AttributeModifier::Smi),
-      (#[string]) => Some(AttributeModifier::String(StringMode::Default)),
-      (#[string(onebyte)]) => Some(AttributeModifier::String(StringMode::OneByte)),
-      (#[state]) => Some(AttributeModifier::State),
-      (#[varargs]) => Some(AttributeModifier::VarArgs),
-      (#[buffer]) => Some(AttributeModifier::Buffer(BufferMode::Default, BufferSource::TypedArray)),
-      (#[buffer(unsafe)]) => Some(AttributeModifier::Buffer(BufferMode::Unsafe, BufferSource::TypedArray)),
-      (#[buffer(copy)]) => Some(AttributeModifier::Buffer(BufferMode::Copy, BufferSource::TypedArray)),
-      (#[buffer(detach)]) => Some(AttributeModifier::Buffer(BufferMode::Detach, BufferSource::TypedArray)),
-      (#[anybuffer]) => Some(AttributeModifier::Buffer(BufferMode::Default, BufferSource::Any)),
-      (#[anybuffer(unsafe)]) => Some(AttributeModifier::Buffer(BufferMode::Unsafe, BufferSource::Any)),
-      (#[anybuffer(copy)]) => Some(AttributeModifier::Buffer(BufferMode::Copy, BufferSource::Any)),
-      (#[anybuffer(detach)]) => Some(AttributeModifier::Buffer(BufferMode::Detach, BufferSource::Any)),
-      (#[arraybuffer]) => Some(AttributeModifier::Buffer(BufferMode::Default, BufferSource::ArrayBuffer)),
-      (#[arraybuffer(unsafe)]) => Some(AttributeModifier::Buffer(BufferMode::Unsafe, BufferSource::ArrayBuffer)),
-      (#[arraybuffer(copy)]) => Some(AttributeModifier::Buffer(BufferMode::Copy, BufferSource::ArrayBuffer)),
-      (#[arraybuffer(detach)]) => Some(AttributeModifier::Buffer(BufferMode::Detach, BufferSource::ArrayBuffer)),
-      (#[global]) => Some(AttributeModifier::Global),
-      (#[cppgc]) => Some(AttributeModifier::CppGcResource),
-      (#[to_v8]) => Some(AttributeModifier::ToV8),
-      (#[from_v8]) => Some(AttributeModifier::FromV8),
-      (#[required ($_attr:literal)]) => Some(AttributeModifier::Ignore),
-      (#[rename ($_attr:literal)]) => Some(AttributeModifier::Ignore),
-      (#[method ($_attr:literal)]) => Some(AttributeModifier::Ignore),
-      (#[method]) => Some(AttributeModifier::Ignore),
-      (#[getter]) => Some(AttributeModifier::Ignore),
-      (#[setter]) => Some(AttributeModifier::Ignore),
-      (#[fast]) => Some(AttributeModifier::Ignore),
-      // async is a keyword and does not work as #[async] so we use #[async_method] instead
-      (#[async_method]) => Some(AttributeModifier::Ignore),
-      (#[static_method]) => Some(AttributeModifier::Ignore),
-      (#[constructor]) => Some(AttributeModifier::Ignore),
-      (#[allow ($_rule:path)]) => None,
-      (#[doc = $_attr:literal]) => None,
-      (#[cfg $_cfg:tt]) => None,
-      (#[meta ($($_key: ident = $_value: literal),*)]) => Some(AttributeModifier::Ignore),
-    })
-  }).map_err(|_| AttributeError::InvalidAttribute(stringify_token(attr)))?;
-  Ok(res)
+  match attr.path().get_ident() {
+    Some(ident) => Ok(match &*ident.to_string() {
+      "bigint" => Some(AttributeModifier::Bigint),
+      "number" => Some(AttributeModifier::Number),
+      "serde" => Some(AttributeModifier::Serde),
+      "webidl" => {
+        let webidl = attr
+          .parse_args::<WebIdlAttr>()
+          .map_err(|e| AttributeError::InvalidAttribute(e.to_string()))?;
+        Some(AttributeModifier::WebIDL {
+          options: webidl
+            .options
+            .map(|options| {
+              options
+                .options
+                .into_iter()
+                .map(|pair| WebIDLPairs(pair.key, pair.value.into()))
+                .collect()
+            })
+            .unwrap_or_default(),
+          default: webidl.default.map(|default| WebIDLDefault(default.default)),
+        })
+      }
+      "smi" => Some(AttributeModifier::Smi),
+      "string" => {
+        if let syn::Meta::Path(_) = &attr.meta {
+          return Ok(Some(AttributeModifier::String(StringMode::Default)));
+        }
+        let args = attr
+          .parse_args::<Ident>()
+          .map_err(|e| AttributeError::InvalidAttribute(e.to_string()))?;
+        if args.to_string().as_str() == "onebyte" {
+          Some(AttributeModifier::String(StringMode::OneByte))
+        } else {
+          return Err(AttributeError::InvalidAttribute(format!(
+            "{}({})",
+            ident, args
+          )));
+        }
+      }
+      "state" => Some(AttributeModifier::State),
+      "varargs" => Some(AttributeModifier::VarArgs),
+      "buffer" => {
+        return parse_buffer_attr(attr, BufferSource::TypedArray).map(Some);
+      }
+      "anybuffer" => {
+        return parse_buffer_attr(attr, BufferSource::Any).map(Some);
+      }
+      "arraybuffer" => {
+        return parse_buffer_attr(attr, BufferSource::ArrayBuffer).map(Some);
+      }
+      "global" => Some(AttributeModifier::Global),
+      "cppgc" => Some(AttributeModifier::CppGcResource),
+      "to_v8" => Some(AttributeModifier::ToV8),
+      "from_v8" => Some(AttributeModifier::FromV8),
+      "required" => Some(AttributeModifier::Ignore),
+      "rename" => Some(AttributeModifier::Ignore),
+      "method" => Some(AttributeModifier::Ignore),
+      "getter" => Some(AttributeModifier::Ignore),
+      "setter" => Some(AttributeModifier::Ignore),
+      "fast" => Some(AttributeModifier::Ignore),
+      "async_method" => Some(AttributeModifier::Ignore),
+      "static_method" => Some(AttributeModifier::Ignore),
+      "constructor" => Some(AttributeModifier::Ignore),
+      "allow" => None,
+      "doc" => None,
+      "cfg" => None,
+      "meta" => Some(AttributeModifier::Ignore),
+      _ => return Err(AttributeError::InvalidAttribute(ident.to_string())),
+    }),
+    None => Err(AttributeError::InvalidAttribute(stringify_token(attr))),
+  }
+  // attr.parse_args_with(parser)
+  // let res = std::panic::catch_unwind(|| {
+  //   rules!(tokens => {
+  //     (#[bigint]) => Some(AttributeModifier::Bigint),
+  //     (#[number]) => Some(AttributeModifier::Number),
+  //     (#[serde]) => Some(AttributeModifier::Serde),
+  //     (#[webidl]) => Some(AttributeModifier::WebIDL { options: vec![],default: None }),
+  //     (#[webidl($(default = $default:expr)?$($(,)? options($($key:ident = $value:literal),*))?)]) => Some(AttributeModifier::WebIDL { options: key.map(|key| key.into_iter().zip(value.unwrap().into_iter()).map(|v| WebIDLPairs(v.0, v.1)).collect()).unwrap_or_default(), default: default.map(WebIDLDefault) }),
+  //     (#[smi]) => Some(AttributeModifier::Smi),
+  //     (#[string]) => Some(AttributeModifier::String(StringMode::Default)),
+  //     (#[string(onebyte)]) => Some(AttributeModifier::String(StringMode::OneByte)),
+  //     (#[state]) => Some(AttributeModifier::State),
+  //     (#[varargs]) => Some(AttributeModifier::VarArgs),
+  //     (#[buffer]) => Some(AttributeModifier::Buffer(BufferMode::Default, BufferSource::TypedArray)),
+  //     (#[buffer(unsafe)]) => Some(AttributeModifier::Buffer(BufferMode::Unsafe, BufferSource::TypedArray)),
+  //     (#[buffer(copy)]) => Some(AttributeModifier::Buffer(BufferMode::Copy, BufferSource::TypedArray)),
+  //     (#[buffer(detach)]) => Some(AttributeModifier::Buffer(BufferMode::Detach, BufferSource::TypedArray)),
+  //     (#[anybuffer]) => Some(AttributeModifier::Buffer(BufferMode::Default, BufferSource::Any)),
+  //     (#[anybuffer(unsafe)]) => Some(AttributeModifier::Buffer(BufferMode::Unsafe, BufferSource::Any)),
+  //     (#[anybuffer(copy)]) => Some(AttributeModifier::Buffer(BufferMode::Copy, BufferSource::Any)),
+  //     (#[anybuffer(detach)]) => Some(AttributeModifier::Buffer(BufferMode::Detach, BufferSource::Any)),
+  //     (#[arraybuffer]) => Some(AttributeModifier::Buffer(BufferMode::Default, BufferSource::ArrayBuffer)),
+  //     (#[arraybuffer(unsafe)]) => Some(AttributeModifier::Buffer(BufferMode::Unsafe, BufferSource::ArrayBuffer)),
+  //     (#[arraybuffer(copy)]) => Some(AttributeModifier::Buffer(BufferMode::Copy, BufferSource::ArrayBuffer)),
+  //     (#[arraybuffer(detach)]) => Some(AttributeModifier::Buffer(BufferMode::Detach, BufferSource::ArrayBuffer)),
+  //     (#[global]) => Some(AttributeModifier::Global),
+  //     (#[cppgc]) => Some(AttributeModifier::CppGcResource),
+  //     (#[to_v8]) => Some(AttributeModifier::ToV8),
+  //     (#[from_v8]) => Some(AttributeModifier::FromV8),
+  //     (#[required ($_attr:literal)]) => Some(AttributeModifier::Ignore),
+  //     (#[rename ($_attr:literal)]) => Some(AttributeModifier::Ignore),
+  //     (#[method ($_attr:literal)]) => Some(AttributeModifier::Ignore),
+  //     (#[method]) => Some(AttributeModifier::Ignore),
+  //     (#[getter]) => Some(AttributeModifier::Ignore),
+  //     (#[setter]) => Some(AttributeModifier::Ignore),
+  //     (#[fast]) => Some(AttributeModifier::Ignore),
+  //     // async is a keyword and does not work as #[async] so we use #[async_method] instead
+  //     (#[async_method]) => Some(AttributeModifier::Ignore),
+  //     (#[static_method]) => Some(AttributeModifier::Ignore),
+  //     (#[constructor]) => Some(AttributeModifier::Ignore),
+  //     (#[allow ($_rule:path)]) => None,
+  //     (#[doc = $_attr:literal]) => None,
+  //     (#[cfg $_cfg:tt]) => None,
+  //     (#[meta ($($_key: ident = $_value: literal),*)]) => Some(AttributeModifier::Ignore),
+  //   })
+  // }).map_err(|_| AttributeError::InvalidAttribute(stringify_token(attr)))?;
+  // Ok(res)
 }
 
 fn parse_numeric_type(tp: &Path) -> Result<NumericArg, ArgError> {
