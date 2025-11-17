@@ -1796,6 +1796,23 @@ impl JsRuntime {
       .get_module_namespace(isolate, module_id)
   }
 
+  pub fn get_module_namespace_by_name(
+    &mut self,
+    name: &str,
+    requested_module_type: impl AsRef<RequestedModuleType>,
+  ) -> Result<v8::Global<v8::Object>, CoreError> {
+    let module_id = self
+      .inner
+      .main_realm
+      .0
+      .module_map
+      .get_id(name, requested_module_type)
+      .ok_or_else(|| {
+        CoreErrorKind::MissingFromModuleMap(name.to_string()).into_box()
+      })?;
+    self.get_module_namespace(module_id)
+  }
+
   /// Registers a callback on the isolate when the memory limits are approached.
   /// Use this to prevent V8 from crashing the process when reaching the limit.
   ///
