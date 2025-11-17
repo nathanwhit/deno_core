@@ -2,6 +2,8 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
+use std::time::Instant;
 
 use deno_core::GarbageCollected;
 use deno_core::OpState;
@@ -18,6 +20,38 @@ use deno_error::JsErrorBox;
 use super::Output;
 use super::TestData;
 use super::extensions::SomeType;
+
+pub struct StartTime(Instant);
+
+impl Default for StartTime {
+  fn default() -> Self {
+    Self(Instant::now())
+  }
+}
+impl std::ops::Deref for StartTime {
+  type Target = Instant;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+fn expose_time(duration: Duration, out: &mut [u8]) {
+  let seconds = duration.as_secs() as u32;
+  let subsec_nanos = duration.subsec_nanos();
+
+  if out.len() >= 8 {
+    out[0..4].copy_from_slice(&seconds.to_ne_bytes());
+    out[4..8].copy_from_slice(&subsec_nanos.to_ne_bytes());
+  }
+}
+
+#[op2(fast)]
+pub fn op_now(state: &mut OpState, #[buffer] buf: &mut [u8]) {
+  let start_time = state.borrow::<StartTime>();
+  let elapsed = start_time.elapsed();
+  expose_time(elapsed, buf);
+}
 
 #[op2(fast)]
 pub fn op_log_debug(#[string] s: &str) {

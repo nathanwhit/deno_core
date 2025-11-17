@@ -3,6 +3,7 @@
 use crate::checkin::runner::Output;
 use crate::checkin::runner::TestData;
 use crate::checkin::runner::ops;
+use crate::checkin::runner::ops::StartTime;
 use crate::checkin::runner::ops_async;
 use crate::checkin::runner::ops_buffer;
 use crate::checkin::runner::ops_error;
@@ -17,6 +18,7 @@ deno_core::extension!(
   checkin_runtime,
   parameters = [P: SomeType],
   ops = [
+    ops::op_now,
     ops::op_log_debug,
     ops::op_log_info,
     ops::op_stats_capture,
@@ -73,5 +75,6 @@ deno_core::extension!(
   state = |state| {
     state.put(TestData::default());
     state.put(Output::default());
+    state.put(StartTime::default());
   }
 );

@@ -19,6 +19,9 @@ globalThis.setInterval = timers.setInterval;
 globalThis.clearTimeout = timers.clearTimeout;
 globalThis.clearInterval = timers.clearInterval;
 globalThis.Worker = worker.Worker;
+globalThis.performance = {
+  now: timers.now,
+};
 Deno.core.addMainModuleHandler((module) => {
   if (onMainModuleCb) onMainModuleCb(module);
 });

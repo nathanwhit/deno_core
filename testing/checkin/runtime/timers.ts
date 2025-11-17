@@ -1,5 +1,15 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+import { op_now } from "ext:core/ops";
+
+const hrU8 = new Uint8Array(8);
+const hr = new Uint32Array(hrU8.buffer);
+
+export function now() {
+  op_now(hrU8);
+  return hr[0] * 1000 + hr[1] / 1e6;
+}
+
 /**
  * Call a callback function after a delay.
  */
