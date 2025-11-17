@@ -28,3 +28,13 @@ declare global {
     export function unrefTimer(id: number): void;
   }
 }
+
+declare module "checkin:object" {
+  export function nop(): void;
+  export function rustObjectAssign(target: any, source: any): any;
+  export function map(array: any[], func: (value: any) => any): any[];
+  export function map2(array: any[], func: (value: any) => any): any[];
+  export function thingIsString(thing: any): boolean;
+  export function testObjectWrap(): any;
+  export function testEnumWrap(): any;
+}

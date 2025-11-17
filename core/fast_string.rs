@@ -48,7 +48,7 @@ impl FastStaticString {
 
   pub fn v8_string<'s, 'i>(
     &self,
-    scope: &mut v8::PinScope<'s, 'i>,
+    scope: &v8::PinScope<'s, 'i>,
   ) -> Result<v8::Local<'s, v8::String>, FastStringV8AllocationError> {
     FastString::from(*self).v8_string(scope)
   }
@@ -299,7 +299,7 @@ impl FastString {
   /// an external one-byte static is created.
   pub fn v8_string<'a, 'i>(
     &self,
-    scope: &mut v8::PinScope<'a, 'i>,
+    scope: &v8::PinScope<'a, 'i>,
   ) -> Result<v8::Local<'a, v8::String>, FastStringV8AllocationError> {
     match self.inner {
       FastStringInner::StaticAscii(s) => {

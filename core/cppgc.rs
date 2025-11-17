@@ -607,3 +607,8 @@ impl<T: GarbageCollected + 'static> SameObject<T> {
     try_unwrap_cppgc_object(scope, val.cast())
   }
 }
+
+pub unsafe trait Inherits<T: GarbageCollected + 'static> {}
+
+
+

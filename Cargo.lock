@@ -728,6 +728,7 @@ dependencies = [
  "futures",
  "pretty_assertions",
  "prettyplease",
+ "smallvec",
  "testing_macros",
  "thiserror 2.0.12",
  "tokio",
