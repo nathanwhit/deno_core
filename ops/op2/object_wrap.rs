@@ -109,8 +109,8 @@ pub(crate) fn generate_impl_ops(
 
       let mut config = MacroConfig::from_attributes(span, attrs)?;
 
-      if args.class_ty.is_some() {
-        config.use_proto_cppgc = true;
+      if matches!(args.class_ty, Some(ClassTy::Base { .. })) {
+        config.use_cppgc_base = true;
       }
 
       if let Some(ref rename) = config.rename {
@@ -153,42 +153,16 @@ pub(crate) fn generate_impl_ops(
     quote! { None }
   };
 
-  let (prototype_index, inherits_type_name) = match &args.class_ty {
-    Some(ClassTy::Base { .. }) => (
-      quote! {
-        impl deno_core::cppgc::PrototypeChain for #self_ty {
-          fn prototype_index() -> Option<usize> {
-            Some(0)
-          }
-        }
-      },
-      quote! {
-        inherits_type_name: || None,
-      },
-    ),
-    Some(ClassTy::Inherit { ty, .. }) => (
-      quote! {
-        impl deno_core::cppgc::PrototypeChain for #self_ty {
-          fn prototype_index() -> Option<usize> {
-            Some(<#ty as deno_core::cppgc::PrototypeChain>::prototype_index().unwrap_or_default() + 1)
-          }
-        }
-      },
-      quote! {
-        inherits_type_name: || Some(std::any::type_name::<#ty>()),
-      },
-    ),
-    None => (
-      quote! {},
-      quote! {
-        inherits_type_name: || None,
-      },
-    ),
+  let inherits_type_name = match &args.class_ty {
+    Some(ClassTy::Inherit { ty, .. }) => quote! {
+      inherits_type_name: || Some(std::any::type_name::<#ty>()),
+    },
+    _ => quote! {
+      inherits_type_name: || None,
+    },
   };
 
   let res = quote! {
-      #prototype_index
-
       impl #self_ty {
         pub const DECL: deno_core::_ops::OpMethodDecl = deno_core::_ops::OpMethodDecl {
           methods: &[

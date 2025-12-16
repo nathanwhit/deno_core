@@ -55,8 +55,8 @@ pub struct MacroConfig {
   pub rename: Option<String>,
   /// Symbol.for("op_name") for the op.
   pub symbol: bool,
-  /// Use proto for cppgc object.
-  pub use_proto_cppgc: bool,
+  /// Use base-unwrapping for cppgc object inheritance.
+  pub use_cppgc_base: bool,
   /// Calls the fn with the promise_id of the async op.
   pub promise_id: bool,
   pub validate: Option<Path>,

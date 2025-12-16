@@ -7,6 +7,7 @@ use proc_macro::TokenStream;
 use std::error::Error;
 
 mod conversion;
+mod cppgc;
 mod op2;
 mod webidl;
 
@@ -15,6 +16,16 @@ mod webidl;
 #[proc_macro_attribute]
 pub fn op2(attr: TokenStream, item: TokenStream) -> TokenStream {
   op2_macro(attr, item)
+}
+
+#[proc_macro_derive(CppgcInherits, attributes(cppgc_base))]
+pub fn cppgc_inherits(item: TokenStream) -> TokenStream {
+  cppgc::derives_inherits(item.into()).into()
+}
+
+#[proc_macro_derive(CppgcBase, attributes(cppgc_inheritors))]
+pub fn cppgc_base(item: TokenStream) -> TokenStream {
+  cppgc::derives_base(item.into()).into()
 }
 
 fn op2_macro(attr: TokenStream, item: TokenStream) -> TokenStream {

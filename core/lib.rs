@@ -34,6 +34,8 @@ pub mod webidl;
 
 // Re-exports
 pub use anyhow;
+pub use deno_ops::CppgcBase;
+pub use deno_ops::CppgcInherits;
 pub use deno_ops::FromV8;
 pub use deno_ops::ToV8;
 pub use deno_ops::WebIDL;
@@ -184,7 +186,9 @@ pub mod _ops {
   pub use super::cppgc::make_cppgc_object;
   pub use super::cppgc::make_cppgc_proto_object;
   pub use super::cppgc::try_unwrap_cppgc_object;
-  pub use super::cppgc::try_unwrap_cppgc_proto_object;
+  pub use super::cppgc::try_unwrap_cppgc_base_object;
+  pub use super::cppgc::try_unwrap_cppgc_persistent_object;
+  pub use super::cppgc::try_unwrap_cppgc_base_persistent_object;
   pub use super::error::throw_error_js_error_class;
   pub use super::error::throw_error_one_byte;
   pub use super::error::throw_error_one_byte_info;
