@@ -367,7 +367,7 @@ mod tests {
 
   #[repr(C)]
   #[derive(CppgcBase)]
-  #[cppgc_inheritors(Derived)]
+  #[cppgc_inheritors(Derived, Derived2)]
   struct BaseType {
     _value: u8,
   }
@@ -381,7 +381,8 @@ mod tests {
   }
 
   #[repr(C)]
-  #[derive(CppgcInherits)]
+  #[derive(CppgcInherits, CppgcBase)]
+  #[cppgc_inheritors(Derived2)]
   #[cppgc_base(BaseType)]
   struct Derived {
     base: BaseType,
@@ -399,5 +400,23 @@ mod tests {
   #[test]
   fn inheriting_types_list_contains_derived() {
     assert!(BaseType::INHERITING_TYPES.contains(&TypeId::of::<Derived>()));
+    assert!(BaseType::INHERITING_TYPES.contains(&TypeId::of::<Derived2>()));
+    assert!(Derived::INHERITING_TYPES.contains(&TypeId::of::<Derived2>()));
+  }
+
+  unsafe impl GarbageCollected for Derived2 {
+    fn trace(&self, _: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static std::ffi::CStr {
+      c"Derived2"
+    }
+  }
+
+  #[repr(C)]
+  #[derive(CppgcInherits)]
+  #[cppgc_base(Derived => BaseType)]
+  struct Derived2 {
+    base: Derived,
+    _value: u8,
   }
 }
