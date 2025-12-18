@@ -94,6 +94,7 @@ fn inherits_inner(input: DeriveInput) -> Result<TokenStream2> {
       #size_align_assert
       #[automatically_derived]
       unsafe impl #base_impl_generics deno_core::cppgc::Inherits<#base> for #ident #base_ty_generics #base_where_clause {}
+      deno_core::_ops::inventory::submit!(deno_core::cppgc::verify_inherits::<#base, #ident #base_ty_generics>());
       #[automatically_derived]
       unsafe impl #transitive_impl_generics deno_core::cppgc::Inherits<__TransitiveBase> for #ident #base_ty_generics #transitive_where_clause {}
   })
@@ -120,10 +121,6 @@ fn base_inner(input: DeriveInput) -> Result<TokenStream2> {
 
   let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-  let type_ids = inheritors
-    .iter()
-    .map(|ty| quote!(::std::any::TypeId::of::<#ty>()));
-
   let check_name = quote::format_ident!("assert_inherits_{}", ident);
   let inherits_checks = inheritors.iter().map(|ty| {
     quote_spanned! {ty.span()=>
@@ -148,9 +145,7 @@ fn base_inner(input: DeriveInput) -> Result<TokenStream2> {
     #size_assert
     const _: () = { #( #inherits_checks )* };
     #[automatically_derived]
-    unsafe impl #impl_generics deno_core::cppgc::Base for #ident #ty_generics #where_clause {
-      const INHERITING_TYPES: &[::std::any::TypeId] = &[ #( #type_ids ),* ];
-    }
+    unsafe impl #impl_generics deno_core::cppgc::Base for #ident #ty_generics #where_clause {}
   })
 }
 

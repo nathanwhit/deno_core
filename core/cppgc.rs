@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::any::TypeId;
 use std::any::type_name;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 pub use v8::cppgc::GarbageCollected;
 pub use v8::cppgc::GcCell;
 
@@ -181,7 +182,7 @@ pub fn try_unwrap_cppgc_base_object<
   isolate: &mut v8::Isolate,
   val: v8::Local<'sc, v8::Value>,
 ) -> Option<UnsafePtr<T>> {
-  try_unwrap_cppgc_with::<T>(isolate, val, T::INHERITING_TYPES)
+  try_unwrap_cppgc_with::<T>(isolate, val, T::inheriting_types())
 }
 
 pub struct Ref<T: GarbageCollected> {
@@ -355,9 +356,67 @@ pub unsafe trait Inherits<T: GarbageCollected + 'static>:
   GarbageCollected + 'static
 {
 }
-pub unsafe trait Base: GarbageCollected + 'static {
-  const INHERITING_TYPES: &[TypeId];
+
+fn find_transitive_inheritors(root: TypeId) -> Vec<TypeId> {
+  let mut adjacency_map: HashMap<TypeId, Vec<TypeId>> = HashMap::new();
+
+  for edge in inventory::iter::<InheritanceEdge> {
+    adjacency_map
+      .entry(edge.base)
+      .or_default()
+      .push(edge.derived);
+  }
+
+  let mut descendants = Vec::new();
+  let mut queue = vec![root];
+  let mut visited = std::collections::HashSet::new();
+  visited.insert(root);
+
+  while let Some(current) = queue.pop() {
+    if let Some(children) = adjacency_map.get(&current) {
+      for &child in children {
+        if visited.insert(child) {
+          descendants.push(child);
+          queue.push(child);
+        }
+      }
+    }
+  }
+
+  descendants
 }
+
+pub unsafe trait Base: GarbageCollected + 'static {
+  fn __cache() -> &'static std::sync::OnceLock<Vec<TypeId>> {
+    static CACHE: std::sync::OnceLock<Vec<TypeId>> = std::sync::OnceLock::new();
+    &CACHE
+  }
+  fn inheriting_types() -> &'static [TypeId] {
+    Self::__cache()
+      .get_or_init(|| find_transitive_inheritors(TypeId::of::<Self>()))
+  }
+}
+
+pub const fn verify_inherits<
+  Base: GarbageCollected + 'static,
+  Derived: Inherits<Base>,
+>() -> InheritanceEdge {
+  InheritanceEdge {
+    base: TypeId::of::<Base>(),
+    derived: TypeId::of::<Derived>(),
+    _private: Private,
+  }
+}
+
+struct Private;
+
+pub struct InheritanceEdge {
+  pub base: TypeId,
+  pub derived: TypeId,
+  _private: Private, // make sure it can't be constructed outside of this module
+}
+
+inventory::collect!(InheritanceEdge);
 
 #[cfg(test)]
 mod tests {
@@ -407,9 +466,9 @@ mod tests {
 
   #[test]
   fn inheriting_types_list_contains_derived() {
-    assert!(BaseType::INHERITING_TYPES.contains(&TypeId::of::<Derived>()));
-    assert!(BaseType::INHERITING_TYPES.contains(&TypeId::of::<Derived2>()));
-    assert!(Derived::INHERITING_TYPES.contains(&TypeId::of::<Derived2>()));
+    assert!(BaseType::inheriting_types().contains(&TypeId::of::<Derived>()));
+    assert!(BaseType::inheriting_types().contains(&TypeId::of::<Derived2>()));
+    assert!(Derived::inheriting_types().contains(&TypeId::of::<Derived2>()));
   }
 
   unsafe impl GarbageCollected for Derived2 {
