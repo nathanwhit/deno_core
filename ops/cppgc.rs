@@ -3,12 +3,11 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, quote_spanned};
-use syn::parse::Parse;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
   Attribute, Data, DeriveInput, Error, Fields, Ident, Meta, Result, Token,
-  Type, parse_macro_input,
+  Type, parse_macro_input, parse_quote,
 };
 
 pub fn derives_inherits(input: TokenStream) -> TokenStream {
@@ -34,7 +33,17 @@ fn inherits_inner(input: DeriveInput) -> Result<TokenStream2> {
     ..
   } = input;
 
-  let inheritance_list = parse_base_attr(&attrs)?;
+  let base = parse_base_attr(&attrs)?;
+  let mut impl_generics = generics.clone();
+  impl_generics.params.push(parse_quote!(__TransitiveBase));
+  let where_clause = impl_generics.make_where_clause();
+  where_clause
+    .predicates
+    .push(parse_quote!(#base: deno_core::cppgc::Inherits<__TransitiveBase>));
+  where_clause
+    .predicates
+    .push(parse_quote!(__TransitiveBase: deno_core::cppgc::Base));
+
   ensure_repr_c(&attrs, ident.span())?;
 
   let first_field = first_field(&data).ok_or_else(|| {
@@ -49,44 +58,45 @@ fn inherits_inner(input: DeriveInput) -> Result<TokenStream2> {
     FieldRef::Unnamed(idx, ty_span) => (quote!(#idx), *ty_span),
   };
 
-  if !types_equal(&first_field.ty, &inheritance_list.ancestors[0]) {
+  if !types_equal(&first_field.ty, &base) {
     return Err(Error::new(
       field_ty_span,
       "first field must be the base type for cppgc inheritance",
     ));
   }
 
-  let mut output = TokenStream2::new();
-  for ancestor in inheritance_list.ancestors {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+  let (transitive_impl_generics, _, transitive_where_clause) =
+    impl_generics.split_for_impl();
+  let (base_impl_generics, base_ty_generics, base_where_clause) =
+    generics.split_for_impl();
 
-    let offset_assert = quote! {
-      const _: () = {
-        const OFFSET: usize = ::core::mem::offset_of!(#ident #ty_generics, #field_path);
-        assert!(OFFSET == 0, "base field must be at offset 0");
-      };
+  let offset_assert = quote! {
+    const _: () = {
+      const OFFSET: usize = ::core::mem::offset_of!(#ident #base_ty_generics, #field_path);
+      assert!(OFFSET == 0, "base field must be at offset 0");
     };
-    let size_align_assert = quote! {
-      const _: () = {
-        assert!(
-          ::core::mem::size_of::<#ancestor>() != 0,
-          "zero-sized base types are not supported for inheritance between cppgc types"
-        );
-        assert!(
-          ::core::mem::align_of::<#ident #ty_generics>() >= ::core::mem::align_of::<#ancestor>(),
-          "derived alignment must be >= base alignment for inheritance between cppgc types"
-        );
-      };
+  };
+  let size_align_assert = quote! {
+    const _: () = {
+      assert!(
+        ::core::mem::size_of::<#base>() != 0,
+        "zero-sized base types are not supported for inheritance between cppgc types"
+      );
+      assert!(
+        ::core::mem::align_of::<#ident #base_ty_generics>() >= ::core::mem::align_of::<#base>(),
+        "derived alignment must be >= base alignment for inheritance between cppgc types"
+      );
     };
+  };
 
-    output.extend(quote! {
+  Ok(quote! {
       #offset_assert
       #size_align_assert
       #[automatically_derived]
-      unsafe impl #impl_generics deno_core::cppgc::Inherits<#ancestor> for #ident #ty_generics #where_clause {}
-    });
-  }
-  Ok(output)
+      unsafe impl #base_impl_generics deno_core::cppgc::Inherits<#base> for #ident #base_ty_generics #base_where_clause {}
+      #[automatically_derived]
+      unsafe impl #transitive_impl_generics deno_core::cppgc::Inherits<__TransitiveBase> for #ident #base_ty_generics #transitive_where_clause {}
+  })
 }
 
 fn base_inner(input: DeriveInput) -> Result<TokenStream2> {
@@ -166,25 +176,7 @@ fn ensure_repr_c(attrs: &[Attribute], span: proc_macro2::Span) -> Result<()> {
   ))
 }
 
-struct InheritanceList {
-  ancestors: Vec<Type>,
-}
-
-impl Parse for InheritanceList {
-  fn parse(input: syn::parse::ParseStream) -> Result<Self> {
-    let parent = input.parse::<Type>()?;
-    let mut ancestors = Vec::new();
-    ancestors.push(parent);
-    while input.peek(Token![=>]) {
-      let _ = input.parse::<Token![=>]>()?;
-      let ancestor = input.parse::<Type>()?;
-      ancestors.push(ancestor);
-    }
-    Ok(InheritanceList { ancestors })
-  }
-}
-
-fn parse_base_attr(attrs: &[Attribute]) -> Result<InheritanceList> {
+fn parse_base_attr(attrs: &[Attribute]) -> Result<Type> {
   let mut found = None;
   for attr in attrs {
     if !attr.path().is_ident("cppgc_base") {
@@ -196,7 +188,7 @@ fn parse_base_attr(attrs: &[Attribute]) -> Result<InheritanceList> {
         "cppgc_base specified more than once",
       ));
     }
-    let base = attr.parse_args::<InheritanceList>()?;
+    let base = attr.parse_args::<Type>()?;
     found = Some(base);
   }
   found.ok_or_else(|| {
@@ -264,5 +256,3 @@ struct FieldRefWithType {
 fn types_equal(a: &Type, b: &Type) -> bool {
   quote!(#a).to_string() == quote!(#b).to_string()
 }
-
-// Tests live in ops/tests to exercise the proc-macros.

@@ -397,6 +397,14 @@ mod tests {
     }
   }
 
+  const fn check<A: Inherits<B>, B: Base>() {}
+
+  const _: () = {
+    let _ = check::<Derived, BaseType>();
+    let _ = check::<Derived2, BaseType>();
+    let _ = check::<Derived2, Derived>();
+  };
+
   #[test]
   fn inheriting_types_list_contains_derived() {
     assert!(BaseType::INHERITING_TYPES.contains(&TypeId::of::<Derived>()));
@@ -414,7 +422,7 @@ mod tests {
 
   #[repr(C)]
   #[derive(CppgcInherits)]
-  #[cppgc_base(Derived => BaseType)]
+  #[cppgc_base(Derived)]
   struct Derived2 {
     base: Derived,
     _value: u8,
