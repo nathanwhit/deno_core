@@ -732,17 +732,23 @@ fn map_v8_fastcall_arg_to_arg(
         *buffer,
       )?
     }
+    Arg::Special(Special::RawIsolatePtr) => {
+      *needs_fast_api_callback_options = true;
+      gs_quote!(generator_state(fast_api_callback_options) => {
+        let #arg_ident = unsafe { #fast_api_callback_options.isolate_unchecked().as_raw_isolate_ptr() };
+      })
+    }
     Arg::Ref(RefType::Ref, Special::Isolate) => {
       *needs_fast_api_callback_options = true;
       gs_quote!(generator_state(fast_api_callback_options) => {
-        let #arg_ident = unsafe { deno_core::v8::Isolate::from_raw_isolate_ptr(#fast_api_callback_options.isolate) };
+        let #arg_ident = unsafe { #fast_api_callback_options.isolate_unchecked() };
         let #arg_ident = &#arg_ident;
       })
     }
     Arg::Ref(RefType::Mut, Special::Isolate) => {
       *needs_fast_api_callback_options = true;
       gs_quote!(generator_state(fast_api_callback_options) => {
-        let mut #arg_ident = unsafe { deno_core::v8::Isolate::from_raw_isolate_ptr(#fast_api_callback_options.isolate) };
+        let mut #arg_ident = unsafe { #fast_api_callback_options.isolate_unchecked_mut() };
         let #arg_ident = &mut #arg_ident;
       })
     }
@@ -901,7 +907,8 @@ fn map_arg_to_v8_fastcall_type(
     | Arg::Ref(RefType::Ref, Special::JsRuntimeState)
     | Arg::VarArgs
     | Arg::This
-    | Arg::Ref(_, Special::Isolate) => V8FastCallType::Virtual,
+    | Arg::Ref(_, Special::Isolate)
+    | Arg::Special(Special::RawIsolatePtr) => V8FastCallType::Virtual,
     // Other types + ref types are not handled
     Arg::OptionNumeric(..)
     | Arg::Option(_)

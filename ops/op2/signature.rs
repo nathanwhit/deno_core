@@ -150,6 +150,7 @@ pub enum Special {
   JsRuntimeState,
   FastApiCallbackOptions,
   Isolate,
+  RawIsolatePtr,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -420,7 +421,8 @@ impl Arg {
         | Special::OpState
         | Special::JsRuntimeState
         | Special::HandleScope
-        | Special::Isolate,
+        | Special::Isolate
+        | Special::RawIsolatePtr,
       ) => true,
       Self::Ref(
         _,
@@ -1471,6 +1473,7 @@ fn parse_type_path(
         OpState => Ok(CBare(TSpecial(Special::OpState))),
         JsRuntimeState => Ok(CBare(TSpecial(Special::JsRuntimeState))),
         v8::Isolate => Ok(CBare(TSpecial(Special::Isolate))),
+        v8::UnsafeRawIsolatePtr => Ok(CBare(TSpecial(Special::RawIsolatePtr))),
         v8::PinScope<'_, '_> | v8::PinScope => Ok(CBare(TSpecial(Special::HandleScope))),
         v8::FastApiCallbackOptions => Ok(CBare(TSpecial(Special::FastApiCallbackOptions))),
         v8::Local<'_, v8::$v8> | v8::Local<v8::$v8> => Ok(CV8Local(TV8(parse_v8_type(v8)?))),
@@ -1922,6 +1925,8 @@ pub(crate) fn parse_type(
         parse_type_path(position, attrs.clone(), TypePathContext::None, of)?;
       if let CBare(TSpecial(Special::Isolate)) = typath {
         return Ok(Arg::Special(Special::Isolate));
+      } else if let CBare(TSpecial(Special::RawIsolatePtr)) = typath {
+        return Ok(Arg::Special(Special::RawIsolatePtr));
       }
       Arg::from_parsed(typath, attrs)
         .map_err(|_| ArgError::InvalidType(stringify_token(ty), "for path"))

@@ -603,6 +603,12 @@ pub fn from_arg(
         let #arg_ident = &#arg_ident;
       )
     }
+    Arg::Special(Special::RawIsolatePtr) => {
+      *needs_opctx = true;
+      quote!(
+        let #arg_ident = #opctx.isolate;
+      )
+    }
     Arg::Ref(RefType::Mut, Special::Isolate) => {
       *needs_opctx = true;
       quote!(
