@@ -8,6 +8,7 @@ import * as throw_ from "checkin:throw";
 import * as object from "checkin:object";
 import * as callsite from "checkin:callsite";
 import * as bench from "checkin:bench";
+import init from "ext:checkin_node/__bootstrap.js";
 async;
 error;
 throw_;
@@ -84,3 +85,5 @@ Reflect.defineProperty(globalThis, "onrejectionhandled", {
 });
 Deno.unrefTimer = timers.unrefTimer;
 Deno.refTimer = timers.refTimer;
+
+init(globalThis);

@@ -1,0 +1,60 @@
+export class ERR_ILLEGAL_CONSTRUCTOR extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_ILLEGAL_CONSTRUCTOR";
+  }
+}
+
+export class ERR_INVALID_ARG_TYPE extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_INVALID_ARG_TYPE";
+  }
+}
+
+export class ERR_INVALID_ARG_VALUE extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_INVALID_ARG_VALUE";
+  }
+}
+
+export class AbortError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AbortError";
+  }
+}
+
+export class ERR_UNHANDLED_ERROR extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_UNHANDLED_ERROR";
+  }
+}
+
+export class ERR_MISSING_ARGS extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_MISSING_ARGS";
+  }
+}
+
+export class ERR_OUT_OF_RANGE extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_OUT_OF_RANGE";
+  }
+}
+
+export default {
+  AbortError,
+  codes: {
+    ERR_ILLEGAL_CONSTRUCTOR,
+    ERR_INVALID_ARG_TYPE,
+    ERR_INVALID_ARG_VALUE,
+    ERR_UNHANDLED_ERROR,
+    ERR_MISSING_ARGS,
+    ERR_OUT_OF_RANGE,
+  },
+};

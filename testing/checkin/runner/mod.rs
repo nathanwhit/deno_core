@@ -112,7 +112,10 @@ pub fn create_runtime_from_snapshot_with_options(
 ) -> (JsRuntime, WorkerHostSide) {
   let (worker, worker_host_side) = worker_create(parent);
 
-  let mut extensions = vec![extensions::checkin_runtime::init::<()>()];
+  let mut extensions = vec![
+    extensions::node::checkin_node::init(),
+    extensions::checkin_runtime::init::<()>(),
+  ];
   extensions.extend(additional_extensions);
   let module_loader =
     Rc::new(ts_module_loader::TypescriptModuleLoader::default());

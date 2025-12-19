@@ -203,11 +203,12 @@ pub fn maybe_transpile_source(
   source: ModuleCodeString,
 ) -> Result<(ModuleCodeString, Option<SourceMapData>), JsErrorBox> {
   // Always transpile `checkin:` built-in modules, since they might be TypeScript.
-  let media_type = if specifier.starts_with("checkin:") {
-    MediaType::TypeScript
-  } else {
-    MediaType::from_path(Path::new(&specifier))
-  };
+  let media_type =
+    if specifier.starts_with("checkin:") || specifier.starts_with("node:") {
+      MediaType::TypeScript
+    } else {
+      MediaType::from_path(Path::new(&specifier))
+    };
 
   match media_type {
     MediaType::TypeScript => {}

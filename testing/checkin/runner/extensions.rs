@@ -1,5 +1,6 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
+pub mod node;
 use crate::checkin::runner::Output;
 use crate::checkin::runner::TestData;
 use crate::checkin::runner::ops;
@@ -9,6 +10,7 @@ use crate::checkin::runner::ops_buffer;
 use crate::checkin::runner::ops_error;
 use crate::checkin::runner::ops_io;
 use crate::checkin::runner::ops_worker;
+use node::checkin_node;
 
 pub trait SomeType {}
 
@@ -16,6 +18,9 @@ impl SomeType for () {}
 
 deno_core::extension!(
   checkin_runtime,
+  deps = [
+    checkin_node
+  ],
   parameters = [P: SomeType],
   ops = [
     ops::op_now,
