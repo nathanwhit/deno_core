@@ -26,6 +26,7 @@ mod ops_async;
 mod ops_buffer;
 mod ops_error;
 mod ops_io;
+mod ops_net;
 mod ops_worker;
 pub mod snapshot;
 #[cfg(test)]

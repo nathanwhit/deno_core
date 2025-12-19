@@ -9,8 +9,8 @@ use crate::checkin::runner::ops_async;
 use crate::checkin::runner::ops_buffer;
 use crate::checkin::runner::ops_error;
 use crate::checkin::runner::ops_io;
+use crate::checkin::runner::ops_net;
 use crate::checkin::runner::ops_worker;
-use node::checkin_node;
 
 pub trait SomeType {}
 
@@ -70,6 +70,7 @@ deno_core::extension!(
     ops::op_validate_args,
     ops::op_prop_access_static_uncached,
     ops::op_prop_access_internalized_uncached,
+
   ],
   objects = [
     ops::DOMPointReadOnly,
@@ -77,6 +78,7 @@ deno_core::extension!(
     ops::TestObjectWrap,
     ops::TestEnumWrap,
     ops::Socket,
+    ops_net::SocketCb,
   ],
   esm_entry_point = "ext:checkin_runtime/__init.js",
   esm = [
@@ -91,6 +93,7 @@ deno_core::extension!(
     "checkin:worker" = "worker.ts",
     "checkin:throw" = "throw.ts",
     "checkin:callsite" = "callsite.ts",
+    "checkin:net" = "net.ts",
   ],
   state = |state| {
     state.put(TestData::default());
