@@ -15,6 +15,7 @@ use syn::parse::ParseStream;
 use syn::parse2;
 
 use crate::op2::Op2Error;
+use crate::op2::Op2ErrorKind;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MacroConfig {
@@ -145,39 +146,54 @@ impl MacroConfig {
 
     // Test for invalid attribute combinations
     if config.fast && config.nofast {
-      return Err(Op2Error::InvalidAttributeCombination("fast", "nofast"));
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination("fast", "nofast"),
+      ));
     }
     if config.fast && config.fast_alternative.is_some() {
-      return Err(Op2Error::InvalidAttributeCombination("fast", "fast(...)"));
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination("fast", "fast(...)"),
+      ));
     }
     if config.fast
       && (config.r#async && !config.async_lazy && !config.async_deferred)
     {
-      return Err(Op2Error::InvalidAttributeCombination("fast", "async"));
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination("fast", "async"),
+      ));
     }
     if config.nofast
       && (config.r#async && !config.async_lazy && !config.async_deferred)
     {
-      return Err(Op2Error::InvalidAttributeCombination("nofast", "async"));
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination("nofast", "async"),
+      ));
     }
     if config.no_side_effects
       && (config.r#async && !config.async_lazy && !config.async_deferred)
     {
-      return Err(Op2Error::InvalidAttributeCombination(
-        "no_side_effects",
-        "async",
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination("no_side_effects", "async"),
       ));
     }
     if config.no_side_effects && config.reentrant {
-      return Err(Op2Error::InvalidAttributeCombination(
-        "no_side_effects",
-        "reentrant",
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination(
+          "no_side_effects",
+          "reentrant",
+        ),
       ));
     }
     if config.promise_id && !config.r#async {
-      return Err(Op2Error::InvalidAttributeCombination(
-        "promise_id_fn",
-        "async",
+      return Err(Op2Error::with_span(
+        span,
+        Op2ErrorKind::InvalidAttributeCombination("promise_id_fn", "async"),
       ));
     }
 

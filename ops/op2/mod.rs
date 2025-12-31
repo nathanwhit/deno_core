@@ -40,17 +40,58 @@ pub mod signature;
 pub mod signature_retval;
 
 #[derive(Debug, Error)]
-pub enum Op2Error {
+#[error("{kind}")]
+pub struct Op2Error {
+  pub span: Option<Span>,
+  #[source]
+  pub kind: Op2ErrorKind,
+}
+
+impl Op2Error {
+  pub fn new(kind: Op2ErrorKind) -> Self {
+    Self { span: None, kind }
+  }
+
+  pub fn with_span(span: Span, kind: Op2ErrorKind) -> Self {
+    Self {
+      span: Some(span),
+      kind,
+    }
+  }
+}
+
+impl From<Op2ErrorKind> for Op2Error {
+  fn from(kind: Op2ErrorKind) -> Self {
+    Self::new(kind)
+  }
+}
+
+impl From<syn::Error> for Op2Error {
+  fn from(err: syn::Error) -> Self {
+    Op2Error::with_span(err.span(), Op2ErrorKind::ParseError(err))
+  }
+}
+
+impl From<V8SignatureMappingError> for Op2Error {
+  fn from(err: V8SignatureMappingError) -> Self {
+    Op2Error::new(Op2ErrorKind::V8SignatureMappingError(err))
+  }
+}
+
+impl From<SignatureError> for Op2Error {
+  fn from(err: SignatureError) -> Self {
+    Op2Error::new(Op2ErrorKind::SignatureError(err))
+  }
+}
+
+#[derive(Debug, Error)]
+pub enum Op2ErrorKind {
   #[error("Failed to parse syntax tree")]
-  ParseError(
-    #[from]
-    #[source]
-    syn::Error,
-  ),
+  ParseError(#[source] syn::Error),
   #[error("Failed to map signature to V8")]
-  V8SignatureMappingError(#[from] V8SignatureMappingError),
+  V8SignatureMappingError(#[source] V8SignatureMappingError),
   #[error("Failed to parse signature")]
-  SignatureError(#[from] SignatureError),
+  SignatureError(#[source] SignatureError),
   #[error("This op cannot use both ({0}) and ({1})")]
   InvalidAttributeCombination(&'static str, &'static str),
   #[error("This op is fast-compatible and should be marked as (fast)")]
@@ -103,6 +144,7 @@ pub(crate) fn generate_op2(
   config: MacroConfig,
   mut func: ItemFn,
 ) -> Result<TokenStream, Op2Error> {
+  let fn_span = func.span();
   // Create a copy of the original function, named "call"
   let call = Ident::new("call", Span::call_site());
   let orig_name = func.sig.ident.clone();
@@ -132,7 +174,9 @@ pub(crate) fn generate_op2(
     func.sig.ident = format_ident!("__static_{}", func.sig.ident);
   }
   let signature =
-    parse_signature(config.fake_async, func.attrs, func.sig.clone())?;
+    parse_signature(config.fake_async, func.attrs, func.sig.clone()).map_err(
+      |err| Op2Error::with_span(fn_span, Op2ErrorKind::SignatureError(err)),
+    )?;
   for ident in &signature.lifetimes {
     let ident = format_ident!("{ident}");
     op_fn.sig.generics.params.push(syn::GenericParam::Lifetime(
@@ -236,8 +280,12 @@ pub(crate) fn generate_op2(
   let no_side_effect = config.no_side_effects;
 
   match (is_async, config.r#async || config.fake_async) {
-    (true, false) => return Err(Op2Error::ShouldBeAsync),
-    (false, true) => return Err(Op2Error::ShouldNotBeAsync),
+    (true, false) => {
+      return Err(Op2Error::with_span(fn_span, Op2ErrorKind::ShouldBeAsync));
+    }
+    (false, true) => {
+      return Err(Op2Error::with_span(fn_span, Op2ErrorKind::ShouldNotBeAsync));
+    }
     _ => {}
   }
 
@@ -256,7 +304,7 @@ pub(crate) fn generate_op2(
           && !config.getter
           && !config.setter
         {
-          return Err(Op2Error::ShouldBeFast);
+          return Err(Op2Error::with_span(fn_span, Op2ErrorKind::ShouldBeFast));
         }
         // nofast requires the function to be valid for fast
         if config.nofast || config.getter || config.setter {
@@ -271,10 +319,16 @@ pub(crate) fn generate_op2(
       }
       None => {
         if config.fast {
-          return Err(Op2Error::ShouldNotBeFast("fast"));
+          return Err(Op2Error::with_span(
+            fn_span,
+            Op2ErrorKind::ShouldNotBeFast("fast"),
+          ));
         }
         if config.nofast {
-          return Err(Op2Error::ShouldNotBeFast("nofast"));
+          return Err(Op2Error::with_span(
+            fn_span,
+            Op2ErrorKind::ShouldNotBeFast("nofast"),
+          ));
         }
         (quote!(None), quote!(None), quote!())
       }

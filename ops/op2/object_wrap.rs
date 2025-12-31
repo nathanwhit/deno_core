@@ -13,6 +13,7 @@ use syn::spanned::Spanned;
 
 use crate::op2::MacroConfig;
 use crate::op2::Op2Error;
+use crate::op2::Op2ErrorKind;
 use crate::op2::generate_op2;
 
 use super::signature::is_attribute_special;
@@ -124,7 +125,10 @@ pub(crate) fn generate_impl_ops(
       let ident = func.sig.ident.clone();
       if config.constructor {
         if constructor.is_some() {
-          return Err(Op2Error::MultipleConstructors);
+          return Err(Op2Error::with_span(
+            span,
+            Op2ErrorKind::MultipleConstructors,
+          ));
         }
 
         constructor = Some(ident);
