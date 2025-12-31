@@ -41,7 +41,8 @@ export function processTicksAndRejections() {
           }
         }
       } catch (e) {
-        reportError(e);
+        // this is wrong
+        throw e;
       }
     }
     core.runMicrotasks();

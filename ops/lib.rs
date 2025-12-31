@@ -21,6 +21,20 @@ fn op2_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
   match op2::op2(attr.into(), item.into()) {
     Ok(output) => output.into(),
     Err(err) => {
+      if let Some(span) = err.span {
+        let mut source: &dyn Error = &err;
+        let mut output = "Failed to parse #[op2]:\n".to_owned();
+        loop {
+          output += &format!(" - {source}\n");
+          if let Some(next) = source.source() {
+            source = next;
+          } else {
+            break;
+          }
+        }
+        return syn::Error::new(span, output).into_compile_error().into();
+      }
+
       let mut err: &dyn Error = &err;
       let mut output = "Failed to parse #[op2]:\n".to_owned();
       loop {

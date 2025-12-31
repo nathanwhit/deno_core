@@ -1,24 +1,20 @@
-import { SocketCb } from "checkin:net";
+import { Socket } from "node:net";
 
-const socket = new SocketCb("localhost", 8080);
-
+const socket = new Socket();
 const prom = Promise.withResolvers<void>();
 
 const iters = 100000;
 let got = 0;
-const start = performance.now();
 const expected = iters * 5;
-const lengths = {};
-
-await socket.connect((data: Uint8Array) => {
+const start = performance.now();
+socket.connect(8080, "localhost");
+const lengths: Record<number, number> = {};
+socket.on("data", (data: Uint8Array) => {
   got += data.length;
   lengths[data.length] = (lengths[data.length] ?? 0) + 1;
   if (got === expected) {
     prom.resolve();
   }
-});
-socket.on("data", (buf) => {
-  console.log("data", buf);
 });
 
 for (let i = 0; i < iters; i++) {
@@ -29,3 +25,5 @@ await prom.promise;
 socket.unref();
 console.log(got, performance.now() - start);
 console.log(lengths);
+
+console.log(Object.values(lengths).reduce((a, b) => a + b, 0));

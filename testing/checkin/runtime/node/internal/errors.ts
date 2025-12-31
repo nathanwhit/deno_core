@@ -47,6 +47,34 @@ export class ERR_OUT_OF_RANGE extends Error {
   }
 }
 
+export class ERR_METHOD_NOT_IMPLEMENTED extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_METHOD_NOT_IMPLEMENTED";
+  }
+}
+
+export class ERR_STREAM_PUSH_AFTER_EOF extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_STREAM_PUSH_AFTER_EOF";
+  }
+}
+
+export class ERR_STREAM_UNSHIFT_AFTER_END_EVENT extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_STREAM_UNSHIFT_AFTER_END_EVENT";
+  }
+}
+
+export class ERR_UNKNOWN_ENCODING extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_UNKNOWN_ENCODING";
+  }
+}
+
 export default {
   AbortError,
   codes: {
@@ -56,5 +84,9 @@ export default {
     ERR_UNHANDLED_ERROR,
     ERR_MISSING_ARGS,
     ERR_OUT_OF_RANGE,
+    ERR_METHOD_NOT_IMPLEMENTED,
+    ERR_STREAM_PUSH_AFTER_EOF,
+    ERR_STREAM_UNSHIFT_AFTER_END_EVENT,
+    ERR_UNKNOWN_ENCODING,
   },
 };

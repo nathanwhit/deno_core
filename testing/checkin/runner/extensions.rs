@@ -71,6 +71,8 @@ deno_core::extension!(
     ops::op_prop_access_static_uncached,
     ops::op_prop_access_internalized_uncached,
 
+    ops_net::op_set_duplex_constructor,
+
   ],
   objects = [
     ops::DOMPointReadOnly,

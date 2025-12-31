@@ -62,6 +62,7 @@ ObjectSetPrototypeOf(Duplex, Readable);
 Duplex.prototype.destroy = Writable.prototype.destroy;
 
 function Duplex(options) {
+  console.log("DUPLEX");
   if (!(this instanceof Duplex)) {
     return new Duplex(options);
   }

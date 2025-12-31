@@ -9,12 +9,18 @@ use deno_core::op2;
 use deno_core::v8;
 use deno_core::v8::cppgc::Traced;
 use deno_error::JsErrorBox;
+use futures::FutureExt;
 use std::cell::RefCell;
 use std::ops::DerefMut;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::task::ready;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufWriter;
 
 fn is_ipv4(s: &str) -> bool {
   std::net::Ipv4Addr::from_str(s).is_ok()
@@ -68,15 +74,84 @@ pub fn op_is_ip(scope: &mut v8::Isolate, ip: v8::Local<v8::String>) -> u8 {
   map_valid_utf8(scope, ip, is_ip).unwrap_or(0)
 }
 
+struct ConnectedState {
+  connected: AtomicBool,
+  notify: tokio::sync::Notify,
+}
+impl ConnectedState {
+  fn new() -> Self {
+    Self {
+      connected: AtomicBool::new(false),
+      notify: tokio::sync::Notify::new(),
+    }
+  }
+}
+impl ConnectedState {
+  fn set_connected(&self, connected: bool) {
+    self
+      .connected
+      .store(connected, std::sync::atomic::Ordering::Relaxed);
+    self.notify.notify_waiters();
+  }
+
+  async fn wait_for_connected(&self) {
+    if self.connected.load(std::sync::atomic::Ordering::Relaxed) {
+      return;
+    }
+    self.notify.notified().await;
+  }
+}
+
+struct RefTrackerInner {
+  ops_tracker: ExternalOpsTracker,
+  refed: AtomicBool,
+}
+
+#[derive(Clone)]
+struct RefTracker(Arc<RefTrackerInner>);
+
+impl RefTracker {
+  fn new(ops_tracker: ExternalOpsTracker) -> Self {
+    Self(Arc::new(RefTrackerInner {
+      ops_tracker,
+      refed: AtomicBool::new(false),
+    }))
+  }
+
+  fn ref_(&self) {
+    if !self
+      .0
+      .refed
+      .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+      self.0.ops_tracker.ref_op();
+    }
+  }
+
+  fn unref(&self) {
+    if self
+      .0
+      .refed
+      .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+      self.0.ops_tracker.unref_op();
+    }
+  }
+}
+
 struct SocketCbInner {
   write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+  read: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedReadHalf>>>,
   cb: RefCell<Option<Rc<v8::TracedReference<v8::Function>>>>,
   context: Rc<v8::Global<v8::Context>>,
   host: String,
   port: u16,
 
-  ops_tracker: ExternalOpsTracker,
+  super_cons: SocketConstructor,
+  ref_tracker: RefTracker,
   cancel: Rc<CancelHandle>,
+  connected: Rc<ConnectedState>,
+  scope_holder: ScopeHolder,
 }
 
 pub struct SocketCb {
@@ -95,6 +170,17 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
   }
 }
 
+#[op2]
+pub fn op_set_duplex_constructor(
+  op_state: &mut OpState,
+  #[global] cons: v8::Global<v8::Function>,
+) {
+  op_state.put(SocketConstructor(Rc::new(cons)));
+}
+
+#[derive(Clone)]
+struct SocketConstructor(Rc<v8::Global<v8::Function>>);
+
 struct ScopeHolder(v8::UnsafeRawIsolatePtr, Rc<v8::Global<v8::Context>>);
 
 impl ScopeHolder {
@@ -110,23 +196,45 @@ impl ScopeHolder {
 impl SocketCb {
   #[constructor]
   #[cppgc]
+  #[reentrant]
   pub fn new(
+    #[this] me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
-    op_state: &mut OpState,
+    op_state: Rc<RefCell<OpState>>,
     #[string] host: String,
     #[smi] port: u16,
   ) -> Result<SocketCb, JsErrorBox> {
     let context = v8::Global::new(scope, scope.get_current_context());
-    let ops_tracker = op_state.external_ops_tracker.clone();
+
+    let (ops_tracker, super_cons) = {
+      let op_state = op_state.borrow();
+      (
+        op_state.external_ops_tracker.clone(),
+        op_state.borrow::<SocketConstructor>().clone(),
+      )
+    };
+
+    let local_me = v8::Local::new(&scope, &me);
+    let cons = v8::Local::new(scope, &*super_cons.0);
+
+    cons.call(scope, local_me.into(), &[]).unwrap();
+    let context = Rc::new(context);
+    let scope = unsafe { scope.as_raw_isolate_ptr() };
+    let scope_holder = ScopeHolder::new(scope, context.clone());
+
     let cb = SocketCb {
       inner: Rc::new(SocketCbInner {
         write: Rc::new(AsyncRefCell::new(None)),
+        read: Rc::new(AsyncRefCell::new(None)),
         cb: RefCell::new(None),
-        context: Rc::new(context),
+        context,
         cancel: Rc::new(CancelHandle::new()),
         host,
         port,
-        ops_tracker,
+        super_cons,
+        ref_tracker: RefTracker::new(ops_tracker),
+        connected: Rc::new(ConnectedState::new()),
+        scope_holder,
       }),
     };
     Ok(cb)
@@ -154,7 +262,7 @@ impl SocketCb {
         .borrow_mut()
         .replace(Rc::new(v8::TracedReference::new(scope, cb)));
     }
-    inner.ops_tracker.ref_op();
+    inner.ref_tracker.ref_();
     async move {
       let stream =
         tokio::net::TcpStream::connect((inner.host.as_str(), inner.port))
@@ -163,37 +271,51 @@ impl SocketCb {
           .unwrap();
       let (read, write) = stream.into_split();
       *inner.write.borrow_mut().await = Some(write);
-      let ops_tracker = inner.ops_tracker.clone();
-      deno_core::unsync::spawn(async move {
-        let cb = inner.cb.borrow().as_ref().unwrap().clone();
-        let this = this.clone();
-        let mut buf_reader = tokio::io::BufReader::new(read);
-        while let Ok(buf) = buf_reader.fill_buf().await {
-          // eprintln!("got data");
-          if buf.is_empty() {
-            // eprintln!("empty buf!");
-            break;
-          }
-          let nread = buf.len();
-          let data = Uint8Array::from(buf.to_vec());
+      *inner.read.borrow_mut().await = Some(read);
+      let ops_tracker = inner.ref_tracker.clone();
+      // deno_core::unsync::spawn(async move {
+      //   let cb = inner.cb.borrow().as_ref().unwrap().clone();
+      //   let this = this.clone();
 
-          buf_reader.consume(nread);
-          // eprintln!("CALLING CB");
-          {
-            let mut raw_isolate = unsafe {
-              v8::Isolate::from_raw_isolate_ptr_unchecked(scope_holder.0)
-            };
-            v8::scope!(let scope, &mut raw_isolate);
-            let context = v8::Local::new(scope, &*scope_holder.1);
-            let scope = &mut v8::ContextScope::new(scope, context);
-            let this = v8::Local::new(scope, &*this);
-            let cb = cb.get(scope).unwrap();
-            let Ok(data_v8) = data.to_v8(scope);
-            let _result = cb.call(scope, this.into(), &[data_v8]).unwrap();
-          };
-        }
-        // eprintln!("Disconnected");
-      });
+      //   let mut buf_reader = tokio::io::BufReader::new(read);
+      //   let mut last = 0;
+      //   while let Ok(buf) = buf_reader.fill_buf().await {
+      //     // eprintln!("got data");
+      //     if buf.is_empty() {
+      //       // eprintln!("empty buf!");
+      //       break;
+      //     }
+      //     let nread = buf.len();
+      //     let data = Uint8Array(buf.to_vec());
+
+      //     let len = buf.len();
+
+      //     if buf.len() > 1024 || buf.len() == last {
+      //       // if len_is_last {
+      //       //   eprintln!("len is last: {len}");
+      //       // }
+      //       buf_reader.consume(nread);
+      //       // eprintln!("CALLING CB");
+      //       {
+      //         let mut raw_isolate = unsafe {
+      //           v8::Isolate::from_raw_isolate_ptr_unchecked(scope_holder.0)
+      //         };
+      //         v8::scope!(let scope, &mut raw_isolate);
+      //         let context = v8::Local::new(scope, &*scope_holder.1);
+      //         let scope = &mut v8::ContextScope::new(scope, context);
+      //         let this = v8::Local::new(scope, &*this);
+      //         let cb = cb.get(scope).unwrap();
+      //         let data_v8 = data.to_v8(scope).unwrap();
+      //         let _result =
+      //           cb.call(scope, this.into(), &[data_v8.into()]).unwrap();
+      //       };
+      //     }
+
+      //     last = len;
+      //   }
+      //   ops_tracker.unref();
+      //   // eprintln!("Disconnected");
+      // });
 
       // ops_tracker.unref_op();
       Ok(())
@@ -201,8 +323,20 @@ impl SocketCb {
   }
 
   #[fast]
+  fn _read(&self, #[this] me: v8::Global<v8::Object>) {
+    // eprintln!("_read");
+
+    self.start_read(Rc::new(me));
+  }
+
+  #[fast]
+  fn r#ref(&self) {
+    self.inner.ref_tracker.ref_();
+  }
+
+  #[fast]
   fn unref(&self) {
-    self.inner.ops_tracker.unref_op();
+    self.inner.ref_tracker.unref();
   }
 
   #[async_method]
@@ -223,6 +357,123 @@ impl SocketCb {
       .await?
       .map_err(JsErrorBox::from_err)
   }
+}
+
+impl SocketCb {
+  fn start_read(&self, this: Rc<v8::Global<v8::Object>>) {
+    let inner = self.inner.clone();
+    deno_core::unsync::spawn(async move {
+      inner.connected.wait_for_connected().await;
+
+      let this = this.clone();
+      let mut read = inner.read.borrow_mut().await;
+      let read = read.deref_mut().as_mut().unwrap();
+
+      let mut buf_reader = tokio::io::BufReader::new(read);
+      let mut last = 0;
+      while let Ok(buf) = buf_reader.fill_buf().await {
+        // eprintln!("got data");
+        if buf.is_empty() {
+          // eprintln!("empty buf!");
+          break;
+        }
+        let nread = buf.len();
+        let data = Uint8Array(buf.to_vec());
+
+        let len = buf.len();
+
+        buf_reader.consume(nread);
+        {
+          let mut raw_isolate = unsafe {
+            v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
+          };
+          v8::scope!(let scope, &mut raw_isolate);
+          let context = v8::Local::new(scope, &*inner.scope_holder.1);
+          let scope = &mut v8::ContextScope::new(scope, context);
+          let this = v8::Local::new(scope, &*this);
+          let readable_obj = this;
+
+          let push = internalized(scope, "push");
+
+          eprintln!("calling!");
+          let func = readable_obj
+            .get(scope, push.into())
+            .unwrap()
+            .cast::<v8::Function>();
+          let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
+          func.call(scope, this.into(), &[arg]).unwrap();
+        }
+      }
+      inner.ref_tracker.unref();
+    });
+  }
+}
+
+struct CallOnToV8<T> {
+  do_it: bool,
+  recv: v8::Global<v8::Object>,
+  arg: T,
+}
+
+fn internalized<'a>(
+  scope: &v8::PinScope<'a, '_>,
+  s: &str,
+) -> v8::Local<'a, v8::String> {
+  v8::String::new_from_one_byte(
+    scope,
+    s.as_bytes(),
+    v8::NewStringType::Internalized,
+  )
+  .unwrap()
+}
+
+impl<'a, T: ToV8<'a>> ToV8<'a> for CallOnToV8<T> {
+  type Error = JsErrorBox;
+  fn to_v8<'i>(
+    self,
+    scope: &mut v8::PinScope<'a, 'i>,
+  ) -> Result<v8::Local<'a, v8::Value>, Self::Error> {
+    if !self.do_it {
+      return Ok(v8::undefined(scope).into());
+    }
+    let recv = self.recv.to_local(scope);
+    let readable = internalized(scope, "readable");
+    let readable_obj = recv
+      .get(scope, readable.into())
+      .unwrap()
+      .cast::<v8::Object>();
+
+    let push = internalized(scope, "push");
+
+    eprintln!("calling!");
+    let func = readable_obj
+      .get(scope, push.into())
+      .unwrap()
+      .cast::<v8::Function>();
+    let arg = self.arg.to_v8(scope).map_err(JsErrorBox::from_err)?;
+    func.call(scope, recv.into(), &[arg]).unwrap();
+    Ok(v8::undefined(scope).into())
+  }
+}
+
+trait Ext<T> {
+  fn to_local<'a>(self, scope: &v8::PinScope<'a, '_>) -> v8::Local<'a, T>;
+}
+
+impl<'b, T, H> Ext<T> for H
+where
+  H: v8::Handle<Data = T> + 'b,
+{
+  fn to_local<'a>(self, scope: &v8::PinScope<'a, '_>) -> v8::Local<'a, T> {
+    v8::Local::new(scope, self)
+  }
+}
+
+fn to_local<'a, T>(
+  scope: &v8::PinScope<'a, '_>,
+  global: impl v8::Handle<Data = T>,
+) -> v8::Local<'a, T> {
+  v8::Local::new(scope, global)
 }
 
 #[cfg(test)]

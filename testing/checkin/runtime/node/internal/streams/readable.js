@@ -93,7 +93,7 @@ const {
 
 Readable.ReadableState = ReadableState;
 
-// let debug = console.debug;
+let debug = (...args) => {};
 
 const FastBuffer = Buffer[SymbolSpecies];
 

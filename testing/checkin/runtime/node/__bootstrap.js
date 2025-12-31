@@ -1,3 +1,4 @@
+import { op_set_duplex_constructor } from "ext:core/ops";
 import {
   processTicksAndRejections,
   runNextTicks,
@@ -52,9 +53,14 @@ from;
 buffer;
 compose;
 
-export default function init(globalThis) {
+export function init(globalThis) {
   globalThis.process = process;
 
   core.setNextTickCallback(processTicksAndRejections);
   core.setMacrotaskCallback(runNextTicks);
+
+  console.log("INIT");
+  op_set_duplex_constructor(stream.Duplex);
 }
+
+export default init;

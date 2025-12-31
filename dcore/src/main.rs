@@ -3,9 +3,11 @@
 use clap::ArgMatches;
 use clap::builder::Arg;
 use clap::builder::Command;
+use deno_core::RequestedModuleType;
 use deno_core::anyhow::Error;
 
 use deno_core::RuntimeOptions;
+use deno_core::v8;
 use deno_core_testing::create_runtime_from_snapshot;
 
 use std::net::SocketAddr;
@@ -88,6 +90,31 @@ fn main() -> Result<(), Error> {
       )
       .unwrap(),
     )));
+
+  {
+    let object = js_runtime
+      .get_module_namespace_by_name(
+        "ext:checkin_node/__bootstrap.js",
+        RequestedModuleType::None,
+      )
+      .unwrap();
+
+    deno_core::scope!(scope, &mut js_runtime);
+    let local = v8::Local::new(&scope, object);
+    let func = local
+      .get(
+        &scope,
+        deno_core::ascii_str!("init")
+          .v8_string(scope)
+          .unwrap()
+          .into(),
+      )
+      .unwrap()
+      .cast::<v8::Function>();
+    let context = scope.get_current_context();
+    let global_this = context.global(scope);
+    func.call(scope, v8::undefined(scope).into(), &[global_this.into()]);
+  }
 
   let runtime = tokio::runtime::Builder::new_current_thread()
     .enable_all()
