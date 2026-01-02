@@ -521,8 +521,6 @@ unsafe impl GarbageCollected for Socket {
 
 pub struct Socket {}
 
-const FOO_NAME: &str = "foo";
-
 #[op2]
 impl Socket {
   #[constructor]

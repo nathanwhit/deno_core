@@ -72,6 +72,9 @@ deno_core::extension!(
     ops::op_prop_access_internalized_uncached,
 
     ops_net::op_set_duplex_constructor,
+    ops_net::op_is_ipv4,
+    ops_net::op_is_ipv6,
+    ops_net::op_is_ip,
 
   ],
   objects = [

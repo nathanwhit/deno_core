@@ -794,6 +794,16 @@ where
   }
 }
 
+impl<'s> ToV8<'s> for JsErrorBox {
+  type Error = Infallible;
+  fn to_v8<'i>(
+    self,
+    scope: &mut v8::PinScope<'s, 'i>,
+  ) -> Result<v8::Local<'s, v8::Value>, Self::Error> {
+    Ok(crate::error::to_v8_error(scope, &self).into())
+  }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
   use super::*;
