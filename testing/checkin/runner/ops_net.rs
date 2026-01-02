@@ -135,6 +135,7 @@ impl RefTracker {
       .swap(false, std::sync::atomic::Ordering::Relaxed)
     {
       self.0.ops_tracker.unref_op();
+      eprintln!("unrefed");
     }
   }
 }
@@ -152,6 +153,8 @@ struct SocketCbInner {
   cancel: Rc<CancelHandle>,
   connected: Rc<ConnectedState>,
   scope_holder: ScopeHolder,
+
+  reading: AtomicBool,
 }
 
 pub struct SocketCb {
@@ -235,6 +238,7 @@ impl SocketCb {
         ref_tracker: RefTracker::new(ops_tracker),
         connected: Rc::new(ConnectedState::new()),
         scope_holder,
+        reading: AtomicBool::new(false),
       }),
     };
     Ok(cb)
@@ -272,7 +276,7 @@ impl SocketCb {
       let (read, write) = stream.into_split();
       *inner.write.borrow_mut().await = Some(write);
       *inner.read.borrow_mut().await = Some(read);
-      let ops_tracker = inner.ref_tracker.clone();
+      inner.connected.set_connected(true);
       // deno_core::unsync::spawn(async move {
       //   let cb = inner.cb.borrow().as_ref().unwrap().clone();
       //   let this = this.clone();
@@ -322,9 +326,17 @@ impl SocketCb {
     }
   }
 
-  #[fast]
-  fn _read(&self, #[this] me: v8::Global<v8::Object>) {
-    // eprintln!("_read");
+  // #[fast]
+  fn _read(&self, #[this] me: v8::Global<v8::Object>, #[smi] n: Option<i32>) {
+    // If we're already reading, don't start another read or set kSync
+    // This prevents kSync from being set while the async task is calling push()
+    if self
+      .inner
+      .reading
+      .load(std::sync::atomic::Ordering::Relaxed)
+    {
+      return;
+    }
 
     self.start_read(Rc::new(me));
   }
@@ -361,6 +373,13 @@ impl SocketCb {
 
 impl SocketCb {
   fn start_read(&self, this: Rc<v8::Global<v8::Object>>) {
+    if self
+      .inner
+      .reading
+      .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+      return;
+    }
     let inner = self.inner.clone();
     deno_core::unsync::spawn(async move {
       inner.connected.wait_for_connected().await;
@@ -370,11 +389,30 @@ impl SocketCb {
       let read = read.deref_mut().as_mut().unwrap();
 
       let mut buf_reader = tokio::io::BufReader::new(read);
-      let mut last = 0;
       while let Ok(buf) = buf_reader.fill_buf().await {
-        // eprintln!("got data");
         if buf.is_empty() {
-          // eprintln!("empty buf!");
+          {
+            let mut raw_isolate = unsafe {
+              v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
+            };
+            v8::scope!(let scope, &mut raw_isolate);
+            let context = v8::Local::new(scope, &*inner.scope_holder.1);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let this = v8::Local::new(scope, &*this);
+            let readable_obj = this;
+            let push = internalized(scope, "_pushFromAsync");
+            let func = readable_obj
+              .get(scope, push.into())
+              .unwrap()
+              .cast::<v8::Function>();
+            let result = func
+              .call(scope, this.into(), &[v8::null(scope).into()])
+              .unwrap();
+            let result = result.cast::<v8::Boolean>();
+            if result.is_false() {
+              break;
+            }
+          }
           break;
         }
         let nread = buf.len();
@@ -393,19 +431,26 @@ impl SocketCb {
           let this = v8::Local::new(scope, &*this);
           let readable_obj = this;
 
-          let push = internalized(scope, "push");
+          let push = internalized(scope, "_pushFromAsync");
 
-          eprintln!("calling!");
           let func = readable_obj
             .get(scope, push.into())
             .unwrap()
             .cast::<v8::Function>();
           let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-          func.call(scope, this.into(), &[arg]).unwrap();
+          let result = func.call(scope, this.into(), &[arg]).unwrap();
+          let result = result.cast::<v8::Boolean>();
+          if result.is_false() {
+            break;
+          }
         }
       }
-      inner.ref_tracker.unref();
+      // inner.ref_tracker.unref();
+      inner
+        .reading
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     });
+    eprintln!("spawned read");
   }
 }
 

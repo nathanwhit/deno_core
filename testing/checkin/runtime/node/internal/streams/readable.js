@@ -93,7 +93,9 @@ const {
 
 Readable.ReadableState = ReadableState;
 
-let debug = (...args) => {};
+let debug = (...args) => {
+  // console.log(...args);
+};
 
 const FastBuffer = Buffer[SymbolSpecies];
 
@@ -1339,6 +1341,7 @@ function resume_(stream, state) {
   stream.emit("resume");
   flow(stream);
   if ((state[kState] & (kFlowing | kReading)) === kFlowing) {
+    console.log("reading 0");
     stream.read(0);
   }
 }

@@ -1,5 +1,9 @@
 import { SocketCb } from "checkin:net";
 
+const timeout = setTimeout(() => {
+  console.log("exiting due to timeout");
+  process.exit(1);
+}, 5_000);
 const socket = new SocketCb("localhost", 8080);
 
 const prom = Promise.withResolvers<void>();
@@ -10,15 +14,13 @@ const start = performance.now();
 const expected = iters * 5;
 const lengths = {};
 
-await socket.connect((data: Uint8Array) => {
+await socket.connect((data: Uint8Array) => data);
+socket.on("data", (data) => {
   got += data.length;
   lengths[data.length] = (lengths[data.length] ?? 0) + 1;
   if (got === expected) {
     prom.resolve();
   }
-});
-socket.on("data", (buf) => {
-  console.log("data", buf);
 });
 
 for (let i = 0; i < iters; i++) {
@@ -27,5 +29,7 @@ for (let i = 0; i < iters; i++) {
 
 await prom.promise;
 socket.unref();
+clearTimeout(timeout);
+console.log("done");
 console.log(got, performance.now() - start);
 console.log(lengths);

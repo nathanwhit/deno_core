@@ -1,5 +1,10 @@
+use deno_core::op2;
+
 deno_core::extension!(
   checkin_node,
+  ops = [
+    op_exit,
+  ],
   esm = [
     dir "checkin/runtime/node",
     "next_tick.ts",
@@ -31,3 +36,8 @@ deno_core::extension!(
     "node:buffer" = "internal/buffer.mjs",
   ]
 );
+
+#[op2(fast)]
+pub fn op_exit(#[smi] code: i32) {
+  std::process::exit(code);
+}
