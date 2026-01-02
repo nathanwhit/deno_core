@@ -147,6 +147,7 @@ struct SocketCbInner {
   context: Rc<v8::Global<v8::Context>>,
   host: String,
   port: u16,
+  this: Rc<v8::TracedReference<v8::Object>>,
 
   super_cons: SocketConstructor,
   ref_tracker: RefTracker,
@@ -166,6 +167,7 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
     if let Some(cb) = self.inner.cb.borrow().as_ref() {
       cb.trace(visitor);
     }
+    self.inner.this.trace(visitor);
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
@@ -219,6 +221,7 @@ impl SocketCb {
 
     let local_me = v8::Local::new(&scope, &me);
     let cons = v8::Local::new(scope, &*super_cons.0);
+    let this = Rc::new(v8::TracedReference::new(scope, local_me));
 
     cons.call(scope, local_me.into(), &[]).unwrap();
     let context = Rc::new(context);
@@ -234,6 +237,7 @@ impl SocketCb {
         cancel: Rc::new(CancelHandle::new()),
         host,
         port,
+        this,
         super_cons,
         ref_tracker: RefTracker::new(ops_tracker),
         connected: Rc::new(ConnectedState::new()),
@@ -247,13 +251,11 @@ impl SocketCb {
   #[async_method]
   pub fn connect<'a, 'b>(
     &self,
-    #[this] this: v8::Global<v8::Object>,
     scope: v8::UnsafeRawIsolatePtr,
     #[global] cb: v8::Global<v8::Function>,
   ) -> impl Future<Output = Result<(), JsErrorBox>> {
     let scope_holder = ScopeHolder::new(scope, self.inner.context.clone());
     let inner = self.inner.clone();
-    let this = Rc::new(this);
     {
       let mut raw_isolate =
         unsafe { v8::Isolate::from_raw_isolate_ptr_unchecked(scope) };
@@ -326,8 +328,9 @@ impl SocketCb {
     }
   }
 
-  // #[fast]
-  fn _read(&self, #[this] me: v8::Global<v8::Object>, #[smi] n: Option<i32>) {
+  #[fast]
+  fn _read(&self, #[this] me: v8::Global<v8::Object>) {
+    // eprintln!("read");
     // If we're already reading, don't start another read or set kSync
     // This prevents kSync from being set while the async task is calling push()
     if self
@@ -388,9 +391,11 @@ impl SocketCb {
       let mut read = inner.read.borrow_mut().await;
       let read = read.deref_mut().as_mut().unwrap();
 
-      let mut buf_reader = tokio::io::BufReader::new(read);
-      while let Ok(buf) = buf_reader.fill_buf().await {
-        if buf.is_empty() {
+      let mut buf = vec![0; 64 * 1024];
+
+      while let Ok(nread) = read.read(&mut buf).await {
+        if nread == 0 {
+          // Push EOF (null)
           {
             let mut raw_isolate = unsafe {
               v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
@@ -399,12 +404,9 @@ impl SocketCb {
             let context = v8::Local::new(scope, &*inner.scope_holder.1);
             let scope = &mut v8::ContextScope::new(scope, context);
             let this = v8::Local::new(scope, &*this);
-            let readable_obj = this;
             let push = internalized(scope, "_pushFromAsync");
-            let func = readable_obj
-              .get(scope, push.into())
-              .unwrap()
-              .cast::<v8::Function>();
+            let func =
+              this.get(scope, push.into()).unwrap().cast::<v8::Function>();
             let result = func
               .call(scope, this.into(), &[v8::null(scope).into()])
               .unwrap();
@@ -415,13 +417,8 @@ impl SocketCb {
           }
           break;
         }
-        let nread = buf.len();
-        let data = Uint8Array(buf.to_vec());
 
-        let len = buf.len();
-
-        buf_reader.consume(nread);
-        {
+        if nread > 0 {
           let mut raw_isolate = unsafe {
             v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
           };
@@ -429,14 +426,10 @@ impl SocketCb {
           let context = v8::Local::new(scope, &*inner.scope_holder.1);
           let scope = &mut v8::ContextScope::new(scope, context);
           let this = v8::Local::new(scope, &*this);
-          let readable_obj = this;
-
+          let data = Uint8Array(buf[..nread].to_vec());
           let push = internalized(scope, "_pushFromAsync");
-
-          let func = readable_obj
-            .get(scope, push.into())
-            .unwrap()
-            .cast::<v8::Function>();
+          let func =
+            this.get(scope, push.into()).unwrap().cast::<v8::Function>();
           let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
           let result = func.call(scope, this.into(), &[arg]).unwrap();
           let result = result.cast::<v8::Boolean>();
@@ -450,8 +443,9 @@ impl SocketCb {
         .reading
         .store(false, std::sync::atomic::Ordering::Relaxed);
     });
-    eprintln!("spawned read");
   }
+
+  // pub fn push_data()
 }
 
 struct CallOnToV8<T> {

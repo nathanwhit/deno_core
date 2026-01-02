@@ -23,13 +23,16 @@ socket.on("data", (data) => {
   }
 });
 
-for (let i = 0; i < iters; i++) {
-  socket.write(new Uint8Array([1, 2, 3, 4, 5]));
-}
-
+const writeStart = performance.now();
+// for (let i = 0; i < iters; i++) {
+//   socket.write(new Uint8Array([1, 2, 3, 4, 5]));
+// }
+const writeEnd = performance.now();
+console.log(`write time: ${writeEnd - writeStart}`);
 await prom.promise;
 socket.unref();
 clearTimeout(timeout);
 console.log("done");
 console.log(got, performance.now() - start);
 console.log(lengths);
+console.log(Object.values(lengths).reduce((a, b) => a + b, 0));

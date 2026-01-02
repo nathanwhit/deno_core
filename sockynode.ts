@@ -17,10 +17,12 @@ socket.on("data", (data: Uint8Array) => {
   }
 });
 
-for (let i = 0; i < iters; i++) {
-  socket.write(new Uint8Array([1, 2, 3, 4, 5]));
-}
-
+const writeStart = performance.now();
+// for (let i = 0; i < iters; i++) {
+//   socket.write(new Uint8Array([1, 2, 3, 4, 5]));
+// }
+const writeEnd = performance.now();
+console.log(`write time: ${writeEnd - writeStart}`);
 await prom.promise;
 socket.unref();
 console.log(got, performance.now() - start);
