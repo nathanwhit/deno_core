@@ -70,6 +70,48 @@ pub fn op_is_ip(scope: &mut v8::Isolate, ip: v8::Local<v8::String>) -> u8 {
   map_valid_utf8(scope, ip, is_ip).unwrap_or(0)
 }
 
+struct ShouldReadState {
+  read_once: AtomicBool,
+  should_read: AtomicBool,
+  notify: tokio::sync::Notify,
+}
+impl ShouldReadState {
+  fn new() -> Self {
+    Self {
+      read_once: AtomicBool::new(false),
+      should_read: AtomicBool::new(false),
+      notify: tokio::sync::Notify::new(),
+    }
+  }
+}
+impl ShouldReadState {
+  fn set_should_read(&self) {
+    if self
+      .should_read
+      .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+      return;
+    }
+    self.notify.notify_waiters();
+  }
+  fn swap_read_once(&self) -> bool {
+    self
+      .read_once
+      .swap(true, std::sync::atomic::Ordering::Relaxed)
+  }
+  fn clear_should_read(&self) {
+    self
+      .should_read
+      .store(false, std::sync::atomic::Ordering::Relaxed);
+  }
+  async fn wait_for_should_read(&self) {
+    if self.should_read.load(std::sync::atomic::Ordering::Relaxed) {
+      return;
+    }
+    self.notify.notified().await;
+  }
+}
+
 struct ConnectedState {
   connected: AtomicBool,
   notify: tokio::sync::Notify,
@@ -150,6 +192,7 @@ struct SocketCbInner {
   scope_holder: ScopeHolder,
 
   reading: AtomicBool,
+  should_read: Rc<ShouldReadState>,
 }
 
 pub struct SocketCb {
@@ -235,6 +278,7 @@ impl SocketCb {
         connected: Rc::new(ConnectedState::new()),
         scope_holder,
         reading: AtomicBool::new(false),
+        should_read: Rc::new(ShouldReadState::new()),
       }),
     };
     Ok(cb)
@@ -308,14 +352,11 @@ impl SocketCb {
   #[fast]
   #[rename("_read")]
   fn read(&self, #[this] me: v8::Global<v8::Object>) {
-    eprintln!("read");
+    eprintln!("readddd");
+    self.inner.should_read.set_should_read();
     // If we're already reading, don't start another read or set kSync
     // This prevents kSync from being set while the async task is calling push()
-    if self
-      .inner
-      .reading
-      .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if self.inner.should_read.swap_read_once() {
       eprintln!("already reading");
       return;
     }
@@ -403,6 +444,7 @@ impl SocketCb {
       let mut buf = vec![0; 64 * 1024];
 
       while let Ok(nread) = read.read(&mut buf).await {
+        inner.should_read.wait_for_should_read().await;
         if nread == 0 {
           // Push EOF (null)
           {
@@ -421,10 +463,9 @@ impl SocketCb {
               .unwrap();
             let result = result.cast::<v8::Boolean>();
             if result.is_false() {
-              break;
+              inner.should_read.clear_should_read();
             }
           }
-          break;
         }
 
         if nread > 0 {
@@ -443,7 +484,7 @@ impl SocketCb {
           let result = func.call(scope, this.into(), &[arg]).unwrap();
           let result = result.cast::<v8::Boolean>();
           if result.is_false() {
-            break;
+            inner.should_read.clear_should_read();
           }
         }
       }

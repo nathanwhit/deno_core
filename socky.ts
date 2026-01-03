@@ -25,6 +25,13 @@ console.log(
 );
 
 await socket.connect((data: Uint8Array) => data);
+
+const writeStart = performance.now();
+for (let i = 0; i < iters; i++) {
+  socket.write(new Uint8Array([1, 2, 3, 4, 5]), null);
+}
+const writeEnd = performance.now();
+console.log(`write time: ${writeEnd - writeStart}`);
 socket.on("data", (data) => {
   got += data.length;
   console.log("got", got);
@@ -34,16 +41,8 @@ socket.on("data", (data) => {
   }
 });
 console.log("connected");
-
-const writeStart = performance.now();
-for (let i = 0; i < iters; i++) {
-  socket.write(new Uint8Array([1, 2, 3, 4, 5]));
-}
-const writeEnd = performance.now();
-console.log(`write time: ${writeEnd - writeStart}`);
 await prom.promise;
 socket.unref();
-clearTimeout(timeout);
 console.log("done");
 console.log(got, performance.now() - start);
 console.log(lengths);
