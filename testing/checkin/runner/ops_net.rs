@@ -2,9 +2,11 @@ use deno_core::AsyncRefCell;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::ExternalOpsTracker;
+use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::ToV8;
 use deno_core::convert::Uint8Array;
+use deno_core::error::JsError;
 use deno_core::op2;
 use deno_core::v8;
 use deno_core::v8::cppgc::Traced;
@@ -232,6 +234,15 @@ impl ScopeHolder {
   ) -> Self {
     Self(scope, context)
   }
+
+  pub fn with_scope<R>(&self, f: impl FnOnce(&mut v8::PinScope) -> R) -> R {
+    let mut raw_isolate =
+      unsafe { v8::Isolate::from_raw_isolate_ptr_unchecked(self.0) };
+    v8::scope!(let scope, &mut raw_isolate);
+    let context = v8::Local::new(scope, &*self.1);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    f(scope)
+  }
 }
 
 #[op2]
@@ -300,51 +311,6 @@ impl SocketCb {
       *inner.write.borrow_mut().await = Some(write);
       *inner.read.borrow_mut().await = Some(read);
       inner.connected.set_connected(true);
-      // deno_core::unsync::spawn(async move {
-      //   let cb = inner.cb.borrow().as_ref().unwrap().clone();
-      //   let this = this.clone();
-
-      //   let mut buf_reader = tokio::io::BufReader::new(read);
-      //   let mut last = 0;
-      //   while let Ok(buf) = buf_reader.fill_buf().await {
-      //     // eprintln!("got data");
-      //     if buf.is_empty() {
-      //       // eprintln!("empty buf!");
-      //       break;
-      //     }
-      //     let nread = buf.len();
-      //     let data = Uint8Array(buf.to_vec());
-
-      //     let len = buf.len();
-
-      //     if buf.len() > 1024 || buf.len() == last {
-      //       // if len_is_last {
-      //       //   eprintln!("len is last: {len}");
-      //       // }
-      //       buf_reader.consume(nread);
-      //       // eprintln!("CALLING CB");
-      //       {
-      //         let mut raw_isolate = unsafe {
-      //           v8::Isolate::from_raw_isolate_ptr_unchecked(scope_holder.0)
-      //         };
-      //         v8::scope!(let scope, &mut raw_isolate);
-      //         let context = v8::Local::new(scope, &*scope_holder.1);
-      //         let scope = &mut v8::ContextScope::new(scope, context);
-      //         let this = v8::Local::new(scope, &*this);
-      //         let cb = cb.get(scope).unwrap();
-      //         let data_v8 = data.to_v8(scope).unwrap();
-      //         let _result =
-      //           cb.call(scope, this.into(), &[data_v8.into()]).unwrap();
-      //       };
-      //     }
-
-      //     last = len;
-      //   }
-      //   ops_tracker.unref();
-      //   // eprintln!("Disconnected");
-      // });
-
-      // ops_tracker.unref_op();
       Ok(())
     }
   }
@@ -352,12 +318,10 @@ impl SocketCb {
   #[fast]
   #[rename("_read")]
   fn read(&self, #[this] me: v8::Global<v8::Object>) {
-    eprintln!("readddd");
     self.inner.should_read.set_should_read();
     // If we're already reading, don't start another read or set kSync
     // This prevents kSync from being set while the async task is calling push()
     if self.inner.should_read.swap_read_once() {
-      eprintln!("already reading");
       return;
     }
 
@@ -375,14 +339,36 @@ impl SocketCb {
     self.inner.ref_tracker.unref();
   }
 
+  #[reentrant]
   #[rename("_write")]
   pub fn write(
     &self,
-    #[buffer(copy)] data: Vec<u8>,
-    #[string] _encoding: Option<String>,
+    #[buffer] data: JsBuffer,
+    _encoding: v8::Local<v8::String>,
     #[global] cb: v8::Global<v8::Value>,
   ) {
     let inner = self.inner.clone();
+
+    let num_wrote = if let Some(mut write) = inner.write.try_borrow_mut() {
+      let write = write.deref_mut().as_mut().unwrap();
+      let nwritten = write
+        .try_write(&data)
+        .map_err(JsErrorBox::from_err)
+        .unwrap();
+      nwritten
+    } else {
+      0
+    };
+
+    if num_wrote >= data.len() {
+      inner.scope_holder.with_scope(|scope| {
+        let local_cb = v8::Local::new(scope, &cb);
+        let this = inner.this.get(scope).unwrap();
+        call_write_cb(scope, local_cb, this, None);
+      });
+      return;
+    }
+
     deno_core::unsync::spawn(async move {
       let result = inner
         .write
@@ -391,36 +377,43 @@ impl SocketCb {
         .deref_mut()
         .as_mut()
         .unwrap()
-        .write_all(&data)
+        .write_all(&data[num_wrote..])
         .or_cancel(inner.cancel.clone())
         .await
         .unwrap()
         .map_err(JsErrorBox::from_err)
         .err();
 
-      let mut raw_isolate = unsafe {
-        v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
-      };
-      v8::scope!(let scope, &mut raw_isolate);
-      let context = v8::Local::new(scope, &*inner.scope_holder.1);
-      let scope = &mut v8::ContextScope::new(scope, context);
-      v8::tc_scope!(let scope, scope);
-
-      let local_cb = v8::Local::new(scope, &cb);
-      let this = inner.this.get(scope).unwrap();
-
-      if local_cb.is_function() {
-        let local_cb = local_cb.cast::<v8::Function>();
-        if let Some(result) = result {
-          let error = result.to_v8(scope).unwrap();
-          let _result = local_cb.call(scope, this.into(), &[error]).unwrap();
-        } else {
-          let _result = local_cb.call(scope, this.into(), &[]).unwrap();
-        }
-      } else {
-        eprintln!("cb is not a function, it's a {}", local_cb.type_repr());
-      }
+      inner.scope_holder.with_scope(|scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = inner.this.get(scope).unwrap();
+        call_write_cb(scope, cb, this, result);
+      });
     });
+  }
+}
+
+fn call_write_cb(
+  scope: &mut v8::PinScope,
+  cb: v8::Local<v8::Value>,
+  this: v8::Local<v8::Object>,
+  result: Option<JsErrorBox>,
+) {
+  v8::tc_scope!(let scope, scope);
+  if let Ok(cb) = cb.try_cast::<v8::Function>() {
+    if let Some(result) = result {
+      let error = result.to_v8(scope).unwrap();
+      let _result = cb.call(scope, this.into(), &[error]).unwrap();
+    } else {
+      let _result = cb.call(scope, this.into(), &[]);
+    }
+  } else {
+    eprintln!("cb is not a function, it's a {}", cb.type_repr());
+  }
+  if scope.has_caught() {
+    let exception = scope.exception().unwrap();
+    let error = JsError::from_v8_exception(scope, exception);
+    eprintln!("error: {:?}", error);
   }
 }
 
@@ -442,57 +435,55 @@ impl SocketCb {
       let read = read.deref_mut().as_mut().unwrap();
 
       let mut buf = vec![0; 64 * 1024];
-
-      while let Ok(nread) = read.read(&mut buf).await {
+      loop {
         inner.should_read.wait_for_should_read().await;
+        let nread = match read.read(&mut buf).await {
+          Ok(nread) => nread,
+          Err(e) => {
+            eprintln!("error reading: {:?}", e);
+            break;
+          }
+        };
+
         if nread == 0 {
           // Push EOF (null)
           {
-            let mut raw_isolate = unsafe {
-              v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
-            };
-            v8::scope!(let scope, &mut raw_isolate);
-            let context = v8::Local::new(scope, &*inner.scope_holder.1);
-            let scope = &mut v8::ContextScope::new(scope, context);
-            let this = v8::Local::new(scope, &*this);
-            let push = internalized(scope, "push");
-            let func =
-              this.get(scope, push.into()).unwrap().cast::<v8::Function>();
-            let result = func
-              .call(scope, this.into(), &[v8::null(scope).into()])
-              .unwrap();
-            let result = result.cast::<v8::Boolean>();
-            if result.is_false() {
-              inner.should_read.clear_should_read();
-            }
+            inner.scope_holder.with_scope(|scope| {
+              let this = v8::Local::new(scope, &*this);
+              let push = internalized(scope, "push");
+              let func =
+                this.get(scope, push.into()).unwrap().cast::<v8::Function>();
+              let result = func
+                .call(scope, this.into(), &[v8::null(scope).into()])
+                .unwrap();
+              let result = result.cast::<v8::Boolean>();
+              if result.is_false() {
+                inner.should_read.clear_should_read();
+              }
+            });
           }
         }
 
         if nread > 0 {
-          let mut raw_isolate = unsafe {
-            v8::Isolate::from_raw_isolate_ptr_unchecked(inner.scope_holder.0)
-          };
-          v8::scope!(let scope, &mut raw_isolate);
-          let context = v8::Local::new(scope, &*inner.scope_holder.1);
-          let scope = &mut v8::ContextScope::new(scope, context);
-          let this = v8::Local::new(scope, &*this);
-          let data = Uint8Array(buf[..nread].to_vec());
-          let push = internalized(scope, "push");
-          let func =
-            this.get(scope, push.into()).unwrap().cast::<v8::Function>();
-          let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-          let result = func.call(scope, this.into(), &[arg]).unwrap();
-          let result = result.cast::<v8::Boolean>();
-          if result.is_false() {
-            inner.should_read.clear_should_read();
-          }
+          inner.scope_holder.with_scope(|scope| {
+            let this = v8::Local::new(scope, &*this);
+            let data = Uint8Array(buf[..nread].to_vec());
+            let push = internalized(scope, "push");
+            let func =
+              this.get(scope, push.into()).unwrap().cast::<v8::Function>();
+            let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
+            let result = func.call(scope, this.into(), &[arg]).unwrap();
+            let result = result.cast::<v8::Boolean>();
+            if result.is_false() {
+              eprintln!("push returned false");
+              inner.should_read.clear_should_read();
+            }
+          });
         }
       }
       eprintln!("done reading");
       // inner.ref_tracker.unref();
-      inner
-        .reading
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+      inner.should_read.clear_should_read();
       eprintln!("set reading to false");
     });
   }
@@ -514,6 +505,8 @@ fn internalized<'a>(
 
 #[cfg(test)]
 mod tests {
+  use deno_core::{JsRuntime, ModuleSpecifier, RuntimeOptions};
+
   use super::*;
 
   #[test]
@@ -616,5 +609,38 @@ mod tests {
     for case in fail_cases {
       assert_eq!(is_ip(case), 0);
     }
+  }
+
+  async fn js_test(
+    contents: &str,
+  ) -> Result<v8::Global<v8::Value>, JsErrorBox> {
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+      extensions: vec![
+        crate::checkin::runner::extensions::node::checkin_node::init(),
+        crate::checkin::runner::extensions::checkin_runtime::init::<()>(),
+      ],
+      ..Default::default()
+    });
+    let specifier = ModuleSpecifier::parse("file:///test.js").unwrap();
+    // let id = runtime
+    //   .load_main_es_module_from_code(&specifier, contents.to_string())
+    //   .await
+    //   .map_err(JsErrorBox::from_err)?;
+
+    // runtime.mod_evaluate(id).await.map_err(JsErrorBox::from_err)
+    runtime
+      .execute_script("test.js", format!("'use strict';\n{}", contents))
+      .map_err(JsErrorBox::from_err)
+  }
+
+  #[tokio::test]
+  async fn constructor_accepts_host_and_port() {
+    let result = js_test(
+      "
+      const { SocketCb } = Deno.core.ops; 
+      new SocketCb('localhost', 8080);
+    ",
+    );
+    assert!(result.await.is_ok());
   }
 }
