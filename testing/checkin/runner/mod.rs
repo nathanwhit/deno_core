@@ -104,6 +104,42 @@ pub fn create_runtime_from_snapshot(
 
 pub struct Snapshot(&'static [u8]);
 
+#[cfg(test)]
+pub fn create_runtime_without_snapshot(
+  inspector: bool,
+  parent: Option<WorkerCloseWatcher>,
+  additional_extensions: Vec<Extension>,
+  options: RuntimeOptions,
+) -> (JsRuntime, WorkerHostSide) {
+  let (worker, worker_host_side) = worker_create(parent);
+
+  let module_loader =
+    Rc::new(ts_module_loader::TypescriptModuleLoader::default());
+  let mut extensions = vec![
+    extensions::node::checkin_node::init(),
+    extensions::checkin_runtime::init::<()>(),
+    crate::checkin::runner::testing::checkin_testing::init(),
+  ];
+  extensions.extend(additional_extensions);
+  let runtime = JsRuntime::new(RuntimeOptions {
+    extensions,
+    module_loader: Some(module_loader.clone()),
+    extension_transpiler: Some(Rc::new(|specifier, source| {
+      maybe_transpile_source(specifier, source)
+    })),
+    shared_array_buffer_store: Some(CrossIsolateStore::default()),
+    inspector,
+    import_assertions_support: ImportAssertionsSupport::Warning,
+    ..options
+  });
+
+  let stats = runtime.runtime_activity_stats_factory();
+  runtime.op_state().borrow_mut().put(stats);
+  runtime.op_state().borrow_mut().put(worker);
+
+  (runtime, worker_host_side)
+}
+
 pub fn create_runtime_from_snapshot_with_options(
   snapshot: &'static [u8],
   inspector: bool,

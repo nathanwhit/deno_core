@@ -51,11 +51,29 @@ export function fail(reason: string) {
   throw new Error("Failed: " + reason);
 }
 
+export function equal(a: any, b: any): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => equal(v, b[i]));
+  }
+  if (typeof a === "object" && typeof b === "object") {
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (const key of keysA) {
+      if (!equal(a[key], b[key])) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 /**
  * Assert two values match (==).
  */
 export function assertEquals(a1: any, a2: any) {
-  assert(a1 == a2, `${a1} != ${a2}`);
+  assert(equal(a1, a2), `${a1} != ${a2}`);
 }
 
 /**

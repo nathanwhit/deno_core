@@ -59,7 +59,6 @@ export function init(globalThis) {
   core.setNextTickCallback(processTicksAndRejections);
   core.setMacrotaskCallback(runNextTicks);
 
-  console.log("INIT");
   op_set_duplex_constructor(stream.Duplex);
 }
 

@@ -175,7 +175,6 @@ impl RefTracker {
       .swap(false, std::sync::atomic::Ordering::Relaxed)
     {
       self.0.ops_tracker.unref_op();
-      eprintln!("unrefed");
     }
   }
 }
@@ -193,7 +192,6 @@ struct SocketCbInner {
   connected: Rc<ConnectedState>,
   scope_holder: ScopeHolder,
 
-  reading: AtomicBool,
   should_read: Rc<ShouldReadState>,
 }
 
@@ -292,7 +290,6 @@ impl SocketCb {
         ref_tracker: RefTracker::new(ops_tracker),
         connected: Rc::new(ConnectedState::new()),
         scope_holder,
-        reading: AtomicBool::new(false),
         should_read: Rc::new(ShouldReadState::new()),
       }),
     };
@@ -469,13 +466,6 @@ fn call_write_cb(
 
 impl SocketCb {
   fn start_read(&self, this: Rc<v8::Global<v8::Object>>) {
-    if self
-      .inner
-      .reading
-      .swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-      return;
-    }
     let inner = self.inner.clone();
     deno_core::unsync::spawn(async move {
       inner.connected.wait_for_connected().await;
@@ -486,7 +476,11 @@ impl SocketCb {
 
       let mut buf = vec![0; 64 * 1024];
       loop {
-        inner.should_read.wait_for_should_read().await;
+        let _ = inner
+          .should_read
+          .wait_for_should_read()
+          .or_cancel(inner.cancel.clone())
+          .await;
         let nread =
           match read.read(&mut buf).or_cancel(inner.cancel.clone()).await {
             Ok(Ok(nread)) => nread,
@@ -525,16 +519,22 @@ impl SocketCb {
 
         if nread > 0 {
           inner.scope_holder.with_scope(|scope| {
+            v8::tc_scope!(let scope, scope);
             let this = v8::Local::new(scope, &*this);
             let data = Uint8Array(buf[..nread].to_vec());
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-            let result = inner
-              .push_func
-              .get(scope)
-              .unwrap()
-              .call(scope, this.into(), &[arg])
-              .unwrap();
-            let result = result.cast::<v8::Boolean>();
+            let result = inner.push_func.get(scope).unwrap().call(
+              scope,
+              this.into(),
+              &[arg],
+            );
+            if result.is_none() {
+              let exception = scope.exception().unwrap();
+              let error = JsError::from_v8_exception(scope, exception);
+              eprintln!("error in push: {:?}", error);
+              return;
+            }
+            let result = result.unwrap().cast::<v8::Boolean>();
             if result.is_false() {
               eprintln!("push returned false");
               inner.should_read.clear_should_read();
@@ -542,10 +542,7 @@ impl SocketCb {
           });
         }
       }
-      eprintln!("done reading");
-      // inner.ref_tracker.unref();
       inner.should_read.clear_should_read();
-      eprintln!("set reading to false");
     });
   }
 
@@ -586,7 +583,9 @@ fn internalized<'a>(
 
 #[cfg(test)]
 mod tests {
-  use deno_core::{JsRuntime, ModuleSpecifier, RuntimeOptions};
+  use std::sync::{OnceLock, atomic::AtomicUsize};
+
+  use deno_core::{ModuleSpecifier, RequestedModuleType, RuntimeOptions};
 
   use super::*;
 
@@ -692,26 +691,48 @@ mod tests {
     }
   }
 
+  static ID: OnceLock<AtomicUsize> = OnceLock::new();
+  fn next_id() -> usize {
+    ID.get_or_init(|| AtomicUsize::new(0))
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+  }
+
   async fn js_test(
     contents: &str,
   ) -> Result<v8::Global<v8::Value>, JsErrorBox> {
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-      extensions: vec![
-        crate::checkin::runner::extensions::node::checkin_node::init(),
-        crate::checkin::runner::extensions::checkin_runtime::init::<()>(),
-      ],
-      ..Default::default()
-    });
-    let specifier = ModuleSpecifier::parse("file:///test.js").unwrap();
-    // let id = runtime
-    //   .load_main_es_module_from_code(&specifier, contents.to_string())
-    //   .await
-    //   .map_err(JsErrorBox::from_err)?;
+    let (mut runtime, _worker_host_side) =
+      crate::checkin::runner::create_runtime_without_snapshot(
+        false,
+        None,
+        vec![],
+        RuntimeOptions::default(),
+      );
+    let specifier =
+      ModuleSpecifier::parse(&format!("file:///test-{}.ts", next_id()))
+        .unwrap();
 
-    // runtime.mod_evaluate(id).await.map_err(JsErrorBox::from_err)
+    let id = runtime
+      .load_main_es_module_from_code(&specifier, contents.to_string())
+      .await
+      .map_err(JsErrorBox::from_err)?;
+
+    let module = runtime.mod_evaluate(id);
+
     runtime
-      .execute_script("test.js", format!("'use strict';\n{}", contents))
-      .map_err(JsErrorBox::from_err)
+      .run_event_loop(Default::default())
+      .await
+      .map_err(JsErrorBox::from_err)?;
+    let _ = module.await.map_err(JsErrorBox::from_err)?;
+    let namespace = runtime
+      .get_module_namespace_by_name(
+        &specifier.to_string(),
+        RequestedModuleType::None,
+      )
+      .unwrap();
+    deno_core::scope!(scope, runtime);
+    let namespace = v8::Local::new(scope, namespace);
+    let namespace = namespace.cast::<v8::Value>();
+    Ok(v8::Global::new(scope, namespace))
   }
 
   #[tokio::test]
@@ -723,5 +744,49 @@ mod tests {
     ",
     );
     assert!(result.await.is_ok());
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_read() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn(async move {
+      let (mut stream, _addr) = listener.accept().await.unwrap();
+      let data = "hello world".as_bytes().to_vec();
+      stream
+        .write_all(&data)
+        .await
+        .map_err(JsErrorBox::from_err)
+        .unwrap();
+    });
+    let port = addr.port();
+    let code = "
+    import { SocketCb } from 'checkin:net';
+    import { equal } from 'checkin:testing';
+    const socket = new SocketCb('localhost', ${PORT});
+    
+    const expected = new Uint8Array([
+      104, 101, 108, 108,
+      111,  32, 119, 111,
+      114, 108, 100
+    ]);
+
+    const prom = Promise.withResolvers();
+    let data = new Uint8Array();
+    socket.on('data', (chunk) => {
+      data = new Uint8Array([...data, ...chunk]);
+      if (!equal(data, expected)) {
+        throw new Error('data is not equal to expected');
+      }
+      prom.resolve();
+      socket.destroy();
+    });
+
+    await socket.connect();
+    await prom.promise;
+  "
+    .replace("${PORT}", &port.to_string());
+    let result = js_test(&code);
+    result.await.unwrap();
   }
 }
