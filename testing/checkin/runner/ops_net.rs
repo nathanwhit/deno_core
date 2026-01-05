@@ -183,7 +183,7 @@ impl RefTracker {
 struct SocketCbInner {
   write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
   read: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedReadHalf>>>,
-  cb: RefCell<Option<Rc<v8::TracedReference<v8::Function>>>>,
+  push_func: Rc<v8::TracedReference<v8::Function>>,
   host: String,
   port: u16,
   this: Rc<v8::TracedReference<v8::Object>>,
@@ -203,9 +203,7 @@ pub struct SocketCb {
 
 unsafe impl deno_core::GarbageCollected for SocketCb {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
-    if let Some(cb) = self.inner.cb.borrow().as_ref() {
-      cb.trace(visitor);
-    }
+    self.inner.push_func.trace(visitor);
     self.inner.this.trace(visitor);
   }
 
@@ -272,6 +270,12 @@ impl SocketCb {
     let this = Rc::new(v8::TracedReference::new(scope, local_me));
 
     cons.call(scope, local_me.into(), &[]).unwrap();
+    let push = internalized(scope, "push");
+    let push_func = local_me
+      .get(scope, push.into())
+      .unwrap()
+      .cast::<v8::Function>();
+    let push_func = Rc::new(v8::TracedReference::new(scope, push_func));
     let context = Rc::new(context);
     let scope = unsafe { scope.as_raw_isolate_ptr() };
     let scope_holder = ScopeHolder::new(scope, context);
@@ -280,7 +284,7 @@ impl SocketCb {
       inner: Rc::new(SocketCbInner {
         write: Rc::new(AsyncRefCell::new(None)),
         read: Rc::new(AsyncRefCell::new(None)),
-        cb: RefCell::new(None),
+        push_func,
         cancel: Rc::new(CancelHandle::new()),
         host,
         port,
@@ -339,6 +343,46 @@ impl SocketCb {
     self.inner.ref_tracker.unref();
   }
 
+  #[rename("_final")]
+  fn final_(&self, #[global] cb: v8::Global<v8::Function>) {
+    let inner = self.inner.clone();
+    deno_core::unsync::spawn(async move {
+      let mut write = inner.write.borrow_mut().await;
+      let write = write.deref_mut().as_mut().unwrap();
+      let result = write.shutdown().await.map_err(JsErrorBox::from_err).err();
+      inner.scope_holder.with_scope(|scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = inner.this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, result);
+      });
+    });
+  }
+
+  #[reentrant]
+  #[rename("_destroy")]
+  fn destroy(
+    &self,
+    #[global] error: v8::Global<v8::Value>,
+    #[global] cb: v8::Global<v8::Function>,
+  ) {
+    self.inner.cancel.cancel();
+    self.inner.should_read.clear_should_read();
+    self.inner.connected.set_connected(false);
+    let inner = self.inner.clone();
+
+    deno_core::unsync::spawn(async move {
+      inner.read.borrow_mut().await.take();
+      inner.write.borrow_mut().await.take();
+      inner.scope_holder.with_scope(|scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = inner.this.get(scope).unwrap();
+        let error = v8::Local::new(scope, &error);
+        cb.call(scope, this.into(), &[error]).unwrap();
+      });
+      inner.ref_tracker.unref();
+    });
+  }
+
   #[reentrant]
   #[rename("_write")]
   pub fn write(
@@ -346,16 +390,20 @@ impl SocketCb {
     #[buffer] data: JsBuffer,
     _encoding: v8::Local<v8::String>,
     #[global] cb: v8::Global<v8::Value>,
-  ) {
+  ) -> Result<(), JsErrorBox> {
     let inner = self.inner.clone();
 
     let num_wrote = if let Some(mut write) = inner.write.try_borrow_mut() {
       let write = write.deref_mut().as_mut().unwrap();
-      let nwritten = write
-        .try_write(&data)
-        .map_err(JsErrorBox::from_err)
-        .unwrap();
-      nwritten
+      let nwritten = write.try_write(&data);
+      match nwritten {
+        Ok(nwritten) => nwritten,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+        Err(e) => {
+          eprintln!("error writing: {:?}", e);
+          return Err(JsErrorBox::from_err(e));
+        }
+      }
     } else {
       0
     };
@@ -366,7 +414,7 @@ impl SocketCb {
         let this = inner.this.get(scope).unwrap();
         call_write_cb(scope, local_cb, this, None);
       });
-      return;
+      return Ok(());
     }
 
     deno_core::unsync::spawn(async move {
@@ -390,6 +438,8 @@ impl SocketCb {
         call_write_cb(scope, cb, this, result);
       });
     });
+
+    Ok(())
   }
 }
 
@@ -437,23 +487,32 @@ impl SocketCb {
       let mut buf = vec![0; 64 * 1024];
       loop {
         inner.should_read.wait_for_should_read().await;
-        let nread = match read.read(&mut buf).await {
-          Ok(nread) => nread,
-          Err(e) => {
-            eprintln!("error reading: {:?}", e);
-            break;
-          }
-        };
+        let nread =
+          match read.read(&mut buf).or_cancel(inner.cancel.clone()).await {
+            Ok(Ok(nread)) => nread,
+            Ok(Err(e)) => {
+              eprintln!("error reading: {:?}", e);
+              inner.scope_holder.with_scope(|scope| {
+                let error = JsErrorBox::from_err(e).to_v8(scope).unwrap();
+                inner.emit_event(
+                  scope,
+                  &[internalized(scope, "error").into(), error.into()],
+                );
+              });
+              break;
+            }
+            Err(deno_core::Canceled) => break,
+          };
 
         if nread == 0 {
           // Push EOF (null)
           {
             inner.scope_holder.with_scope(|scope| {
               let this = v8::Local::new(scope, &*this);
-              let push = internalized(scope, "push");
-              let func =
-                this.get(scope, push.into()).unwrap().cast::<v8::Function>();
-              let result = func
+              let result = inner
+                .push_func
+                .get(scope)
+                .unwrap()
                 .call(scope, this.into(), &[v8::null(scope).into()])
                 .unwrap();
               let result = result.cast::<v8::Boolean>();
@@ -468,11 +527,13 @@ impl SocketCb {
           inner.scope_holder.with_scope(|scope| {
             let this = v8::Local::new(scope, &*this);
             let data = Uint8Array(buf[..nread].to_vec());
-            let push = internalized(scope, "push");
-            let func =
-              this.get(scope, push.into()).unwrap().cast::<v8::Function>();
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-            let result = func.call(scope, this.into(), &[arg]).unwrap();
+            let result = inner
+              .push_func
+              .get(scope)
+              .unwrap()
+              .call(scope, this.into(), &[arg])
+              .unwrap();
             let result = result.cast::<v8::Boolean>();
             if result.is_false() {
               eprintln!("push returned false");
@@ -489,6 +550,26 @@ impl SocketCb {
   }
 
   // pub fn push_data()
+}
+
+impl SocketCbInner {
+  fn emit_event(
+    &self,
+    scope: &mut v8::PinScope,
+    args: &[v8::Local<v8::Value>],
+  ) {
+    v8::tc_scope!(let scope, scope);
+    let this = self.this.get(scope).unwrap();
+    let emit = internalized(scope, "emit");
+    let emit_func =
+      this.get(scope, emit.into()).unwrap().cast::<v8::Function>();
+    emit_func.call(scope, this.into(), args).unwrap();
+    if scope.has_caught() {
+      let exception = scope.exception().unwrap();
+      let error = JsError::from_v8_exception(scope, exception);
+      eprintln!("error in emit_event: {:?}", error);
+    }
+  }
 }
 
 fn internalized<'a>(

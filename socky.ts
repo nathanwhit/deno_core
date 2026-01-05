@@ -9,38 +9,42 @@ const prom = Promise.withResolvers<void>();
 
 const iters = 1000000;
 let got = 0;
-const expected = iters * 5;
+// const expected = iters * 5;
+const expected = 100 * 1024 * 1024;
 const lengths: Record<number, number> = {};
 
-await socket.connect((data: Uint8Array) => data);
+await socket.connect();
 const start = performance.now();
-// socket.on("data", (data) => {
-//   got += data.length;
-//   lengths[data.length] = (lengths[data.length] ?? 0) + 1;
-//   if (got === expected) {
-//     prom.resolve();
-//   }
-// });
-const writeStart = performance.now();
-const writeProm = Promise.withResolvers<void>();
-let flushed = 0;
-for (let i = 0; i < iters; i++) {
-  const buf = new Uint8Array([1, 2, 3, 4, 5]);
-  socket.write(buf, undefined, () => {
-    flushed++;
-    if (flushed === iters) {
-      writeProm.resolve();
-    }
-  });
-}
-await writeProm.promise;
-const writeEnd = performance.now();
-console.log(`write time: ${writeEnd - writeStart}`);
-console.log(`flushed: ${flushed}`);
+socket.on("data", (data) => {
+  got += data.length;
+  lengths[data.length] = (lengths[data.length] ?? 0) + 1;
+  if (got === expected) {
+    prom.resolve();
+  }
+});
+socket.end(new Uint8Array([1, 2, 3, 4, 5]));
+socket.destroy();
+
+// const writeStart = performance.now();
+// const writeProm = Promise.withResolvers<void>();
+// let flushed = 0;
+// for (let i = 0; i < iters; i++) {
+//   const buf = new Uint8Array([1, 2, 3, 4, 5]);
+//   socket.write(buf, undefined, () => {
+//     flushed++;
+//     if (flushed === iters) {
+//       writeProm.resolve();
+//     }
+//   });
+// }
+// await writeProm.promise;
+// const writeEnd = performance.now();
+// console.log(`write time: ${writeEnd - writeStart}`);
+// console.log(`flushed: ${flushed}`);
 
 console.log("connected");
 // await prom.promise;
-socket.unref();
+// socket.unref();
 console.log("done");
 console.log(got, performance.now() - start);
 console.log(lengths);
