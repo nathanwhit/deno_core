@@ -523,13 +523,13 @@ impl SocketCb {
 
         if nread > 0 {
           let this = this.clone();
+          let buf = buf[..nread].to_vec();
           let inner2 = inner.clone();
           inner.scope_holder.with_scope(move |scope| {
             v8::tc_scope!(let scope, scope);
             let this = v8::Local::new(scope, &*this);
-            let ab = v8::ArrayBuffer::new(scope, nread);
-            let uint8array = v8::Uint8Array::new(scope, ab, 0, nread).unwrap();
-            let arg = uint8array.into();
+            let data = Uint8Array(buf);
+            let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
             let result = inner2.push_func.get(scope).unwrap().call(
               scope,
               this.into(),
