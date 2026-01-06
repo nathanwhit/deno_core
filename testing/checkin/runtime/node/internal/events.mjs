@@ -71,6 +71,10 @@ import { nextTick } from "ext:checkin_node/next_tick.ts";
 
 // export { addAbortListener } from "ext:checkin_node/internal/events/abort_listener.mjs";
 
+const inspect = (value) => {
+  JSON.stringify(value);
+};
+
 const kCapture = Symbol("kCapture");
 const kErrorMonitor = Symbol("events.errorMonitor");
 const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");

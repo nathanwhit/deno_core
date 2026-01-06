@@ -17,7 +17,14 @@ socket.on("data", (data: Uint8Array) => {
     prom.resolve();
   }
 });
-socket.destroy();
+
+socket.on("error", (error) => {
+  console.log("GOT ERROR", error);
+  prom.reject(error);
+});
+
+socket.end(new Uint8Array([1, 2, 3, 4, 5]));
+// socket.destroy();
 
 // const writeProm = Promise.withResolvers<void>();
 // const writeStart = performance.now();
@@ -35,7 +42,7 @@ socket.destroy();
 // const writeEnd = performance.now();
 // console.log(`write time: ${writeEnd - writeStart}`);
 // console.log(`flushed: ${flushed}`);
-// await prom.promise;
+await prom.promise;
 socket.unref();
 console.log(got, performance.now() - start);
 console.log(lengths);

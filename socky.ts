@@ -10,7 +10,7 @@ const prom = Promise.withResolvers<void>();
 const iters = 1000000;
 let got = 0;
 // const expected = iters * 5;
-const expected = 100 * 1024 * 1024;
+const expected = 4 * 1024 * 1024 * 1024;
 const lengths: Record<number, number> = {};
 
 await socket.connect();
@@ -22,8 +22,14 @@ socket.on("data", (data) => {
     prom.resolve();
   }
 });
-socket.end(new Uint8Array([1, 2, 3, 4, 5]));
-socket.destroy();
+
+socket.on("error", (error) => {
+  // console.log("GOT ERROR", error);
+  prom.reject(error);
+});
+
+// socket.end(new Uint8Array([1, 2, 3, 4, 5]));
+// socket.destroy();
 
 // const writeStart = performance.now();
 // const writeProm = Promise.withResolvers<void>();
@@ -43,8 +49,8 @@ socket.destroy();
 // console.log(`flushed: ${flushed}`);
 
 console.log("connected");
-// await prom.promise;
-// socket.unref();
+await prom.promise;
+socket.unref();
 console.log("done");
 console.log(got, performance.now() - start);
 console.log(lengths);
