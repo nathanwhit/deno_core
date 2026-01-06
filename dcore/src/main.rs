@@ -23,7 +23,13 @@ mod metrics;
 use crate::inspector_server::InspectorServer;
 use crate::metrics::create_metrics;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+
 fn main() -> Result<(), Error> {
+  #[cfg(feature = "dhat-heap")]
+  let _profiler = dhat::Profiler::new_heap();
   eprintln!(
     "🛑 deno_core binary is meant for development and testing purposes."
   );
