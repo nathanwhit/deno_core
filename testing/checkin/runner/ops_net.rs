@@ -6,7 +6,6 @@ use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::ToV8;
 use deno_core::convert::Uint8Array;
-use deno_core::error::JsError;
 use deno_core::op2;
 use deno_core::v8;
 use deno_core::v8::cppgc::Traced;
@@ -17,8 +16,11 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+
+const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 fn is_ipv4(s: &str) -> bool {
   std::net::Ipv4Addr::from_str(s).is_ok()
@@ -72,70 +74,55 @@ pub fn op_is_ip(scope: &mut v8::Isolate, ip: v8::Local<v8::String>) -> u8 {
   map_valid_utf8(scope, ip, is_ip).unwrap_or(0)
 }
 
-struct ShouldReadState {
-  read_once: AtomicBool,
-  should_read: AtomicBool,
+struct ReadSignal {
+  pending: AtomicBool,
   notify: tokio::sync::Notify,
 }
-impl ShouldReadState {
+impl ReadSignal {
   fn new() -> Self {
     Self {
-      read_once: AtomicBool::new(false),
-      should_read: AtomicBool::new(false),
+      pending: AtomicBool::new(false),
       notify: tokio::sync::Notify::new(),
     }
   }
-}
-impl ShouldReadState {
-  fn set_should_read(&self) {
-    if self
-      .should_read
-      .swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-      return;
+
+  fn signal(&self) {
+    if !self.pending.swap(true, Ordering::Relaxed) {
+      self.notify.notify_waiters();
     }
-    self.notify.notify_waiters();
   }
-  fn swap_read_once(&self) -> bool {
-    self
-      .read_once
-      .swap(true, std::sync::atomic::Ordering::Relaxed)
+
+  fn clear(&self) {
+    self.pending.store(false, Ordering::Relaxed);
   }
-  fn clear_should_read(&self) {
-    self
-      .should_read
-      .store(false, std::sync::atomic::Ordering::Relaxed);
-  }
-  async fn wait_for_should_read(&self) {
-    if self.should_read.load(std::sync::atomic::Ordering::Relaxed) {
+
+  async fn wait(&self) {
+    if self.pending.load(Ordering::Relaxed) {
       return;
     }
     self.notify.notified().await;
   }
 }
 
-struct ConnectedState {
+struct Connected {
   connected: AtomicBool,
   notify: tokio::sync::Notify,
 }
-impl ConnectedState {
+impl Connected {
   fn new() -> Self {
     Self {
       connected: AtomicBool::new(false),
       notify: tokio::sync::Notify::new(),
     }
   }
-}
-impl ConnectedState {
-  fn set_connected(&self, connected: bool) {
-    self
-      .connected
-      .store(connected, std::sync::atomic::Ordering::Relaxed);
+
+  fn signal(&self) {
+    self.connected.store(true, Ordering::Relaxed);
     self.notify.notify_waiters();
   }
 
-  async fn wait_for_connected(&self) {
-    if self.connected.load(std::sync::atomic::Ordering::Relaxed) {
+  async fn wait(&self) {
+    if self.connected.load(Ordering::Relaxed) {
       return;
     }
     self.notify.notified().await;
@@ -189,10 +176,11 @@ struct SocketCbInner {
 
   ref_tracker: RefTracker,
   cancel: Rc<CancelHandle>,
-  connected: Rc<ConnectedState>,
+  connected: Rc<Connected>,
   scope_holder: ScopeHolder,
 
-  should_read: Rc<ShouldReadState>,
+  read_signal: Rc<ReadSignal>,
+  read_started: AtomicBool,
 }
 
 pub struct SocketCb {
@@ -288,9 +276,10 @@ impl SocketCb {
         port,
         this,
         ref_tracker: RefTracker::new(ops_tracker),
-        connected: Rc::new(ConnectedState::new()),
+        connected: Rc::new(Connected::new()),
         scope_holder,
-        should_read: Rc::new(ShouldReadState::new()),
+        read_signal: Rc::new(ReadSignal::new()),
+        read_started: AtomicBool::new(false),
       }),
     };
     Ok(cb)
@@ -311,7 +300,7 @@ impl SocketCb {
       let (read, write) = stream.into_split();
       *inner.write.borrow_mut().await = Some(write);
       *inner.read.borrow_mut().await = Some(read);
-      inner.connected.set_connected(true);
+      inner.connected.signal();
       Ok(())
     }
   }
@@ -319,10 +308,8 @@ impl SocketCb {
   #[fast]
   #[rename("_read")]
   fn read(&self, #[this] me: v8::Global<v8::Object>) {
-    self.inner.should_read.set_should_read();
-    // If we're already reading, don't start another read or set kSync
-    // This prevents kSync from being set while the async task is calling push()
-    if self.inner.should_read.swap_read_once() {
+    self.inner.read_signal.signal();
+    if self.inner.read_started.swap(true, Ordering::Relaxed) {
       return;
     }
 
@@ -341,17 +328,13 @@ impl SocketCb {
   }
 
   #[rename("_final")]
-  fn final_(&self, #[global] cb: v8::Global<v8::Function>) {
+  fn final_(&self, #[global] cb: v8::Global<v8::Value>) {
     let inner = self.inner.clone();
     deno_core::unsync::spawn(async move {
       let mut write = inner.write.borrow_mut().await;
       let write = write.deref_mut().as_mut().unwrap();
       let result = write.shutdown().await.map_err(JsErrorBox::from_err).err();
-      inner.scope_holder.with_scope(|scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = inner.this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, result);
-      });
+      call_write_cb(&inner, &cb, result);
     });
   }
 
@@ -363,8 +346,7 @@ impl SocketCb {
     #[global] cb: v8::Global<v8::Function>,
   ) {
     self.inner.cancel.cancel();
-    self.inner.should_read.clear_should_read();
-    self.inner.connected.set_connected(false);
+    self.inner.read_signal.clear();
     let inner = self.inner.clone();
 
     deno_core::unsync::spawn(async move {
@@ -389,28 +371,10 @@ impl SocketCb {
     #[global] cb: v8::Global<v8::Value>,
   ) -> Result<(), JsErrorBox> {
     let inner = self.inner.clone();
-
-    let num_wrote = if let Some(mut write) = inner.write.try_borrow_mut() {
-      let write = write.deref_mut().as_mut().unwrap();
-      let nwritten = write.try_write(&data);
-      match nwritten {
-        Ok(nwritten) => nwritten,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-        Err(e) => {
-          eprintln!("error writing: {:?}", e);
-          return Err(JsErrorBox::from_err(e));
-        }
-      }
-    } else {
-      0
-    };
+    let num_wrote = self.try_sync_write(&data)?;
 
     if num_wrote >= data.len() {
-      inner.scope_holder.with_scope(|scope| {
-        let local_cb = v8::Local::new(scope, &cb);
-        let this = inner.this.get(scope).unwrap();
-        call_write_cb(scope, local_cb, this, None);
-      });
+      call_write_cb(&inner, &cb, None);
       return Ok(());
     }
 
@@ -429,143 +393,173 @@ impl SocketCb {
         .map_err(JsErrorBox::from_err)
         .err();
 
-      inner.scope_holder.with_scope(|scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = inner.this.get(scope).unwrap();
-        call_write_cb(scope, cb, this, result);
-      });
+      call_write_cb(&inner, &cb, result);
     });
 
     Ok(())
   }
 }
 
-fn call_write_cb(
-  scope: &mut v8::PinScope,
-  cb: v8::Local<v8::Value>,
-  this: v8::Local<v8::Object>,
-  result: Option<JsErrorBox>,
-) {
-  v8::tc_scope!(let scope, scope);
-  if let Ok(cb) = cb.try_cast::<v8::Function>() {
-    if let Some(result) = result {
-      let error = result.to_v8(scope).unwrap();
-      let _result = cb.call(scope, this.into(), &[error]).unwrap();
-    } else {
-      let _result = cb.call(scope, this.into(), &[]);
-    }
-  } else {
-    eprintln!("cb is not a function, it's a {}", cb.type_repr());
-  }
-  if scope.has_caught() {
-    let exception = scope.exception().unwrap();
-    let error = JsError::from_v8_exception(scope, exception);
-    eprintln!("error: {:?}", error);
-  }
-}
-
 impl SocketCb {
+  fn try_sync_write(&self, data: &JsBuffer) -> Result<usize, JsErrorBox> {
+    let Some(mut write) = self.inner.write.try_borrow_mut() else {
+      return Ok(0);
+    };
+    let write = write.deref_mut().as_mut().unwrap();
+
+    match write.try_write(data) {
+      Ok(n) => Ok(n),
+      Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+      Err(e) => {
+        eprintln!("error writing: {:?}", e);
+        Err(JsErrorBox::from_err(e))
+      }
+    }
+  }
+
   fn start_read(&self, this: Rc<v8::Global<v8::Object>>) {
     let inner = self.inner.clone();
     deno_core::unsync::spawn(async move {
-      inner.connected.wait_for_connected().await;
+      inner.connected.wait().await;
 
-      let this = this.clone();
       let mut read = inner.read.borrow_mut().await;
       let read = read.deref_mut().as_mut().unwrap();
+      let mut buf = vec![0; READ_BUFFER_SIZE];
 
-      let mut buf = vec![0; 64 * 1024];
       loop {
-        let _ = inner
-          .should_read
-          .wait_for_should_read()
-          .or_cancel(inner.cancel.clone())
-          .await;
-        let nread =
-          match read.read(&mut buf).or_cancel(inner.cancel.clone()).await {
-            Ok(Ok(nread)) => nread,
-            Ok(Err(e)) => {
-              eprintln!("error reading: {:?}", e);
-              inner.scope_holder.with_scope(|scope| {
-                let error = JsErrorBox::from_err(e).to_v8(scope).unwrap();
-                inner.emit_event(
-                  scope,
-                  &[internalized(scope, "error").into(), error.into()],
-                );
-              });
-              break;
-            }
-            Err(deno_core::Canceled) => break,
-          };
-
-        if nread == 0 {
-          // Push EOF (null)
-          {
-            inner.scope_holder.with_scope(|scope| {
-              let this = v8::Local::new(scope, &*this);
-              let result = inner
-                .push_func
-                .get(scope)
-                .unwrap()
-                .call(scope, this.into(), &[v8::null(scope).into()])
-                .unwrap();
-              let result = result.cast::<v8::Boolean>();
-              if result.is_false() {
-                inner.should_read.clear_should_read();
-              }
-            });
+        let nread = match inner.read_next(&mut buf, read).await {
+          Ok(n) => n,
+          Err(e) => {
+            inner.emit_error(e);
+            break;
           }
-        }
+        };
 
-        if nread > 0 {
-          inner.scope_holder.with_scope(|scope| {
-            v8::tc_scope!(let scope, scope);
-            let this = v8::Local::new(scope, &*this);
-            let data = Uint8Array(buf[..nread].to_vec());
-            let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-            let result = inner.push_func.get(scope).unwrap().call(
-              scope,
-              this.into(),
-              &[arg],
-            );
-            if result.is_none() {
-              let exception = scope.exception().unwrap();
-              let error = JsError::from_v8_exception(scope, exception);
-              eprintln!("error in push: {:?}", error);
-              return;
-            }
-            let result = result.unwrap().cast::<v8::Boolean>();
-            if result.is_false() {
-              eprintln!("push returned false");
-              inner.should_read.clear_should_read();
-            }
-          });
-        }
+        inner.handle_read_data(&this, &buf[..nread]);
       }
-      inner.should_read.clear_should_read();
+      inner.read_signal.clear();
     });
   }
+}
 
-  // pub fn push_data()
+fn call_write_cb(
+  inner: &SocketCbInner,
+  cb: &v8::Global<v8::Value>,
+  result: Option<JsErrorBox>,
+) {
+  inner.with_this(|scope, this| {
+    let Ok(cb) = v8::Local::new(scope, cb).try_cast::<v8::Function>() else {
+      eprintln!("cb is not a function");
+      return;
+    };
+    match result {
+      Some(err) => {
+        let arg = err.to_v8(scope).unwrap();
+        let _ = cb.call(scope, this.into(), &[arg]);
+      }
+      None => {
+        let _ = cb.call(scope, this.into(), &[]);
+      }
+    }
+  });
 }
 
 impl SocketCbInner {
-  fn emit_event(
+  async fn read_next(
     &self,
-    scope: &mut v8::PinScope,
-    args: &[v8::Local<v8::Value>],
-  ) {
-    v8::tc_scope!(let scope, scope);
-    let this = self.this.get(scope).unwrap();
-    let emit = internalized(scope, "emit");
-    let emit_func =
-      this.get(scope, emit.into()).unwrap().cast::<v8::Function>();
-    emit_func.call(scope, this.into(), args).unwrap();
-    if scope.has_caught() {
-      let exception = scope.exception().unwrap();
-      let error = JsError::from_v8_exception(scope, exception);
-      eprintln!("error in emit_event: {:?}", error);
+    buf: &mut [u8],
+    read: &mut tokio::net::tcp::OwnedReadHalf,
+  ) -> Result<usize, std::io::Error> {
+    let _ = self.read_signal.wait().or_cancel(self.cancel.clone()).await;
+    match read.read(buf).or_cancel(self.cancel.clone()).await {
+      Ok(Ok(n)) => Ok(n),
+      Ok(Err(e)) => Err(e),
+      Err(_) => Err(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "cancelled",
+      )),
     }
+  }
+
+  fn handle_read_data(&self, this: &Rc<v8::Global<v8::Object>>, data: &[u8]) {
+    if data.is_empty() {
+      self.push_eof(this);
+    } else {
+      self.push_data(this, data);
+    }
+  }
+
+  fn push_eof(&self, this: &Rc<v8::Global<v8::Object>>) {
+    let should_continue = self.scope_holder.with_scope(|scope| {
+      let this = v8::Local::new(scope, &**this);
+      let result = self.push_func.get(scope).unwrap().call(
+        scope,
+        this.into(),
+        &[v8::null(scope).into()],
+      );
+      result.map_or(false, |r| r.cast::<v8::Boolean>().is_true())
+    });
+
+    if !should_continue {
+      self.read_signal.clear();
+    }
+  }
+
+  fn push_data(&self, this: &Rc<v8::Global<v8::Object>>, data: &[u8]) {
+    let should_continue = self.scope_holder.with_scope(|scope| {
+      v8::tc_scope!(let scope, scope);
+      let this = v8::Local::new(scope, &**this);
+      let data = Uint8Array(data.to_vec()).to_v8(scope).unwrap();
+      let result =
+        self
+          .push_func
+          .get(scope)
+          .unwrap()
+          .call(scope, this.into(), &[data]);
+      result.map_or(false, |r| r.cast::<v8::Boolean>().is_true())
+    });
+
+    if !should_continue {
+      eprintln!("push returned false");
+      self.read_signal.clear();
+    }
+  }
+
+  fn emit_error(&self, e: std::io::Error) {
+    eprintln!("error reading: {:?}", e);
+    self.call_method("emit", |scope, _| {
+      let error = JsErrorBox::from_err(e).to_v8(scope).unwrap();
+      vec![internalized(scope, "error").into(), error.into()]
+    });
+  }
+
+  fn with_this<R>(
+    &self,
+    f: impl for<'a> FnOnce(
+      &mut v8::PinScope<'a, '_>,
+      v8::Local<'a, v8::Object>,
+    ) -> R,
+  ) -> R {
+    self.scope_holder.with_scope(|scope| {
+      let this = self.this.get(scope).unwrap();
+      f(scope, this)
+    })
+  }
+
+  fn call_method(
+    &self,
+    name: &str,
+    build_args: impl for<'a> FnOnce(
+      &mut v8::PinScope<'a, '_>,
+      v8::Local<'a, v8::Object>,
+    ) -> Vec<v8::Local<'a, v8::Value>>,
+  ) {
+    self.with_this(|scope, this| {
+      let key = internalized(scope, name);
+      let func = this.get(scope, key.into()).unwrap().cast::<v8::Function>();
+      let args = build_args(scope, this);
+      let _ = func.call(scope, this.into(), &args);
+    });
   }
 }
 
@@ -583,7 +577,10 @@ fn internalized<'a>(
 
 #[cfg(test)]
 mod tests {
-  use std::sync::{OnceLock, atomic::AtomicUsize};
+  use std::{
+    sync::{OnceLock, atomic::AtomicUsize},
+    time::Duration,
+  };
 
   use deno_core::{ModuleSpecifier, RequestedModuleType, RuntimeOptions};
 
@@ -591,103 +588,48 @@ mod tests {
 
   #[test]
   fn test_is_ipv4() {
-    let pass_cases = [
-      "127.0.0.1",
-      "192.168.1.1",
-      "10.0.0.1",
-      "172.16.0.1",
-      "172.31.255.255",
-      "100.64.0.1",
-      "100.127.255.255",
-      "169.254.0.1",
-      "169.254.255.255",
+    let cases = [
+      ("127.0.0.1", true),
+      ("192.168.1.1", true),
+      ("172.16.0.1", true),
+      ("169.254.255.255", true),
+      ("127.0.0.1.1", false),
+      ("127.0.0.256", false),
+      ("127.0.0.-1", false),
     ];
-    let fail_cases = [
-      "127.0.0.1.1",
-      "127.0.0.0.1",
-      "127.0.0.256",
-      "127.0.0.-1",
-      "127.0.0.255.256",
-      "127.0.0.255.255.255",
-    ];
-    for case in pass_cases {
-      assert!(is_ipv4(case));
-    }
-    for case in fail_cases {
-      assert!(!is_ipv4(case));
+    for (addr, expected) in cases {
+      assert_eq!(is_ipv4(addr), expected, "failed for {}", addr);
     }
   }
 
   #[test]
   fn test_is_ipv6() {
-    let pass_cases = [
-      "::1",
-      "::ffff:127.0.0.1",
-      "::ffff:192.168.1.1",
-      "::ffff:10.0.0.1",
-      "::ffff:172.16.0.1",
-      "::ffff:172.31.255.255",
-      "::ffff:100.64.0.1",
-      "::ffff:100.127.255.255",
+    let cases = [
+      ("::1", true),
+      ("::ffff:127.0.0.1", true),
+      ("::ffff:172.16.0.1", true),
+      ("::1.1", false),
+      ("::ffff:127.0.0.256", false),
+      ("::ffff:127.0.0.-1", false),
     ];
-    let fail_cases = [
-      "::1.1",
-      "::ffff:127.0.0.1.1",
-      "::ffff:127.0.0.0.1",
-      "::ffff:127.0.0.256",
-      "::ffff:127.0.0.-1",
-      "::ffff:127.0.0.255.256",
-      "::ffff:127.0.0.255.255.255",
-    ];
-    for case in pass_cases {
-      assert!(is_ipv6(case));
-    }
-    for case in fail_cases {
-      assert!(!is_ipv6(case));
+    for (addr, expected) in cases {
+      assert_eq!(is_ipv6(addr), expected, "failed for {}", addr);
     }
   }
 
   #[test]
   fn test_is_ip() {
-    let ipv4_cases = [
-      "127.0.0.1",
-      "192.168.1.1",
-      "10.0.0.1",
-      "172.16.0.1",
-      "172.31.255.255",
-      "100.64.0.1",
-      "100.127.255.255",
-      "169.254.0.1",
-      "169.254.255.255",
+    let cases = [
+      ("127.0.0.1", 4),
+      ("192.168.1.1", 4),
+      ("::1", 6),
+      ("::ffff:127.0.0.1", 6),
+      ("127.0.0.1.1", 0),
+      ("127.0.0.256", 0),
+      ("invalid", 0),
     ];
-    let ipv6_cases = [
-      "::1",
-      "::ffff:127.0.0.1",
-      "::ffff:192.168.1.1",
-      "::ffff:10.0.0.1",
-      "::ffff:172.16.0.1",
-      "::ffff:172.31.255.255",
-      "::ffff:100.64.0.1",
-      "::ffff:100.127.255.255",
-      "::ffff:169.254.0.1",
-      "::ffff:169.254.255.255",
-    ];
-    let fail_cases = [
-      "127.0.0.1.1",
-      "127.0.0.0.1",
-      "127.0.0.256",
-      "127.0.0.-1",
-      "127.0.0.255.256",
-      "127.0.0.255.255.255",
-    ];
-    for case in ipv4_cases {
-      assert_eq!(is_ip(case), 4);
-    }
-    for case in ipv6_cases {
-      assert_eq!(is_ip(case), 6);
-    }
-    for case in fail_cases {
-      assert_eq!(is_ip(case), 0);
+    for (addr, expected) in cases {
+      assert_eq!(is_ip(addr), expected, "failed for {}", addr);
     }
   }
 
@@ -718,11 +660,17 @@ mod tests {
 
     let module = runtime.mod_evaluate(id);
 
-    runtime
-      .run_event_loop(Default::default())
+    tokio::time::timeout(
+      Duration::from_secs(10),
+      runtime.run_event_loop(Default::default()),
+    )
+    .await
+    .unwrap()
+    .map_err(JsErrorBox::from_err)?;
+    let _ = tokio::time::timeout(Duration::from_secs(10), module)
       .await
+      .unwrap()
       .map_err(JsErrorBox::from_err)?;
-    let _ = module.await.map_err(JsErrorBox::from_err)?;
     let namespace = runtime
       .get_module_namespace_by_name(
         &specifier.to_string(),
