@@ -71,7 +71,7 @@ deno_core::extension!(
     ops::op_prop_access_static_uncached,
     ops::op_prop_access_internalized_uncached,
 
-    ops_net::op_set_duplex_constructor,
+    ops_net::op_set_constructors,
     ops_net::op_is_ipv4,
     ops_net::op_is_ipv6,
     ops_net::op_is_ip,
@@ -84,6 +84,7 @@ deno_core::extension!(
     ops::TestEnumWrap,
     ops::Socket,
     ops_net::SocketCb,
+    ops_net::Server,
   ],
   esm_entry_point = "ext:checkin_runtime/__init.js",
   esm = [

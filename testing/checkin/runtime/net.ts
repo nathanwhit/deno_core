@@ -1,8 +1,10 @@
-import { op_set_duplex_constructor, SocketCb } from "ext:core/ops";
+import { Server, SocketCb } from "ext:core/ops";
 import { Duplex } from "node:stream";
-import { kState } from "ext:checkin_node/internal/streams/utils.js";
+import { EventEmitter } from "node:events";
 
 Object.setPrototypeOf(SocketCb, Duplex);
 Object.setPrototypeOf(SocketCb.prototype, Duplex.prototype);
+Object.setPrototypeOf(Server, EventEmitter);
+Object.setPrototypeOf(Server.prototype, EventEmitter.prototype);
 
-export { SocketCb };
+export { Server, SocketCb };

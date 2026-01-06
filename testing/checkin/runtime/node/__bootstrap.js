@@ -1,4 +1,4 @@
-import { op_set_duplex_constructor } from "ext:core/ops";
+import { op_set_constructors } from "ext:core/ops";
 import {
   processTicksAndRejections,
   runNextTicks,
@@ -59,7 +59,7 @@ export function init(globalThis) {
   core.setNextTickCallback(processTicksAndRejections);
   core.setMacrotaskCallback(runNextTicks);
 
-  op_set_duplex_constructor(stream.Duplex);
+  op_set_constructors(stream.Duplex, events.EventEmitter);
 }
 
 export default init;

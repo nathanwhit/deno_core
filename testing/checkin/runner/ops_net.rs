@@ -2,6 +2,7 @@ use deno_core::AsyncRefCell;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::ExternalOpsTracker;
+use deno_core::GarbageCollected;
 use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::ToV8;
@@ -193,6 +194,8 @@ struct SocketCbInner {
   scope_holder: ScopeHolder,
 
   should_read: Rc<ShouldReadState>,
+
+  emit_func: Rc<v8::TracedReference<v8::Function>>,
 }
 
 pub struct SocketCb {
@@ -203,6 +206,7 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
     self.inner.push_func.trace(visitor);
     self.inner.this.trace(visitor);
+    self.inner.emit_func.trace(visitor);
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
@@ -211,15 +215,31 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
 }
 
 #[op2]
-pub fn op_set_duplex_constructor(
+pub fn op_set_constructors(
   op_state: &mut OpState,
-  #[global] cons: v8::Global<v8::Function>,
+  #[global] duplex_constructor: v8::Global<v8::Function>,
+  #[global] event_emitter_constructor: v8::Global<v8::Function>,
 ) {
-  op_state.put(SocketConstructor(Rc::new(cons)));
+  op_state.put(Constructors {
+    duplex: Rc::new(duplex_constructor),
+    event_emitter: Rc::new(event_emitter_constructor),
+  });
 }
 
 #[derive(Clone)]
-struct SocketConstructor(Rc<v8::Global<v8::Function>>);
+struct Constructors {
+  duplex: Rc<v8::Global<v8::Function>>,
+  event_emitter: Rc<v8::Global<v8::Function>>,
+}
+
+impl Constructors {
+  fn event_emitter<'s>(
+    &self,
+    scope: &v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    v8::Local::new(scope, &*self.event_emitter)
+  }
+}
 
 struct ScopeHolder(deno_core::V8TaskSpawner);
 
@@ -237,29 +257,25 @@ impl ScopeHolder {
   }
 }
 
-#[op2]
 impl SocketCb {
-  #[constructor]
-  #[cppgc]
-  #[reentrant]
-  pub fn new(
-    #[this] me: v8::Global<v8::Object>,
+  fn new_inner(
+    me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
-    #[string] host: String,
-    #[smi] port: u16,
+    host: String,
+    port: u16,
   ) -> Result<SocketCb, JsErrorBox> {
     let (ops_tracker, super_cons, spawner) = {
       let op_state = op_state.borrow();
       (
         op_state.external_ops_tracker.clone(),
-        op_state.borrow::<SocketConstructor>().clone(),
+        op_state.borrow::<Constructors>().clone(),
         op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
       )
     };
 
     let local_me = v8::Local::new(&scope, &me);
-    let cons = v8::Local::new(scope, &*super_cons.0);
+    let cons = v8::Local::new(scope, &*super_cons.duplex);
     let this = Rc::new(v8::TracedReference::new(scope, local_me));
 
     cons.call(scope, local_me.into(), &[]).unwrap();
@@ -270,6 +286,13 @@ impl SocketCb {
       .cast::<v8::Function>();
     let push_func = Rc::new(v8::TracedReference::new(scope, push_func));
     let scope_holder = ScopeHolder::new(spawner);
+
+    let emit = internalized(scope, "emit");
+    let emit_func = local_me
+      .get(scope, emit.into())
+      .unwrap()
+      .cast::<v8::Function>();
+    let emit_func = Rc::new(v8::TracedReference::new(scope, emit_func));
 
     let cb = SocketCb {
       inner: Rc::new(SocketCbInner {
@@ -284,9 +307,26 @@ impl SocketCb {
         connected: Rc::new(ConnectedState::new()),
         scope_holder,
         should_read: Rc::new(ShouldReadState::new()),
+        emit_func,
       }),
     };
     Ok(cb)
+  }
+}
+
+#[op2]
+impl SocketCb {
+  #[constructor]
+  #[cppgc]
+  #[reentrant]
+  pub fn new(
+    #[this] me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+    #[string] host: String,
+    #[smi] port: u16,
+  ) -> Result<SocketCb, JsErrorBox> {
+    SocketCb::new_inner(me, scope, op_state, host, port)
   }
 
   #[async_method]
@@ -311,7 +351,7 @@ impl SocketCb {
 
   #[fast]
   #[rename("_read")]
-  fn read(&self, #[this] me: v8::Global<v8::Object>) {
+  fn read(&self) {
     self.inner.should_read.set_should_read();
     // If we're already reading, don't start another read or set kSync
     // This prevents kSync from being set while the async task is calling push()
@@ -319,7 +359,7 @@ impl SocketCb {
       return;
     }
 
-    self.start_read(Rc::new(me));
+    self.inner.start_read();
   }
 
   #[fast]
@@ -461,9 +501,10 @@ fn call_write_cb(
   }
 }
 
-impl SocketCb {
-  fn start_read(&self, this: Rc<v8::Global<v8::Object>>) {
-    let inner = self.inner.clone();
+impl SocketCbInner {
+  fn start_read(self: &Rc<Self>) {
+    let inner = self.clone();
+    let this = inner.this.clone();
     deno_core::unsync::spawn(async move {
       inner.connected.wait_for_connected().await;
 
@@ -495,7 +536,7 @@ impl SocketCb {
               break;
             }
             Err(deno_core::Canceled) => {
-              eprintln!("canceled");
+              // eprintln!("canceled");
               break;
             }
           };
@@ -506,7 +547,7 @@ impl SocketCb {
             let inner2 = inner.clone();
             let this = this.clone();
             inner.scope_holder.with_scope(move |scope| {
-              let this = v8::Local::new(scope, &*this);
+              let this = this.get(scope).unwrap();
               let result = inner2
                 .push_func
                 .get(scope)
@@ -527,7 +568,7 @@ impl SocketCb {
           let inner2 = inner.clone();
           inner.scope_holder.with_scope(move |scope| {
             v8::tc_scope!(let scope, scope);
-            let this = v8::Local::new(scope, &*this);
+            let this = this.get(scope).unwrap();
             let data = Uint8Array(buf);
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
             let result = inner2.push_func.get(scope).unwrap().call(
@@ -556,17 +597,18 @@ impl SocketCb {
   // pub fn push_data()
 }
 
-impl SocketCbInner {
-  fn emit_event(
+impl EventEmitter for SocketCbInner {
+  fn this<'s>(
     &self,
-    scope: &mut v8::PinScope,
-    args: &[v8::Local<v8::Value>],
-  ) {
-    let this = self.this.get(scope).unwrap();
-    let emit = internalized(scope, "emit");
-    let emit_func =
-      this.get(scope, emit.into()).unwrap().cast::<v8::Function>();
-    emit_func.call(scope, this.into(), args);
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Object> {
+    self.this.get(scope).unwrap()
+  }
+  fn cached_emit_func<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    self.emit_func.get(scope).unwrap()
   }
 }
 
@@ -580,6 +622,183 @@ fn internalized<'a>(
     v8::NewStringType::Internalized,
   )
   .unwrap()
+}
+
+unsafe impl GarbageCollected for Server {
+  fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
+    if let Some(on_listening) = &self.inner.on_listening {
+      on_listening.trace(visitor);
+    }
+  }
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"Server"
+  }
+}
+
+pub struct Server {
+  inner: Rc<ServerInner>,
+}
+
+struct ServerInner {
+  host: RefCell<String>,
+  port: RefCell<u16>,
+  on_listening: Option<v8::TracedReference<v8::Function>>,
+  holder: Rc<ScopeHolder>,
+  op_state: Rc<RefCell<OpState>>,
+  this: Rc<v8::Global<v8::Object>>,
+  ref_tracker: RefTracker,
+  emit_func: Rc<v8::Global<v8::Function>>,
+}
+
+#[op2]
+impl Server {
+  #[constructor]
+  #[cppgc]
+  fn new(
+    #[this] me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+  ) -> Server {
+    let (ops_tracker, super_cons, spawner) = {
+      let op_state = op_state.borrow();
+      (
+        op_state.external_ops_tracker.clone(),
+        op_state.borrow::<Constructors>().clone(),
+        op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
+      )
+    };
+    let local_me = v8::Local::new(scope, &me);
+    let holder = ScopeHolder::new(spawner);
+    super_cons
+      .event_emitter(scope)
+      .call(scope, v8::Local::new(scope, &me).into(), &[])
+      .unwrap();
+
+    let this = Rc::new(v8::Global::new(scope, local_me));
+    let emit = internalized(scope, "emit");
+    let emit_func = local_me
+      .get(scope, emit.into())
+      .unwrap()
+      .cast::<v8::Function>();
+    let emit_func = Rc::new(v8::Global::new(scope, emit_func));
+    Server {
+      inner: Rc::new(ServerInner {
+        host: RefCell::new(String::new()),
+        port: RefCell::new(0),
+        on_listening: None,
+        holder: Rc::new(holder),
+        op_state,
+        this,
+        ref_tracker: RefTracker::new(ops_tracker),
+        emit_func,
+      }),
+    }
+  }
+
+  #[fast]
+  fn listen(&self, #[smi] port: u16, #[string] host: String) {
+    let inner = self.inner.clone();
+    *inner.port.borrow_mut() = port;
+    *inner.host.borrow_mut() = host;
+    inner.ref_tracker.ref_();
+    deno_core::unsync::spawn(async move {
+      let listener = tokio::net::TcpListener::bind((
+        inner.host.borrow().as_str(),
+        *inner.port.borrow(),
+      ))
+      .await
+      .map_err(JsErrorBox::from_err)
+      .unwrap();
+      inner.holder.with_scope({
+        let inner = inner.clone();
+        move |scope| {
+          inner.emit_event(scope, &[internalized(scope, "listening").into()]);
+        }
+      });
+
+      loop {
+        let (stream, addr) = listener.accept().await.unwrap();
+        inner.holder.with_scope({
+          let inner = inner.clone();
+          move |scope| {
+            let empty =
+              deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
+            let socket = SocketCb::new_inner(
+              v8::Global::new(scope, empty),
+              scope,
+              inner.op_state.clone(),
+              addr.ip().to_string(),
+              addr.port() as u16,
+            );
+            match socket {
+              Ok(socket) => {
+                let socket_inner = socket.inner.clone();
+                let socket_obj =
+                  deno_core::cppgc::wrap_object(scope, empty, socket);
+                let socket_obj = v8::Global::new(scope, socket_obj);
+                let (read, write) = stream.into_split();
+                *socket_inner.write.try_borrow_mut().unwrap() = Some(write);
+                *socket_inner.read.try_borrow_mut().unwrap() = Some(read);
+                socket_inner.connected.set_connected(true);
+                socket_inner.start_read();
+                inner.holder.with_scope({
+                  let inner = inner.clone();
+                  move |scope| {
+                    let socket_obj = v8::Local::new(scope, socket_obj);
+                    inner.emit_event(
+                      scope,
+                      &[
+                        internalized(scope, "connection").into(),
+                        socket_obj.into(),
+                      ],
+                    );
+                  }
+                });
+              }
+              Err(e) => {
+                eprintln!("error creating socket: {:?}", e);
+              }
+            }
+          }
+        });
+      }
+    });
+  }
+}
+
+pub trait EventEmitter {
+  fn this<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Object>;
+  fn cached_emit_func<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function>;
+  fn emit_event(
+    &self,
+    scope: &mut v8::PinScope,
+    args: &[v8::Local<v8::Value>],
+  ) {
+    let this = self.this(scope);
+    let emit_func = self.cached_emit_func(scope);
+    emit_func.call(scope, this.into(), args);
+  }
+}
+
+impl EventEmitter for ServerInner {
+  fn this<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Object> {
+    v8::Local::new(scope, &*self.this)
+  }
+  fn cached_emit_func<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    v8::Local::new(scope, &*self.emit_func)
+  }
 }
 
 #[cfg(test)]

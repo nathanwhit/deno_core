@@ -6,7 +6,7 @@ const prom = Promise.withResolvers<void>();
 const iters = 1000000;
 let got = 0;
 // const expected = iters * 5;
-const expected = 100 * 1024 * 1024;
+const expected = 4 * 1024 * 1024 * 1024;
 socket.connect(8080, "localhost");
 const start = performance.now();
 const lengths: Record<number, number> = {};
@@ -23,7 +23,6 @@ socket.on("error", (error) => {
   prom.reject(error);
 });
 
-socket.end(new Uint8Array([1, 2, 3, 4, 5]));
 // socket.destroy();
 
 // const writeProm = Promise.withResolvers<void>();

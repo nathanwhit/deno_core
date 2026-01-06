@@ -23,6 +23,7 @@ globalThis.setTimeout = timers.setTimeout;
 globalThis.setInterval = timers.setInterval;
 globalThis.clearTimeout = timers.clearTimeout;
 globalThis.clearInterval = timers.clearInterval;
+
 globalThis.Worker = worker.Worker;
 globalThis.performance = {
   now: timers.now,
