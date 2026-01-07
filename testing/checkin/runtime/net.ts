@@ -7,4 +7,4 @@ Object.setPrototypeOf(SocketCb.prototype, Duplex.prototype);
 Object.setPrototypeOf(Server, EventEmitter);
 Object.setPrototypeOf(Server.prototype, EventEmitter.prototype);
 
-export { Server, SocketCb };
+export { Server, SocketCb as Socket };

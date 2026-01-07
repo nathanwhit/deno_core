@@ -68,6 +68,20 @@ export class ERR_STREAM_UNSHIFT_AFTER_END_EVENT extends Error {
   }
 }
 
+export class ERR_STREAM_ALREADY_FINISHED extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_STREAM_ALREADY_FINISHED";
+  }
+}
+
+export class ERR_STREAM_DESTROYED extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ERR_STREAM_DESTROYED";
+  }
+}
+
 export class ERR_UNKNOWN_ENCODING extends Error {
   constructor(message: string) {
     super(message);
@@ -87,6 +101,8 @@ export default {
     ERR_METHOD_NOT_IMPLEMENTED,
     ERR_STREAM_PUSH_AFTER_EOF,
     ERR_STREAM_UNSHIFT_AFTER_END_EVENT,
+    ERR_STREAM_ALREADY_FINISHED,
+    ERR_STREAM_DESTROYED,
     ERR_UNKNOWN_ENCODING,
   },
 };

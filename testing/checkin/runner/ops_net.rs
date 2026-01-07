@@ -6,9 +6,11 @@ use deno_core::GarbageCollected;
 use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::ToV8;
+use deno_core::convert::Smi;
 use deno_core::convert::Uint8Array;
 use deno_core::error::JsError;
 use deno_core::op2;
+use deno_core::serde;
 use deno_core::v8;
 use deno_core::v8::cppgc::Traced;
 use deno_error::JsErrorBox;
@@ -184,8 +186,8 @@ struct SocketCbInner {
   write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
   read: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedReadHalf>>>,
   push_func: Rc<v8::TracedReference<v8::Function>>,
-  host: String,
-  port: u16,
+  host: RefCell<Option<String>>,
+  port: RefCell<Option<u16>>,
   this: Rc<v8::TracedReference<v8::Object>>,
 
   ref_tracker: RefTracker,
@@ -257,13 +259,29 @@ impl ScopeHolder {
   }
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", crate = "serde")]
+struct SocketOptions {
+  #[serde(default)]
+  allow_half_open: Option<bool>,
+}
+
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase", crate = "serde")]
+struct DuplexOptions {
+  allow_half_open: Option<bool>,
+  emit_close: bool,
+  auto_destroy: bool,
+}
+
 impl SocketCb {
   fn new_inner(
     me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
-    host: String,
-    port: u16,
+    options: SocketOptions,
+    host: Option<String>,
+    port: Option<u16>,
   ) -> Result<SocketCb, JsErrorBox> {
     let (ops_tracker, super_cons, spawner) = {
       let op_state = op_state.borrow();
@@ -278,7 +296,16 @@ impl SocketCb {
     let cons = v8::Local::new(scope, &*super_cons.duplex);
     let this = Rc::new(v8::TracedReference::new(scope, local_me));
 
-    cons.call(scope, local_me.into(), &[]).unwrap();
+    let duplex_options = DuplexOptions {
+      allow_half_open: Some(options.allow_half_open.unwrap_or(false)),
+      emit_close: false,
+      auto_destroy: true,
+    };
+    let duplex_options =
+      deno_core::serde_v8::to_v8(scope, &duplex_options).unwrap();
+    cons
+      .call(scope, local_me.into(), &[duplex_options])
+      .unwrap();
     let push = internalized(scope, "push");
     let push_func = local_me
       .get(scope, push.into())
@@ -300,8 +327,8 @@ impl SocketCb {
         read: Rc::new(AsyncRefCell::new(None)),
         push_func,
         cancel: Rc::new(CancelHandle::new()),
-        host,
-        port,
+        host: RefCell::new(host),
+        port: RefCell::new(port),
         this,
         ref_tracker: RefTracker::new(ops_tracker),
         connected: Rc::new(ConnectedState::new()),
@@ -323,28 +350,43 @@ impl SocketCb {
     #[this] me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
-    #[string] host: String,
-    #[smi] port: u16,
+    #[serde] options: Option<SocketOptions>,
   ) -> Result<SocketCb, JsErrorBox> {
-    SocketCb::new_inner(me, scope, op_state, host, port)
+    let options = options.unwrap_or_default();
+    SocketCb::new_inner(me, scope, op_state, options, None, None)
   }
 
   #[async_method]
   pub fn connect<'a, 'b>(
     &self,
+    #[smi] port: Option<u16>,
+    #[string] host: Option<String>,
   ) -> impl Future<Output = Result<(), JsErrorBox>> {
     let inner = self.inner.clone();
     inner.ref_tracker.ref_();
     async move {
-      let stream =
-        tokio::net::TcpStream::connect((inner.host.as_str(), inner.port))
-          .await
-          .map_err(JsErrorBox::from_err)
-          .unwrap();
+      *inner.host.borrow_mut() =
+        Some(host.unwrap_or_else(|| "localhost".to_string()));
+      *inner.port.borrow_mut() = Some(port.unwrap_or(0));
+      let stream = tokio::net::TcpStream::connect((
+        inner.host.borrow().as_deref().unwrap(),
+        inner.port.borrow().unwrap(),
+      ))
+      .await
+      .map_err(JsErrorBox::from_err)
+      .unwrap();
       let (read, write) = stream.into_split();
       *inner.write.borrow_mut().await = Some(write);
       *inner.read.borrow_mut().await = Some(read);
       inner.connected.set_connected(true);
+      inner.start_read();
+      inner.scope_holder.with_scope({
+        let inner = inner.clone();
+        move |scope| {
+          let zero = Smi(0u8).to_v8(scope).unwrap();
+          inner.call_method(scope, "read", &[zero]).unwrap();
+        }
+      });
       Ok(())
     }
   }
@@ -353,11 +395,6 @@ impl SocketCb {
   #[rename("_read")]
   fn read(&self) {
     self.inner.should_read.set_should_read();
-    // If we're already reading, don't start another read or set kSync
-    // This prevents kSync from being set while the async task is calling push()
-    if self.inner.should_read.swap_read_once() {
-      return;
-    }
 
     self.inner.start_read();
   }
@@ -377,6 +414,8 @@ impl SocketCb {
   fn final_(&self, #[global] cb: v8::Global<v8::Function>) {
     let inner = self.inner.clone();
     deno_core::unsync::spawn(async move {
+      inner.connected.wait_for_connected().await;
+
       let mut write = inner.write.borrow_mut().await;
       let write = write.deref_mut().as_mut().unwrap();
       let result = write.shutdown().await.map_err(JsErrorBox::from_err).err();
@@ -410,6 +449,7 @@ impl SocketCb {
         let this = inner2.this.get(scope).unwrap();
         let error = v8::Local::new(scope, &error);
         cb.call(scope, this.into(), &[error]).unwrap();
+        inner2.emit_event(scope, &[internalized(scope, "close").into()]);
       });
       inner.ref_tracker.unref();
     });
@@ -503,6 +543,9 @@ fn call_write_cb(
 
 impl SocketCbInner {
   fn start_read(self: &Rc<Self>) {
+    if self.should_read.swap_read_once() {
+      return;
+    }
     let inner = self.clone();
     let this = inner.this.clone();
     deno_core::unsync::spawn(async move {
@@ -536,29 +579,29 @@ impl SocketCbInner {
               break;
             }
             Err(deno_core::Canceled) => {
-              // eprintln!("canceled");
               break;
             }
           };
-
         if nread == 0 {
           // Push EOF (null)
           {
-            let inner2 = inner.clone();
             let this = this.clone();
-            inner.scope_holder.with_scope(move |scope| {
-              let this = this.get(scope).unwrap();
-              let result = inner2
-                .push_func
-                .get(scope)
-                .unwrap()
-                .call(scope, this.into(), &[v8::null(scope).into()])
-                .unwrap();
-              let result = result.cast::<v8::Boolean>();
-              if result.is_false() {
-                inner2.should_read.clear_should_read();
+            inner.scope_holder.with_scope({
+              let inner = inner.clone();
+              move |scope| {
+                let this = this.get(scope).unwrap();
+                let _result = inner
+                  .push_func
+                  .get(scope)
+                  .unwrap()
+                  .call(scope, this.into(), &[v8::null(scope).into()])
+                  .unwrap();
+                let zero = Smi(0u8).to_v8(scope).unwrap();
+                inner.call_method(scope, "read", &[zero]).unwrap();
               }
             });
+            // if allowHalfOpen is true, we need to call _final
+            break;
           }
         }
 
@@ -597,13 +640,16 @@ impl SocketCbInner {
   // pub fn push_data()
 }
 
-impl EventEmitter for SocketCbInner {
+impl GetThis for SocketCbInner {
   fn this<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Object> {
     self.this.get(scope).unwrap()
   }
+}
+
+impl EventEmitter for SocketCbInner {
   fn cached_emit_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
@@ -611,6 +657,8 @@ impl EventEmitter for SocketCbInner {
     self.emit_func.get(scope).unwrap()
   }
 }
+
+impl Obj for SocketCbInner {}
 
 fn internalized<'a>(
   scope: &v8::PinScope<'a, '_>,
@@ -696,6 +744,11 @@ impl Server {
   }
 
   #[fast]
+  fn unref(&self) {
+    self.inner.ref_tracker.unref();
+  }
+
+  #[fast]
   fn listen(&self, #[smi] port: u16, #[string] host: String) {
     let inner = self.inner.clone();
     *inner.port.borrow_mut() = port;
@@ -727,8 +780,11 @@ impl Server {
               v8::Global::new(scope, empty),
               scope,
               inner.op_state.clone(),
-              addr.ip().to_string(),
-              addr.port() as u16,
+              SocketOptions {
+                allow_half_open: None,
+              },
+              Some(addr.ip().to_string()),
+              Some(addr.port() as u16),
             );
             match socket {
               Ok(socket) => {
@@ -740,6 +796,8 @@ impl Server {
                 *socket_inner.write.try_borrow_mut().unwrap() = Some(write);
                 *socket_inner.read.try_borrow_mut().unwrap() = Some(read);
                 socket_inner.connected.set_connected(true);
+                let zero = Smi(0u8).to_v8(scope).unwrap();
+                socket_inner.call_method(scope, "read", &[zero]).unwrap();
                 socket_inner.start_read();
                 inner.holder.with_scope({
                   let inner = inner.clone();
@@ -766,11 +824,40 @@ impl Server {
   }
 }
 
-pub trait EventEmitter {
+pub trait GetThis {
   fn this<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Object>;
+}
+
+pub trait Obj: GetThis {
+  fn call_method<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    args: &[v8::Local<'s, v8::Value>],
+  ) -> Result<v8::Local<'s, v8::Value>, JsErrorBox> {
+    v8::tc_scope!(let scope, scope);
+    let this = self.this(scope);
+    let method = this
+      .get(scope, internalized(scope, name).into())
+      .unwrap()
+      .cast::<v8::Function>();
+    let value = method.call(scope, this.into(), args);
+    match value {
+      Some(value) => Ok(value),
+      None => {
+        let exception = scope.exception().unwrap();
+        Err(JsErrorBox::from_err(JsError::from_v8_exception(
+          scope, exception,
+        )))
+      }
+    }
+  }
+}
+
+pub trait EventEmitter: GetThis {
   fn cached_emit_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
@@ -786,13 +873,16 @@ pub trait EventEmitter {
   }
 }
 
-impl EventEmitter for ServerInner {
+impl GetThis for ServerInner {
   fn this<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Object> {
     v8::Local::new(scope, &*self.this)
   }
+}
+
+impl EventEmitter for ServerInner {
   fn cached_emit_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
@@ -956,11 +1046,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn constructor_accepts_host_and_port() {
+  async fn constructor_accepts_options() {
     let result = js_test(
       "
-      const { SocketCb } = Deno.core.ops; 
-      new SocketCb('localhost', 8080);
+      import { Socket } from 'checkin:net';
+      new Socket({ allowHalfOpen: true });
     ",
     );
     assert!(result.await.is_ok());
@@ -981,9 +1071,9 @@ mod tests {
     });
     let port = addr.port();
     let code = "
-    import { SocketCb } from 'checkin:net';
+    import { Socket } from 'checkin:net';
     import { equal } from 'checkin:testing';
-    const socket = new SocketCb('localhost', ${PORT});
+    const socket = new Socket();
     
     const expected = new Uint8Array([
       104, 101, 108, 108,
@@ -1002,11 +1092,91 @@ mod tests {
       socket.destroy();
     });
 
-    await socket.connect();
+    await socket.connect(${PORT}, '127.0.0.1');
     await prom.promise;
   "
     .replace("${PORT}", &port.to_string());
     let result = js_test(&code);
     result.await.unwrap();
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn server_accepts_connections() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    drop(listener);
+
+    let code = "
+    import { Server, Socket } from 'checkin:net';
+    
+    const server = new Server();
+    
+    const listeningProm = Promise.withResolvers();
+    const connectionProm = Promise.withResolvers();
+    
+    let connectionCount = 0;
+    const expectedConnections = 3;
+    
+    server.on('listening', () => {
+      console.log('listening');
+      listeningProm.resolve();
+    });
+    
+    server.on('connection', (socket) => {
+      connectionCount++;
+      console.log('connection', connectionCount);
+      socket.destroy();
+      if (connectionCount === expectedConnections) {
+      console.log('resolving connection prom');
+        connectionProm.resolve();
+      }
+    });
+    
+    server.listen(${PORT}, '127.0.0.1');
+    console.log('listening');
+    await listeningProm.promise;
+    console.log('listening prom resolved');
+
+    async function makeConnection() {
+      const socket = new Socket();
+      const closeProm = Promise.withResolvers();
+
+      socket.on('close', () => {
+        console.log('close');
+        closeProm.resolve();
+      });
+      await socket.connect(${PORT}, '127.0.0.1');
+      await closeProm.promise;
+    }
+    
+
+    console.log('making connections');
+    await Promise.all([
+      makeConnection(),
+      makeConnection(),
+      makeConnection(),
+    ]);
+    
+    await connectionProm.promise;
+    console.log('connection prom resolved');
+    
+    if (connectionCount !== expectedConnections) {
+      throw new Error(`Expected ${expectedConnections} connections, got ${connectionCount}`);
+    }
+    
+    console.log('unrefing server');
+    server.unref();
+    export const success = true;
+  "
+    .replace("${PORT}", &port.to_string());
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(timeout, js_test(&code)).await;
+    match result {
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("Test failed: {:?}", e),
+      Err(_) => panic!("Test timed out after {:?}", timeout),
+    }
   }
 }

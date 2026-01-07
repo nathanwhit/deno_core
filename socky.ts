@@ -16,17 +16,29 @@ const lengths: Record<number, number> = {};
 await socket.connect();
 const start = performance.now();
 socket.on("data", (data) => {
-  got += data.length;
-  lengths[data.length] = (lengths[data.length] ?? 0) + 1;
-  if (got === expected) {
-    prom.resolve();
-  }
+  // got += data.length;
+  // lengths[data.length] = (lengths[data.length] ?? 0) + 1;
+  // if (got === expected) {
+  //   prom.resolve();
+  //   // socket.end();
+  // }
+  socket.end();
 });
 
 socket.on("error", (error) => {
   // console.log("GOT ERROR", error);
   prom.reject(error);
 });
+
+socket.on("end", () => {
+  console.log("end");
+});
+
+socket.on("close", () => {
+  console.log("close");
+});
+
+console.log("autodestroy", socket.readable.autoDestroy);
 
 // socket.end(new Uint8Array([1, 2, 3, 4, 5]));
 // socket.destroy();
@@ -50,7 +62,6 @@ socket.on("error", (error) => {
 
 console.log("connected");
 await prom.promise;
-socket.unref();
 console.log("done");
 console.log(got, performance.now() - start);
 console.log(lengths);
