@@ -688,14 +688,20 @@ pub struct Server {
 }
 
 struct ServerInner {
-  host: RefCell<String>,
-  port: RefCell<u16>,
+  host: RefCell<Option<String>>,
+  port: RefCell<Option<u16>>,
   on_listening: Option<v8::TracedReference<v8::Function>>,
   holder: Rc<ScopeHolder>,
   op_state: Rc<RefCell<OpState>>,
   this: Rc<v8::Global<v8::Object>>,
   ref_tracker: RefTracker,
   emit_func: Rc<v8::Global<v8::Function>>,
+}
+
+#[derive(deno_core::ToV8)]
+struct ServerAddress {
+  address: String,
+  port: u16,
 }
 
 #[op2]
@@ -731,8 +737,8 @@ impl Server {
     let emit_func = Rc::new(v8::Global::new(scope, emit_func));
     Server {
       inner: Rc::new(ServerInner {
-        host: RefCell::new(String::new()),
-        port: RefCell::new(0),
+        host: RefCell::new(None),
+        port: RefCell::new(None),
         on_listening: None,
         holder: Rc::new(holder),
         op_state,
@@ -748,20 +754,32 @@ impl Server {
     self.inner.ref_tracker.unref();
   }
 
+  #[to_v8]
+  fn address(&self) -> Option<ServerAddress> {
+    let inner = self.inner.clone();
+    let host = inner.host.borrow();
+    let port = *inner.port.borrow();
+    match (&*host, port) {
+      (Some(host), Some(port)) => Some(ServerAddress {
+        address: host.to_string(),
+        port,
+      }),
+      _ => None,
+    }
+  }
+
   #[fast]
   fn listen(&self, #[smi] port: u16, #[string] host: String) {
     let inner = self.inner.clone();
-    *inner.port.borrow_mut() = port;
-    *inner.host.borrow_mut() = host;
     inner.ref_tracker.ref_();
     deno_core::unsync::spawn(async move {
-      let listener = tokio::net::TcpListener::bind((
-        inner.host.borrow().as_str(),
-        *inner.port.borrow(),
-      ))
-      .await
-      .map_err(JsErrorBox::from_err)
-      .unwrap();
+      let listener = tokio::net::TcpListener::bind((host, port))
+        .await
+        .map_err(JsErrorBox::from_err)
+        .unwrap();
+      let addr = listener.local_addr().unwrap();
+      *inner.port.borrow_mut() = Some(addr.port());
+      *inner.host.borrow_mut() = Some(addr.ip().to_string());
       inner.holder.with_scope({
         let inner = inner.clone();
         move |scope| {

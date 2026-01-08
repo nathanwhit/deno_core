@@ -12,7 +12,7 @@ let count = 0;
 
 server.on("connection", (socket) => {
   // socket.destroy();
-  socket.write(new Uint8Array([1, 2, 3, 4, 5]));
+  // socket.write(new Uint8Array([1, 2, 3, 4, 5]));
   count++;
   socket.on("close", () => {
     console.log("close");
