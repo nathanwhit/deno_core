@@ -419,7 +419,6 @@ pub fn from_arg(
     needs_isolate,
     needs_opstate,
     needs_opctx,
-    fn_args,
     needs_js_runtime_state,
     ..
   } = &mut generator_state;
@@ -785,18 +784,13 @@ pub fn from_arg(
         };
       }
     }
-    Arg::CppGcResource(proto, ty) => {
+    Arg::CppGcResource(ty) => {
       *needs_scope = true;
-      let from_ident = if *proto {
-        quote!(#fn_args.this().into())
-      } else {
-        quote!(#arg_ident)
-      };
+      let from_ident = quote!(#arg_ident);
       let throw_exception =
         throw_type_error(generator_state, format!("expected {}", &ty));
 
       let scope = &generator_state.scope;
-      let try_unwrap_cppgc = &generator_state.try_unwrap_cppgc;
       let ty =
         syn::parse_str::<syn::Path>(ty).expect("Failed to reparse state type");
       if matches!(
@@ -807,7 +801,7 @@ pub fn from_arg(
           | RetVal::Result(.., true)
       ) {
         let tokens = quote! {
-          let Some(mut #arg_ident) = deno_core::_ops::#try_unwrap_cppgc::<#ty>(&mut #scope, #from_ident) else {
+          let Some(mut #arg_ident) = deno_core::_ops::try_unwrap_cppgc_object::<#ty>(&mut #scope, #from_ident) else {
             #throw_exception;
           };
           #arg_ident.root();
@@ -818,7 +812,7 @@ pub fn from_arg(
         tokens
       } else {
         quote! {
-          let Some(#arg_ident) = deno_core::_ops::#try_unwrap_cppgc::<#ty>(&mut #scope, #from_ident) else {
+          let Some(#arg_ident) = deno_core::_ops::try_unwrap_cppgc_object::<#ty>(&mut #scope, #from_ident) else {
             #throw_exception;
           };
           let #arg_ident = unsafe { #arg_ident.as_ref() };
@@ -832,7 +826,6 @@ pub fn from_arg(
       let ty =
         syn::parse_str::<syn::Path>(ty).expect("Failed to reparse state type");
       let scope = &generator_state.scope;
-      let try_unwrap_cppgc = &generator_state.try_unwrap_cppgc;
       if matches!(
         ret_val,
         RetVal::Future(_)
@@ -843,7 +836,7 @@ pub fn from_arg(
         let tokens = quote! {
           let #arg_ident = if #arg_ident.is_null_or_undefined() {
             None
-          } else if let Some(mut #arg_ident) = deno_core::_ops::#try_unwrap_cppgc::<#ty>(&mut #scope, #arg_ident) {
+          } else if let Some(mut #arg_ident) = deno_core::_ops::try_unwrap_cppgc_object::<#ty>(&mut #scope, #arg_ident) {
             #arg_ident.root();
             Some(#arg_ident)
           } else {
@@ -1106,30 +1099,10 @@ pub fn return_value_infallible(
     }
     ArgMarker::Cppgc if generator_state.use_this_cppgc => {
       generator_state.needs_isolate = true;
-      let wrap_object = match ret_type {
-        Arg::CppGcProtochain(chain) => {
-          let wrap_object = format_ident!("wrap_object{}", chain.len());
-          quote!(#wrap_object)
-        }
-        _ => {
-          if generator_state.use_proto_cppgc {
-            quote!(wrap_object1)
-          } else {
-            quote!(wrap_object)
-          }
-        }
-      };
+      let wrap_object = quote!(wrap_object);
       gs_quote!(generator_state(result, scope) => (
            Some(deno_core::cppgc::#wrap_object(&mut #scope, args.this(), #result))
       ))
-    }
-    ArgMarker::Cppgc if generator_state.use_proto_cppgc => {
-      let marker = quote!(deno_core::_ops::RustToV8Marker::<deno_core::_ops::CppGcProtoMarker, _>::from);
-      if ret_type.is_option() {
-        gs_quote!(generator_state(result) => (#result.map(#marker)))
-      } else {
-        gs_quote!(generator_state(result) => (#marker(#result)))
-      }
     }
     ArgMarker::Cppgc => {
       let marker = quote!(deno_core::_ops::RustToV8Marker::<deno_core::_ops::CppGcMarker, _>::from);

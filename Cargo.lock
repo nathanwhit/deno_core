@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "deno_core"
-version = "0.372.0"
+version = "0.375.0"
 dependencies = [
  "anyhow",
  "az",
@@ -689,6 +689,7 @@ dependencies = [
  "fastrand",
  "futures",
  "indexmap",
+ "inventory",
  "libc",
  "parking_lot",
  "paste",
@@ -773,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "deno_ops"
-version = "0.248.0"
+version = "0.251.0"
 dependencies = [
  "indexmap",
  "pretty_assertions",
@@ -1554,6 +1555,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc61209c082fbeb19919bee74b176221b27223e27b65d781eb91af24eb1fb46e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "is-macro"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2314,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "serde_v8"
-version = "0.281.0"
+version = "0.284.0"
 dependencies = [
  "bencher",
  "deno_error",

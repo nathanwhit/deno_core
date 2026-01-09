@@ -808,15 +808,15 @@ fn map_v8_fastcall_arg_to_arg(
       let extract_intermediate = v8_intermediate_to_arg(&arg_ident, arg);
       v8_to_arg(v8, &arg_ident, arg, throw_type_error, extract_intermediate)?
     }
-    Arg::CppGcResource(_, ty) => {
+    Arg::CppGcResource(ty) => {
       let ty =
         syn::parse_str::<syn::Path>(ty).expect("Failed to reparse state type");
 
       *needs_fast_isolate = true;
       let throw_exception =
         throw_type_error(generator_state, format!("expected {ty:?}"));
-      gs_quote!(generator_state(scope, try_unwrap_cppgc) => {
-        let Some(#arg_ident) = deno_core::_ops::#try_unwrap_cppgc::<#ty>(&mut #scope, #arg_ident) else {
+      gs_quote!(generator_state(scope) => {
+        let Some(#arg_ident) = deno_core::_ops::try_unwrap_cppgc_object::<#ty>(&mut #scope, #arg_ident) else {
           #throw_exception
         };
         let #arg_ident = unsafe { #arg_ident.as_ref() };
@@ -828,10 +828,10 @@ fn map_v8_fastcall_arg_to_arg(
         throw_type_error(generator_state, format!("expected {ty}"));
       let ty =
         syn::parse_str::<syn::Path>(ty).expect("Failed to reparse state type");
-      gs_quote!(generator_state(scope, try_unwrap_cppgc) => {
+      gs_quote!(generator_state(scope) => {
         let #arg_ident = if #arg_ident.is_null_or_undefined() {
           None
-        } else if let Some(#arg_ident) = deno_core::_ops::#try_unwrap_cppgc::<#ty>(&mut #scope, #arg_ident) {
+        } else if let Some(#arg_ident) = deno_core::_ops::try_unwrap_cppgc_object::<#ty>(&mut #scope, #arg_ident) {
           Some(#arg_ident)
         } else {
           #throw_exception

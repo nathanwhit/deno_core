@@ -356,9 +356,8 @@ pub enum Arg {
   V8Ref(RefType, V8Arg),
   Numeric(NumericArg, NumericFlag),
   SerdeV8(String),
-  CppGcResource(bool, String),
+  CppGcResource(String),
   OptionCppGcResource(String),
-  CppGcProtochain(Vec<String>),
   FromV8(String),
   ToV8(String),
   WebIDL(String, Vec<WebIDLPair>, Option<WebIDLDefault>),
@@ -492,7 +491,7 @@ impl Arg {
       Arg::Option(t) => Arg::Special(t.clone()),
       Arg::OptionString(t) => Arg::String(*t),
       Arg::OptionBuffer(t, m, s) => Arg::Buffer(*t, *m, *s),
-      Arg::OptionCppGcResource(t) => Arg::CppGcResource(false, t.clone()),
+      Arg::OptionCppGcResource(t) => Arg::CppGcResource(t.clone()),
       _ => return None,
     })
   }
@@ -549,9 +548,7 @@ impl Arg {
           Arg::OptionBuffer(.., BufferSource::TypedArray) => {
             ArgSlowRetval::V8LocalFalliable
           }
-          Arg::CppGcResource(..) | Arg::CppGcProtochain(_) => {
-            ArgSlowRetval::V8Local
-          }
+          Arg::CppGcResource(..) => ArgSlowRetval::V8Local,
           _ => ArgSlowRetval::None,
         }
       }
@@ -568,9 +565,7 @@ impl Arg {
       Arg::SerdeV8(_) => ArgMarker::Serde,
       Arg::Numeric(NumericArg::__SMI__, _) => ArgMarker::Smi,
       Arg::Numeric(_, NumericFlag::Number) => ArgMarker::Number,
-      Arg::CppGcProtochain(_)
-      | Arg::CppGcResource(..)
-      | Arg::OptionCppGcResource(_) => ArgMarker::Cppgc,
+      Arg::CppGcResource(..) | Arg::OptionCppGcResource(_) => ArgMarker::Cppgc,
       Arg::ToV8(_) => ArgMarker::ToV8,
       Arg::VoidUndefined => ArgMarker::Undefined,
       _ => ArgMarker::None,
@@ -857,8 +852,6 @@ pub enum AttributeModifier {
   Number,
   /// #[cppgc], for a resource backed managed by cppgc.
   CppGcResource,
-  /// #[proto]
-  CppGcProto,
   /// Any attribute that we may want to omit if not syntactically valid.
   Ignore,
   /// Varaible-length arguments.
@@ -885,7 +878,6 @@ impl AttributeModifier {
       AttributeModifier::String(_) => "string",
       AttributeModifier::Global => "global",
       AttributeModifier::CppGcResource => "cppgc",
-      AttributeModifier::CppGcProto => "proto",
       AttributeModifier::Ignore => "ignore",
       AttributeModifier::VarArgs => "varargs",
       AttributeModifier::This => "this",
@@ -1333,7 +1325,6 @@ fn parse_attribute(
     "global" => Some(AttributeModifier::Global),
     "this" => Some(AttributeModifier::This),
     "cppgc" => Some(AttributeModifier::CppGcResource),
-    "proto" => Some(AttributeModifier::CppGcProto),
     "to_v8" => Some(AttributeModifier::ToV8),
     "from_v8" => Some(AttributeModifier::FromV8),
     "varargs" => Some(AttributeModifier::VarArgs),
@@ -1571,17 +1562,11 @@ fn parse_type_special(
   }
 }
 
-fn parse_cppgc(
-  position: Position,
-  ty: &Type,
-  proto: bool,
-) -> Result<Arg, ArgError> {
+fn parse_cppgc(position: Position, ty: &Type) -> Result<Arg, ArgError> {
   match (position, ty) {
     (Position::Arg, Type::Reference(of)) if of.mutability.is_none() => {
       match &*of.elem {
-        Type::Path(of) => {
-          Ok(Arg::CppGcResource(proto, stringify_token(&of.path)))
-        }
+        Type::Path(of) => Ok(Arg::CppGcResource(stringify_token(&of.path))),
         _ => Err(ArgError::InvalidCppGcType(stringify_token(&of.elem))),
       }
     }
@@ -1617,16 +1602,7 @@ fn parse_cppgc(
         {
           Ok(Arg::OptionCppGcResource(stringify_token(&path.path)))
         } else {
-          Ok(Arg::CppGcResource(proto, stringify_token(&tp.path)))
-        }
-      }
-      Type::Tuple(tuple) if tuple.elems.len() == 2 => {
-        match (tuple.elems.get(0).unwrap(), tuple.elems.get(1).unwrap()) {
-          (Type::Path(sup), Type::Path(ty)) => Ok(Arg::CppGcProtochain(vec![
-            stringify_token(&sup.path),
-            stringify_token(&ty.path),
-          ])),
-          _ => Err(ArgError::InvalidCppGcType(stringify_token(ty))),
+          Ok(Arg::CppGcResource(stringify_token(&tp.path)))
         }
       }
       _ => Err(ArgError::InvalidCppGcType(stringify_token(ty))),
@@ -1685,9 +1661,8 @@ pub(crate) fn parse_type(
         return Ok(Arg::VarArgs);
       }
       AttributeModifier::CppGcResource => {
-        return parse_cppgc(position, ty, false);
+        return parse_cppgc(position, ty);
       }
-      AttributeModifier::CppGcProto => return parse_cppgc(position, ty, true),
       AttributeModifier::FromV8 if position == Position::RetVal => {
         return Err(ArgError::InvalidAttributePosition(
           primary.name(),

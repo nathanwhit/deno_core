@@ -34,6 +34,8 @@ pub mod webidl;
 
 // Re-exports
 pub use anyhow;
+pub use deno_ops::CppgcBase;
+pub use deno_ops::CppgcInherits;
 pub use deno_ops::FromV8;
 pub use deno_ops::ToV8;
 pub use deno_ops::WebIDL;
@@ -88,12 +90,14 @@ pub use crate::fast_string::FastStringV8AllocationError;
 pub use crate::flags::v8_set_flags;
 pub use crate::inspector::InspectorMsg;
 pub use crate::inspector::InspectorMsgKind;
+pub use crate::inspector::InspectorSessionChannels;
 pub use crate::inspector::InspectorSessionKind;
 pub use crate::inspector::InspectorSessionProxy;
 pub use crate::inspector::InspectorSessionSend;
 pub use crate::inspector::JsRuntimeInspector;
 pub use crate::inspector::LocalInspectorSession;
 pub use crate::inspector::SessionContainer;
+pub use crate::inspector::create_worker_inspector_session_pair;
 pub use crate::io::AsyncResult;
 pub use crate::io::BufMutView;
 pub use crate::io::BufView;
@@ -181,8 +185,10 @@ extern crate self as deno_core;
 pub mod _ops {
   pub use super::cppgc::make_cppgc_object;
   pub use super::cppgc::make_cppgc_proto_object;
+  pub use super::cppgc::try_unwrap_cppgc_base_object;
+  pub use super::cppgc::try_unwrap_cppgc_base_persistent_object;
   pub use super::cppgc::try_unwrap_cppgc_object;
-  pub use super::cppgc::try_unwrap_cppgc_proto_object;
+  pub use super::cppgc::try_unwrap_cppgc_persistent_object;
   pub use super::error::throw_error_js_error_class;
   pub use super::error::throw_error_one_byte;
   pub use super::error::throw_error_one_byte_info;
@@ -200,6 +206,7 @@ pub mod _ops {
   pub use super::runtime::V8_WRAPPER_TYPE_INDEX;
   pub use super::runtime::ops::*;
   pub use super::runtime::ops_rust_to_v8::*;
+  pub use inventory;
 }
 
 pub mod snapshot {
