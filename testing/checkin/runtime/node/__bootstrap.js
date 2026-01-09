@@ -59,7 +59,12 @@ export function init(globalThis) {
   core.setNextTickCallback(processTicksAndRejections);
   core.setMacrotaskCallback(runNextTicks);
 
-  op_set_constructors(stream.Duplex, events.EventEmitter);
+  op_set_constructors(
+    stream.Duplex,
+    events.EventEmitter,
+    legacy.Stream,
+    stream.Readable,
+  );
 }
 
 export default init;

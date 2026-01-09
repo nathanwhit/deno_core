@@ -337,7 +337,6 @@ impl DOMPoint {
 }
 
 #[derive(CppgcBase)]
-#[cppgc_inheritors(DOMPoint)]
 #[repr(C)]
 pub struct DOMPointReadOnly {
   x: GcCell<f64>,

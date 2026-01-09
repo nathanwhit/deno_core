@@ -23,6 +23,8 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::checkin::runner::Constructors;
+
 fn is_ipv4(s: &str) -> bool {
   std::net::Ipv4Addr::from_str(s).is_ok()
 }
@@ -213,33 +215,6 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
 
   fn get_name(&self) -> &'static std::ffi::CStr {
     c"SocketCb"
-  }
-}
-
-#[op2]
-pub fn op_set_constructors(
-  op_state: &mut OpState,
-  #[global] duplex_constructor: v8::Global<v8::Function>,
-  #[global] event_emitter_constructor: v8::Global<v8::Function>,
-) {
-  op_state.put(Constructors {
-    duplex: Rc::new(duplex_constructor),
-    event_emitter: Rc::new(event_emitter_constructor),
-  });
-}
-
-#[derive(Clone)]
-struct Constructors {
-  duplex: Rc<v8::Global<v8::Function>>,
-  event_emitter: Rc<v8::Global<v8::Function>>,
-}
-
-impl Constructors {
-  fn event_emitter<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.event_emitter)
   }
 }
 
@@ -683,11 +658,13 @@ unsafe impl GarbageCollected for Server {
   }
 }
 
+#[derive(deno_core::CppgcBase)]
+#[repr(C)]
 pub struct Server {
-  inner: Rc<ServerInner>,
+  pub(crate) inner: Rc<ServerInner>,
 }
 
-struct ServerInner {
+pub(crate) struct ServerInner {
   host: RefCell<Option<String>>,
   port: RefCell<Option<u16>>,
   on_listening: Option<v8::TracedReference<v8::Function>>,
@@ -704,12 +681,9 @@ struct ServerAddress {
   port: u16,
 }
 
-#[op2]
 impl Server {
-  #[constructor]
-  #[cppgc]
-  fn new(
-    #[this] me: v8::Global<v8::Object>,
+  pub fn new_inner(
+    me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> Server {
@@ -748,6 +722,19 @@ impl Server {
       }),
     }
   }
+}
+
+#[op2]
+impl Server {
+  #[constructor]
+  #[cppgc]
+  fn new(
+    #[this] me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+  ) -> Server {
+    Server::new_inner(me, scope, op_state)
+  }
 
   #[fast]
   fn unref(&self) {
@@ -770,7 +757,13 @@ impl Server {
 
   #[fast]
   fn listen(&self, #[smi] port: u16, #[string] host: String) {
-    let inner = self.inner.clone();
+    self.inner.listen_inner(port, host);
+  }
+}
+
+impl ServerInner {
+  pub fn listen_inner(self: &Rc<Self>, port: u16, host: String) {
+    let inner = self.clone();
     inner.ref_tracker.ref_();
     deno_core::unsync::spawn(async move {
       let listener = tokio::net::TcpListener::bind((host, port))

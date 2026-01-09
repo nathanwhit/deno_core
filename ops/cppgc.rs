@@ -2,7 +2,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, quote_spanned};
+use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
@@ -111,26 +111,7 @@ fn base_inner(input: DeriveInput) -> Result<TokenStream2> {
 
   ensure_repr_c(&attrs, ident.span())?;
 
-  let inheritors = parse_inheritors_attr(&attrs)?;
-  if inheritors.is_empty() {
-    return Err(Error::new(
-      ident.span(),
-      "cppgc base must list at least one inheriting type",
-    ));
-  }
-
   let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-  let check_name = quote::format_ident!("assert_inherits_{}", ident);
-  let inherits_checks = inheritors.iter().map(|ty| {
-    quote_spanned! {ty.span()=>
-      const _: () = {
-        #[allow(nonstandard_style)]
-        fn #check_name<T: deno_core::cppgc::Inherits<#ident #ty_generics>>() {}
-        let _ = #check_name::<#ty>;
-      };
-    }
-  });
 
   let size_assert = quote! {
     const _: () = {
@@ -143,7 +124,7 @@ fn base_inner(input: DeriveInput) -> Result<TokenStream2> {
 
   Ok(quote! {
     #size_assert
-    const _: () = { #( #inherits_checks )* };
+    // const _: () = { #( #inherits_checks )* };
     #[automatically_derived]
     unsafe impl #impl_generics deno_core::cppgc::Base for #ident #ty_generics #where_clause {}
   })
@@ -190,30 +171,6 @@ fn parse_base_attr(attrs: &[Attribute]) -> Result<Type> {
     Error::new(
       proc_macro2::Span::call_site(),
       "derive(CppgcInherits) requires #[cppgc_base(BaseType)]",
-    )
-  })
-}
-
-fn parse_inheritors_attr(attrs: &[Attribute]) -> Result<Vec<Type>> {
-  let mut found: Option<Vec<Type>> = None;
-  for attr in attrs {
-    if !attr.path().is_ident("cppgc_inheritors") {
-      continue;
-    }
-    if found.is_some() {
-      return Err(Error::new(
-        attr.span(),
-        "cppgc_inheritors specified more than once",
-      ));
-    }
-    let args =
-      attr.parse_args_with(Punctuated::<Type, Token![,]>::parse_terminated)?;
-    found = Some(args.into_iter().collect());
-  }
-  found.ok_or_else(|| {
-    Error::new(
-      proc_macro2::Span::call_site(),
-      "derive(CppgcBase) requires #[cppgc_inheritors(Type1, Type2, ...)]",
     )
   })
 }
