@@ -757,12 +757,80 @@ impl Server {
 
   #[fast]
   fn listen(&self, #[smi] port: u16, #[string] host: String) {
-    self.inner.listen_inner(port, host);
+    self.inner.listen_inner::<SocketCallback>(port, host);
+  }
+}
+
+pub trait OnAccept {
+  async fn on_accept(
+    inner: &Rc<ServerInner>,
+    stream: tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+  ) -> Result<(), JsErrorBox>;
+}
+
+pub struct SocketCallback;
+
+impl OnAccept for SocketCallback {
+  async fn on_accept(
+    inner: &Rc<ServerInner>,
+    stream: tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+  ) -> Result<(), JsErrorBox> {
+    inner.holder.with_scope({
+      let inner = inner.clone();
+      move |scope| {
+        let empty =
+          deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
+        let socket = SocketCb::new_inner(
+          v8::Global::new(scope, empty),
+          scope,
+          inner.op_state.clone(),
+          SocketOptions {
+            allow_half_open: None,
+          },
+          Some(addr.ip().to_string()),
+          Some(addr.port() as u16),
+        );
+        match socket {
+          Ok(socket) => {
+            let socket_inner = socket.inner.clone();
+            let socket_obj =
+              deno_core::cppgc::wrap_object(scope, empty, socket);
+            let socket_obj = v8::Global::new(scope, socket_obj);
+            let (read, write) = stream.into_split();
+            *socket_inner.write.try_borrow_mut().unwrap() = Some(write);
+            *socket_inner.read.try_borrow_mut().unwrap() = Some(read);
+            socket_inner.connected.set_connected(true);
+            let zero = Smi(0u8).to_v8(scope).unwrap();
+            socket_inner.call_method(scope, "read", &[zero]).unwrap();
+            socket_inner.start_read();
+            inner.holder.with_scope({
+              let inner = inner.clone();
+              move |scope| {
+                let socket_obj = v8::Local::new(scope, socket_obj);
+                inner.emit_event(
+                  scope,
+                  &[
+                    internalized(scope, "connection").into(),
+                    socket_obj.into(),
+                  ],
+                );
+              }
+            });
+          }
+          Err(e) => {
+            eprintln!("error creating socket: {:?}", e);
+          }
+        }
+      }
+    });
+    Ok(())
   }
 }
 
 impl ServerInner {
-  pub fn listen_inner(self: &Rc<Self>, port: u16, host: String) {
+  pub fn listen_inner<T: OnAccept>(self: &Rc<Self>, port: u16, host: String) {
     let inner = self.clone();
     inner.ref_tracker.ref_();
     deno_core::unsync::spawn(async move {
@@ -782,54 +850,7 @@ impl ServerInner {
 
       loop {
         let (stream, addr) = listener.accept().await.unwrap();
-        inner.holder.with_scope({
-          let inner = inner.clone();
-          move |scope| {
-            let empty =
-              deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
-            let socket = SocketCb::new_inner(
-              v8::Global::new(scope, empty),
-              scope,
-              inner.op_state.clone(),
-              SocketOptions {
-                allow_half_open: None,
-              },
-              Some(addr.ip().to_string()),
-              Some(addr.port() as u16),
-            );
-            match socket {
-              Ok(socket) => {
-                let socket_inner = socket.inner.clone();
-                let socket_obj =
-                  deno_core::cppgc::wrap_object(scope, empty, socket);
-                let socket_obj = v8::Global::new(scope, socket_obj);
-                let (read, write) = stream.into_split();
-                *socket_inner.write.try_borrow_mut().unwrap() = Some(write);
-                *socket_inner.read.try_borrow_mut().unwrap() = Some(read);
-                socket_inner.connected.set_connected(true);
-                let zero = Smi(0u8).to_v8(scope).unwrap();
-                socket_inner.call_method(scope, "read", &[zero]).unwrap();
-                socket_inner.start_read();
-                inner.holder.with_scope({
-                  let inner = inner.clone();
-                  move |scope| {
-                    let socket_obj = v8::Local::new(scope, socket_obj);
-                    inner.emit_event(
-                      scope,
-                      &[
-                        internalized(scope, "connection").into(),
-                        socket_obj.into(),
-                      ],
-                    );
-                  }
-                });
-              }
-              Err(e) => {
-                eprintln!("error creating socket: {:?}", e);
-              }
-            }
-          }
-        });
+        T::on_accept(&inner, stream, addr).await.unwrap();
       }
     });
   }

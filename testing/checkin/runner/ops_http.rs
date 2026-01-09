@@ -2,8 +2,10 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use deno_core::v8::cppgc::GcCell;
 use deno_core::{GarbageCollected, OpState, op2, v8};
+use deno_error::JsErrorBox;
 
 use crate::checkin::runner::Constructors;
+use crate::checkin::runner::ops_net::{OnAccept, ServerInner};
 
 use super::ops_net::Server;
 
@@ -44,10 +46,25 @@ impl HttpServer {
 
   #[fast]
   fn listen(&self, #[smi] port: u16, #[string] host: String) {
-    self.base.inner.listen_inner(port, host);
+    self
+      .base
+      .inner
+      .listen_inner::<HttpServerCallback>(port, host);
   }
 }
 
+struct HttpServerCallback;
+
+impl OnAccept for HttpServerCallback {
+  async fn on_accept(
+    inner: &Rc<ServerInner>,
+    stream: tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+  ) -> Result<(), JsErrorBox> {
+    
+    Ok(())
+  }
+}
 /// IncomingMessage represents an incoming HTTP request (for server) or response (for client).
 /// This is a Readable stream that wraps the incoming HTTP message data.
 ///
