@@ -23,6 +23,8 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::checkin::runner::extensions::node::ScopeHolder;
+
 use super::Constructors;
 
 fn is_ipv4(s: &str) -> bool {
@@ -218,22 +220,6 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
   }
 }
 
-struct ScopeHolder(deno_core::V8TaskSpawner);
-
-impl ScopeHolder {
-  pub fn new(spawner: deno_core::V8TaskSpawner) -> Self {
-    Self(spawner)
-  }
-
-  pub fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
-    self.0.spawn(move |scope| {
-      v8::tc_scope!(let scope, scope);
-
-      f(scope)
-    })
-  }
-}
-
 #[derive(serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase", crate = "serde")]
 struct SocketOptions {
@@ -287,7 +273,7 @@ impl SocketCb {
       .unwrap()
       .cast::<v8::Function>();
     let push_func = Rc::new(v8::TracedReference::new(scope, push_func));
-    let scope_holder = ScopeHolder::new(spawner);
+    let scope_holder = ScopeHolder::new_from_scope(spawner, scope);
 
     let emit = internalized(scope, "emit");
     let emit_func = local_me
@@ -696,7 +682,7 @@ impl Server {
       )
     };
     let local_me = v8::Local::new(scope, &me);
-    let holder = ScopeHolder::new(spawner);
+    let holder = ScopeHolder::new_from_scope(spawner, scope);
     super_cons
       .event_emitter(scope)
       .call(scope, v8::Local::new(scope, &me).into(), &[])
@@ -721,6 +707,23 @@ impl Server {
         emit_func,
       }),
     }
+  }
+}
+
+impl ServerInner {
+  pub(crate) fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
+    self.holder.with_scope(f);
+  }
+
+  pub(crate) fn with_scope_immediately(
+    &self,
+    f: impl FnOnce(&mut v8::PinScope),
+  ) {
+    self.holder.with_scope_immediately(f);
+  }
+
+  pub(crate) fn op_state(&self) -> Rc<RefCell<OpState>> {
+    self.op_state.clone()
   }
 }
 
@@ -850,7 +853,12 @@ impl ServerInner {
 
       loop {
         let (stream, addr) = listener.accept().await.unwrap();
-        T::on_accept(&inner, stream, addr).await.unwrap();
+        let inner = inner.clone();
+        deno_core::unsync::spawn(async move {
+          if let Err(err) = T::on_accept(&inner, stream, addr).await {
+            eprintln!("error in on_accept: {:?}", err);
+          }
+        });
       }
     });
   }

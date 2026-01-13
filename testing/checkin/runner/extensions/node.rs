@@ -12,6 +12,7 @@ pub struct Constructors {
   event_emitter: Rc<v8::Global<v8::Function>>,
   stream: Rc<v8::Global<v8::Function>>,
   readable: Rc<v8::Global<v8::Function>>,
+  writable: Rc<v8::Global<v8::Function>>,
 }
 
 impl Constructors {
@@ -42,6 +43,13 @@ impl Constructors {
   ) -> v8::Local<'s, v8::Function> {
     v8::Local::new(scope, &*self.readable)
   }
+
+  fn writable<'s>(
+    &self,
+    scope: &v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    v8::Local::new(scope, &*self.writable)
+  }
 }
 
 #[op2]
@@ -51,13 +59,60 @@ pub fn op_set_constructors(
   #[global] event_emitter_constructor: v8::Global<v8::Function>,
   #[global] stream_constructor: v8::Global<v8::Function>,
   #[global] readable_constructor: v8::Global<v8::Function>,
+  #[global] writable_constructor: v8::Global<v8::Function>,
 ) {
   op_state.put(Constructors {
     duplex: Rc::new(duplex_constructor),
     event_emitter: Rc::new(event_emitter_constructor),
     stream: Rc::new(stream_constructor),
     readable: Rc::new(readable_constructor),
+    writable: Rc::new(writable_constructor),
   });
+}
+
+pub struct ScopeHolder {
+  spawner: deno_core::V8TaskSpawner,
+  isolate_ptr: v8::UnsafeRawIsolatePtr,
+  context: Rc<v8::Global<v8::Context>>,
+}
+
+impl ScopeHolder {
+  pub fn new(
+    spawner: deno_core::V8TaskSpawner,
+    isolate_ptr: v8::UnsafeRawIsolatePtr,
+    context: Rc<v8::Global<v8::Context>>,
+  ) -> Self {
+    ScopeHolder {
+      spawner,
+      isolate_ptr,
+      context,
+    }
+  }
+
+  pub fn new_from_scope(
+    spawner: deno_core::V8TaskSpawner,
+    scope: &mut v8::PinScope,
+  ) -> Self {
+    let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
+    let context = Rc::new(v8::Global::new(scope, scope.get_current_context()));
+    Self::new(spawner, isolate_ptr, context)
+  }
+
+  pub fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
+    self.spawner.spawn(move |scope| {
+      v8::tc_scope!(let scope, scope);
+      f(scope);
+    })
+  }
+
+  pub fn with_scope_immediately(&self, f: impl FnOnce(&mut v8::PinScope)) {
+    let mut isolate =
+      unsafe { v8::Isolate::from_raw_isolate_ptr(self.isolate_ptr) };
+    v8::scope!(let scope, &mut isolate);
+    let context = v8::Local::new(scope, &*self.context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    f(scope);
+  }
 }
 
 deno_core::extension!(

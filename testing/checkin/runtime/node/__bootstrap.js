@@ -68,6 +68,7 @@ export function init(globalThis) {
     events.EventEmitter,
     legacy.Stream,
     stream.Readable,
+    stream.Writable,
   );
 }
 

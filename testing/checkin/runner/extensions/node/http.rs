@@ -1,12 +1,24 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+  cell::RefCell, collections::HashMap, io::ErrorKind, ops::DerefMut, rc::Rc,
+};
 
-use deno_core::v8::cppgc::GcCell;
-use deno_core::{GarbageCollected, OpState, op2, v8};
+use deno_core::AsyncRefCell;
+use deno_core::JsBuffer;
+use deno_core::convert::Uint8Array;
+use deno_core::error::JsError;
+use deno_core::v8::cppgc::{GcCell, Traced};
+use deno_core::{GarbageCollected, OpState, ToV8, op2, v8};
 use deno_error::JsErrorBox;
+use hyper::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::OwnedReadHalf;
+
+use crate::checkin::runner::extensions::node::ScopeHolder;
 
 use super::Constructors;
 use super::net::Server;
-use super::net::{OnAccept, ServerInner};
+use super::net::{EventEmitter, OnAccept, ServerInner};
 
 #[derive(deno_core::CppgcInherits)]
 #[cppgc_base(Server)]
@@ -28,7 +40,7 @@ unsafe impl GarbageCollected for HttpServer {
   }
 }
 
-#[op2]
+#[op2(inherit = Server)]
 impl HttpServer {
   #[constructor]
   #[cppgc]
@@ -54,12 +66,401 @@ impl HttpServer {
 
 struct HttpServerCallback;
 
+const MAX_HEADER_SIZE: usize = 16 * 1024;
+struct ParsedRequest {
+  method: String,
+  url: String,
+  http_version: String,
+  http_version_major: u8,
+  http_version_minor: u8,
+  headers: HashMap<String, String>,
+  raw_headers: Vec<String>,
+  headers_distinct: HashMap<String, Vec<String>>,
+}
+
+fn parse_request_head(
+  buf: &[u8],
+) -> Result<Option<(ParsedRequest, usize)>, JsErrorBox> {
+  let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+  let mut request = httparse::Request::new(&mut headers_storage);
+  let status = request
+    .parse(buf)
+    .map_err(|_| JsErrorBox::generic("invalid http"))?;
+  let header_len = match status {
+    httparse::Status::Complete(len) => len,
+    httparse::Status::Partial => return Ok(None),
+  };
+  let method = request
+    .method
+    .ok_or_else(|| JsErrorBox::generic("missing method"))?;
+  let url = request
+    .path
+    .ok_or_else(|| JsErrorBox::generic("missing url"))?;
+  let version = request.version.unwrap_or(1);
+  let http_version_major = 1;
+  let http_version_minor = version as u8;
+  let http_version = format!("{http_version_major}.{http_version_minor}");
+
+  let mut headers = HashMap::new();
+  let mut raw_headers = Vec::new();
+  let mut headers_distinct = HashMap::new();
+  for header in request.headers.iter() {
+    let name = header.name;
+    let value = std::str::from_utf8(header.value)
+      .map_err(JsErrorBox::from_err)?
+      .trim();
+    raw_headers.push(name.to_string());
+    raw_headers.push(value.to_string());
+    let lower = name.to_ascii_lowercase();
+    headers_distinct
+      .entry(lower.clone())
+      .or_insert_with(Vec::new)
+      .push(value.to_string());
+    headers
+      .entry(lower)
+      .and_modify(|existing: &mut String| {
+        existing.push_str(", ");
+        existing.push_str(value);
+      })
+      .or_insert_with(|| value.to_string());
+  }
+
+  Ok(Some((
+    ParsedRequest {
+      method: method.to_string(),
+      url: url.to_string(),
+      http_version,
+      http_version_major,
+      http_version_minor,
+      headers,
+      raw_headers,
+      headers_distinct,
+    },
+    header_len,
+  )))
+}
+
+fn is_chunked(headers: &HashMap<String, String>) -> bool {
+  headers.get("transfer-encoding").map_or(false, |value| {
+    value.to_ascii_lowercase().contains("chunked")
+  })
+}
+
+fn parse_content_length(
+  headers: &HashMap<String, String>,
+) -> Result<Option<usize>, JsErrorBox> {
+  let value = match headers.get("content-length") {
+    Some(value) => value,
+    None => return Ok(None),
+  };
+  let value = value.split(',').next().unwrap_or("").trim();
+  if value.is_empty() {
+    return Ok(None);
+  }
+  let len = value
+    .parse::<usize>()
+    .map_err(|_| JsErrorBox::type_error("Invalid Content-Length"))?;
+  Ok(Some(len))
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+  buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn is_connection_closed(err: &std::io::Error) -> bool {
+  matches!(
+    err.kind(),
+    ErrorKind::ConnectionReset
+      | ErrorKind::ConnectionAborted
+      | ErrorKind::BrokenPipe
+      | ErrorKind::UnexpectedEof
+  )
+}
+
+async fn read_socket(
+  read: &mut OwnedReadHalf,
+  buf: &mut [u8],
+) -> Result<Option<usize>, JsErrorBox> {
+  match read.read(buf).await {
+    Ok(0) => Ok(None),
+    Ok(nread) => Ok(Some(nread)),
+    Err(err) if is_connection_closed(&err) => Ok(None),
+    Err(err) => Err(JsErrorBox::from_err(err)),
+  }
+}
+
+fn internalized<'a>(
+  scope: &v8::PinScope<'a, '_>,
+  s: &str,
+) -> v8::Local<'a, v8::String> {
+  v8::String::new_from_one_byte(
+    scope,
+    s.as_bytes(),
+    v8::NewStringType::Internalized,
+  )
+  .unwrap()
+}
+
 impl OnAccept for HttpServerCallback {
   async fn on_accept(
     inner: &Rc<ServerInner>,
     stream: tokio::net::TcpStream,
-    addr: std::net::SocketAddr,
+    _addr: std::net::SocketAddr,
   ) -> Result<(), JsErrorBox> {
+    let (mut read, write_half) = stream.into_split();
+    let write = Rc::new(AsyncRefCell::new(Some(write_half)));
+    let mut buf = Vec::with_capacity(1024);
+    let mut scratch = [0u8; 1024];
+
+    loop {
+      let (parsed, header_len) = loop {
+        if let Some(parsed) = parse_request_head(&buf)? {
+          break parsed;
+        }
+        let nread = match read_socket(&mut read, &mut scratch).await? {
+          Some(nread) => nread,
+          None => return Ok(()),
+        };
+        buf.extend_from_slice(&scratch[..nread]);
+        if buf.len() > MAX_HEADER_SIZE {
+          return Err(JsErrorBox::generic("http header too large"));
+        }
+      };
+
+      let upgrade = parsed.headers.get("connection").map_or(false, |value| {
+        value.to_ascii_lowercase().contains("upgrade")
+      }) || parsed.headers.contains_key("upgrade");
+      let chunked = is_chunked(&parsed.headers);
+      let content_length = if chunked {
+        None
+      } else {
+        parse_content_length(&parsed.headers)?
+      };
+      let has_body = chunked || content_length.unwrap_or(0) > 0;
+
+      let mut body_buf = buf.split_off(header_len);
+      let req_slot: Rc<RefCell<Option<v8::Global<v8::Object>>>> =
+        Rc::new(RefCell::new(None));
+      let push_slot: Rc<RefCell<Option<v8::Global<v8::Function>>>> =
+        Rc::new(RefCell::new(None));
+      inner.with_scope_immediately({
+        let inner = inner.clone();
+        let req_slot = req_slot.clone();
+        let push_slot = push_slot.clone();
+        let parsed_method = parsed.method;
+        let parsed_url = parsed.url;
+        let parsed_http_version = parsed.http_version;
+        let parsed_http_version_major = parsed.http_version_major;
+        let parsed_http_version_minor = parsed.http_version_minor;
+        let parsed_headers = parsed.headers;
+        let parsed_raw_headers = parsed.raw_headers;
+        let parsed_headers_distinct = parsed.headers_distinct;
+        let write = write.clone();
+        move |scope| {
+          v8::tc_scope!(let scope, scope);
+          let req_empty =
+            deno_core::cppgc::make_cppgc_empty_object::<IncomingMessage>(scope);
+          let req = IncomingMessage::new_inner(
+            v8::Global::new(scope, req_empty),
+            scope,
+            inner.op_state(),
+          );
+          req.method.set(scope, Some(parsed_method));
+          req.url.set(scope, Some(parsed_url));
+          req.http_version.set(scope, parsed_http_version);
+          req.http_version_major.set(scope, parsed_http_version_major);
+          req.http_version_minor.set(scope, parsed_http_version_minor);
+          req.headers.set(scope, parsed_headers);
+          req.raw_headers.set(scope, parsed_raw_headers);
+          req.headers_distinct.set(scope, parsed_headers_distinct);
+          req.complete.set(scope, !has_body);
+          req.upgrade.set(scope, upgrade);
+          let req_obj = deno_core::cppgc::wrap_object(scope, req_empty, req);
+
+          let res_empty =
+            deno_core::cppgc::make_cppgc_empty_object::<ServerResponse>(scope);
+          let res = ServerResponse::new_inner(
+            v8::Global::new(scope, res_empty),
+            scope,
+            inner.op_state(),
+            write,
+          );
+          let res_obj = deno_core::cppgc::wrap_object(scope, res_empty, res);
+
+          let request_event = internalized(scope, "request");
+          inner.emit_event(
+            scope,
+            &[request_event.into(), req_obj.into(), res_obj.into()],
+          );
+
+          let push = req_obj
+            .get(scope, internalized(scope, "push").into())
+            .unwrap()
+            .cast::<v8::Function>();
+          *req_slot.borrow_mut() = Some(v8::Global::new(scope, req_obj));
+          *push_slot.borrow_mut() = Some(v8::Global::new(scope, push));
+        }
+      });
+      let req_handle = Rc::new(req_slot.borrow_mut().take().unwrap());
+      let push_handle = Rc::new(push_slot.borrow_mut().take().unwrap());
+
+      let push_chunk = |data: Vec<u8>| {
+        if data.is_empty() {
+          return;
+        }
+        let inner = inner.clone();
+        let req_handle = req_handle.clone();
+        let push_handle = push_handle.clone();
+        inner.with_scope(move |scope| {
+          v8::tc_scope!(let scope, scope);
+          let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
+          let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
+          let data = Uint8Array(data);
+          let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
+          let result = push.call(scope, req_obj.into(), &[arg]);
+          if result.is_none() {
+            let exception = scope.exception().unwrap();
+            let error = JsError::from_v8_exception(scope, exception);
+            eprintln!("error in push: {:?}", error);
+          }
+        });
+      };
+
+      let finish_req = |mark_complete: bool| {
+        let inner = inner.clone();
+        let req_handle = req_handle.clone();
+        let push_handle = push_handle.clone();
+        inner.with_scope(move |scope| {
+          v8::tc_scope!(let scope, scope);
+          let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
+          let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
+          if mark_complete {
+            let _ = req_obj.set(
+              scope,
+              internalized(scope, "complete").into(),
+              v8::Boolean::new(scope, true).into(),
+            );
+          }
+          let _ = push.call(scope, req_obj.into(), &[v8::null(scope).into()]);
+        });
+      };
+
+      if !has_body {
+        buf = body_buf;
+        finish_req(true);
+        if upgrade {
+          break;
+        }
+        continue;
+      }
+
+      if chunked {
+        let mut cursor = 0usize;
+        loop {
+          if cursor >= body_buf.len() {
+            let nread = match read_socket(&mut read, &mut scratch).await? {
+              Some(nread) => nread,
+              None => return Ok(()),
+            };
+            body_buf.extend_from_slice(&scratch[..nread]);
+            continue;
+          }
+
+          let status = httparse::parse_chunk_size(&body_buf[cursor..])
+            .map_err(|_| JsErrorBox::generic("invalid chunk size"))?;
+          let (size_line_len, size) = match status {
+            httparse::Status::Complete(data) => data,
+            httparse::Status::Partial => {
+              let nread = match read_socket(&mut read, &mut scratch).await? {
+                Some(nread) => nread,
+                None => return Ok(()),
+              };
+              body_buf.extend_from_slice(&scratch[..nread]);
+              continue;
+            }
+          };
+          let size = usize::try_from(size)
+            .map_err(|_| JsErrorBox::generic("chunk too large"))?;
+          let chunk_start = cursor + size_line_len;
+
+          if size == 0 {
+            if body_buf.len() >= chunk_start + 2
+              && &body_buf[chunk_start..chunk_start + 2] == b"\r\n"
+            {
+              cursor = chunk_start + 2;
+              break;
+            }
+            if let Some(end) = find_double_crlf(&body_buf[chunk_start..]) {
+              cursor = chunk_start + end + 4;
+              break;
+            }
+            let nread = match read_socket(&mut read, &mut scratch).await? {
+              Some(nread) => nread,
+              None => return Ok(()),
+            };
+            body_buf.extend_from_slice(&scratch[..nread]);
+            continue;
+          }
+
+          if body_buf.len() < chunk_start + size + 2 {
+            let nread = match read_socket(&mut read, &mut scratch).await? {
+              Some(nread) => nread,
+              None => return Ok(()),
+            };
+            body_buf.extend_from_slice(&scratch[..nread]);
+            continue;
+          }
+          let chunk_end = chunk_start + size;
+          if &body_buf[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(JsErrorBox::generic("invalid chunk terminator"));
+          }
+          push_chunk(body_buf[chunk_start..chunk_end].to_vec());
+          cursor = chunk_end + 2;
+        }
+        body_buf.drain(..cursor);
+        buf = body_buf;
+        finish_req(true);
+      } else if let Some(mut remaining) = content_length {
+        if remaining == 0 {
+          buf = body_buf;
+          finish_req(true);
+        } else {
+          if !body_buf.is_empty() {
+            let take = remaining.min(body_buf.len());
+            push_chunk(body_buf[..take].to_vec());
+            remaining -= take;
+            if body_buf.len() > take {
+              buf = body_buf[take..].to_vec();
+              remaining = 0;
+            } else {
+              body_buf.clear();
+            }
+          }
+          while remaining > 0 {
+            let nread = match read_socket(&mut read, &mut scratch).await? {
+              Some(nread) => nread,
+              None => return Ok(()),
+            };
+            if nread <= remaining {
+              push_chunk(scratch[..nread].to_vec());
+              remaining -= nread;
+            } else {
+              push_chunk(scratch[..remaining].to_vec());
+              buf.extend_from_slice(&scratch[remaining..nread]);
+              remaining = 0;
+            }
+          }
+          if remaining == 0 {
+            finish_req(true);
+          }
+        }
+      }
+
+      if upgrade {
+        break;
+      }
+    }
+
     Ok(())
   }
 }
@@ -130,32 +531,7 @@ impl IncomingMessage {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> IncomingMessage {
-    let super_cons = {
-      let op_state = op_state.borrow();
-      op_state.borrow::<Constructors>().clone()
-    };
-    let local_me = v8::Local::new(scope, &me);
-    let cons = v8::Local::new(scope, &*super_cons.readable);
-    cons.call(scope, local_me.into(), &[]).unwrap();
-    IncomingMessage {
-      method: GcCell::new(None),
-      url: GcCell::new(None),
-      status_code: GcCell::new(None),
-      status_message: GcCell::new(None),
-      http_version: GcCell::new("1.1".to_string()),
-      http_version_major: GcCell::new(1),
-      http_version_minor: GcCell::new(1),
-      headers: GcCell::new(HashMap::new()),
-      raw_headers: GcCell::new(Vec::new()),
-      headers_distinct: GcCell::new(HashMap::new()),
-      trailers: GcCell::new(HashMap::new()),
-      raw_trailers: GcCell::new(Vec::new()),
-      trailers_distinct: GcCell::new(HashMap::new()),
-      complete: GcCell::new(false),
-      aborted: GcCell::new(false),
-      upgrade: GcCell::new(false),
-      join_duplicate_headers: GcCell::new(false),
-    }
+    IncomingMessage::new_inner(me, scope, op_state)
   }
 
   // --- Getters ---
@@ -353,6 +729,41 @@ impl IncomingMessage {
   }
 }
 
+impl IncomingMessage {
+  fn new_inner(
+    me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+  ) -> IncomingMessage {
+    let super_cons = {
+      let op_state = op_state.borrow();
+      op_state.borrow::<Constructors>().clone()
+    };
+    let local_me = v8::Local::new(scope, &me);
+    let cons = super_cons.readable(scope);
+    cons.call(scope, local_me.into(), &[]).unwrap();
+    IncomingMessage {
+      method: GcCell::new(None),
+      url: GcCell::new(None),
+      status_code: GcCell::new(None),
+      status_message: GcCell::new(None),
+      http_version: GcCell::new("1.1".to_string()),
+      http_version_major: GcCell::new(1),
+      http_version_minor: GcCell::new(1),
+      headers: GcCell::new(HashMap::new()),
+      raw_headers: GcCell::new(Vec::new()),
+      headers_distinct: GcCell::new(HashMap::new()),
+      trailers: GcCell::new(HashMap::new()),
+      raw_trailers: GcCell::new(Vec::new()),
+      trailers_distinct: GcCell::new(HashMap::new()),
+      complete: GcCell::new(false),
+      aborted: GcCell::new(false),
+      upgrade: GcCell::new(false),
+      join_duplicate_headers: GcCell::new(false),
+    }
+  }
+}
+
 /// OutgoingMessage is the base class for ServerResponse and ClientRequest.
 /// It represents an outgoing HTTP message being sent.
 ///
@@ -396,6 +807,8 @@ pub struct OutgoingMessage {
   destroyed: GcCell<bool>,
   /// Send date header automatically
   send_date: GcCell<bool>,
+  /// Buffered first body chunk (used to decide Content-Length vs chunked)
+  pending_body: GcCell<Option<Vec<u8>>>,
 }
 
 unsafe impl GarbageCollected for OutgoingMessage {
@@ -617,6 +1030,17 @@ impl OutgoingMessage {
   }
 
   #[fast]
+  #[rename("_storeHeader")]
+  fn store_header_op(
+    &self,
+    isolate: &mut v8::Isolate,
+    #[string] first_line: String,
+  ) -> Result<(), JsErrorBox> {
+    self.store_header(isolate, &first_line)
+  }
+
+  #[fast]
+  #[rename("_destroy")]
   fn destroy(&self, isolate: &mut v8::Isolate) {
     self.destroyed.set(isolate, true);
     self.writable.set(isolate, false);
@@ -634,7 +1058,7 @@ impl OutgoingMessage {
       op_state.borrow::<Constructors>().clone()
     };
     let local_me = v8::Local::new(scope, &me);
-    let cons = v8::Local::new(scope, &*super_cons.stream);
+    let cons = super_cons.writable(scope);
     cons.call(scope, local_me.into(), &[]).unwrap();
     OutgoingMessage {
       header: GcCell::new(None),
@@ -652,7 +1076,112 @@ impl OutgoingMessage {
       writable: GcCell::new(true),
       destroyed: GcCell::new(false),
       send_date: GcCell::new(true),
+      pending_body: GcCell::new(None),
     }
+  }
+
+  fn render_header(
+    &self,
+    isolate: &mut v8::Isolate,
+    first_line: &str,
+  ) -> Result<String, JsErrorBox> {
+    let mut header = first_line.to_string();
+    if !header.ends_with("\r\n") {
+      header.push_str("\r\n");
+    }
+    let headers = self.out_headers.get(isolate).clone();
+    let mut header_map = HeaderMap::new();
+    for (_, (name, value)) in headers.iter() {
+      let name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| JsErrorBox::type_error("Invalid header name"))?;
+      let value = HeaderValue::from_str(value)
+        .map_err(|_| JsErrorBox::type_error("Invalid header value"))?;
+      header_map.append(name, value);
+    }
+    for (name, value) in header_map.iter() {
+      header.push_str(name.as_str());
+      header.push_str(": ");
+      header.push_str(value.to_str().unwrap_or_default());
+      header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
+    Ok(header)
+  }
+
+  fn store_header(
+    &self,
+    isolate: &mut v8::Isolate,
+    first_line: &str,
+  ) -> Result<(), JsErrorBox> {
+    let header = self.render_header(isolate, first_line)?;
+    self.header.set(isolate, Some(header));
+    Ok(())
+  }
+
+  fn ensure_header(
+    &self,
+    isolate: &mut v8::Isolate,
+    first_line: &str,
+  ) -> Result<String, JsErrorBox> {
+    if let Some(header) = self.header.get(isolate).clone() {
+      return Ok(header);
+    }
+    let header = self.render_header(isolate, first_line)?;
+    self.header.set(isolate, Some(header.clone()));
+    Ok(header)
+  }
+
+  fn has_header(&self, isolate: &v8::Isolate, name: &str) -> bool {
+    self.out_headers.get(isolate).contains_key(name)
+  }
+
+  fn clear_header_cache(&self, isolate: &mut v8::Isolate) {
+    if self.header.get(isolate).is_some() {
+      self.header.set(isolate, None);
+    }
+  }
+
+  fn set_content_length(&self, isolate: &mut v8::Isolate, len: usize) {
+    let mut headers = self.out_headers.get(isolate).clone();
+    headers.insert(
+      "content-length".to_string(),
+      ("Content-Length".to_string(), len.to_string()),
+    );
+    self.out_headers.set(isolate, headers);
+    self.content_length.set(isolate, Some(len as u64));
+    self.clear_header_cache(isolate);
+  }
+
+  fn update_chunked_encoding(&self, isolate: &mut v8::Isolate) {
+    if *self.chunked_encoding.get(isolate) {
+      return;
+    }
+    let headers = self.out_headers.get(isolate);
+    if let Some((_, value)) = headers.get("transfer-encoding") {
+      if value.to_ascii_lowercase().contains("chunked") {
+        self.chunked_encoding.set(isolate, true);
+      }
+    }
+  }
+
+  fn maybe_enable_chunked(&self, isolate: &mut v8::Isolate) {
+    if *self.chunked_encoding.get(isolate) {
+      return;
+    }
+    let mut headers = self.out_headers.get(isolate).clone();
+    if headers.contains_key("content-length") {
+      return;
+    }
+    if headers.contains_key("transfer-encoding") {
+      return;
+    }
+    self.clear_header_cache(isolate);
+    headers.insert(
+      "transfer-encoding".to_string(),
+      ("Transfer-Encoding".to_string(), "chunked".to_string()),
+    );
+    self.out_headers.set(isolate, headers);
+    self.chunked_encoding.set(isolate, true);
   }
 }
 
@@ -663,11 +1192,15 @@ pub struct ServerResponse {
   base: OutgoingMessage,
   status_code: GcCell<Option<u16>>,
   status_message: GcCell<Option<String>>,
+  write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+  scope_holder: Rc<ScopeHolder>,
+  this: Rc<v8::TracedReference<v8::Object>>,
 }
 
 unsafe impl GarbageCollected for ServerResponse {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
     self.base.trace(visitor);
+    self.this.trace(visitor);
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
@@ -675,7 +1208,7 @@ unsafe impl GarbageCollected for ServerResponse {
   }
 }
 
-#[op2]
+#[op2(inherit = OutgoingMessage)]
 impl ServerResponse {
   #[constructor]
   #[cppgc]
@@ -684,17 +1217,304 @@ impl ServerResponse {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> ServerResponse {
-    ServerResponse::new_inner(me, scope, op_state)
+    ServerResponse::new_inner(
+      me,
+      scope,
+      op_state,
+      Rc::new(AsyncRefCell::new(None)),
+    )
   }
 
   #[fast]
-  fn write(&self, isolate: &mut v8::Isolate, #[string] data: String) {
-    // self.base.write(isolate, data);
+  #[rename("writeHead")]
+  fn write_head<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+    #[smi] status_code: u16,
+    #[varargs] args: Option<&v8::FunctionCallbackArguments<'a>>,
+  ) -> Result<(), JsErrorBox> {
+    let mut reason: Option<String> = None;
+    let mut headers: Option<HashMap<String, String>> = None;
+    if let Some(args) = args {
+      let mut start = 0i32;
+      let args_len = args.length();
+      if args_len > 0 {
+        let first = args.get(0);
+        if first.is_int32() {
+          if let Some(value) = first.int32_value(scope) {
+            if value as u16 == status_code {
+              start = 1;
+            }
+          }
+        }
+      }
+      if args_len > start {
+        let value = args.get(start);
+        if !(value.is_undefined() || value.is_null()) {
+          if value.is_string() {
+            reason = Some(value.to_rust_string_lossy(scope));
+          } else {
+            headers = Some(
+              deno_core::serde_v8::from_v8(scope, value)
+                .map_err(JsErrorBox::from_err)?,
+            );
+          }
+        }
+      }
+      if args_len > start + 1 {
+        let value = args.get(start + 1);
+        if !(value.is_undefined() || value.is_null()) {
+          headers = Some(
+            deno_core::serde_v8::from_v8(scope, value)
+              .map_err(JsErrorBox::from_err)?,
+          );
+        }
+      }
+    }
+
+    self.status_code.set(scope, Some(status_code));
+    if let Some(reason) = &reason {
+      self.status_message.set(scope, Some(reason.clone()));
+    }
+    if let Some(headers) = headers {
+      let mut out_headers = self.base.out_headers.get(scope).clone();
+      for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        out_headers.insert(lower, (name, value));
+      }
+      self.base.out_headers.set(scope, out_headers);
+    }
+    let status_line =
+      self.status_line(scope, Some(status_code), reason.as_deref())?;
+    self.base.store_header(scope, &status_line)?;
+    Ok(())
   }
 
-  #[fast]
-  fn end(&self, isolate: &mut v8::Isolate) {
-    // self.base.end(isolate);
+  #[reentrant]
+  #[rename("_write")]
+  fn write(
+    &self,
+    isolate: &mut v8::Isolate,
+    #[buffer] data: JsBuffer,
+    _encoding: v8::Local<v8::String>,
+    #[global] cb: v8::Global<v8::Value>,
+  ) -> Result<(), JsErrorBox> {
+    let mut payload = Vec::new();
+    let header_sent = *self.base.header_sent.get(isolate);
+    let has_length = self.base.has_header(isolate, "content-length");
+    let has_te = self.base.has_header(isolate, "transfer-encoding");
+    if !header_sent && !has_length && !has_te {
+      if self.base.pending_body.get(isolate).is_none() {
+        self.base.pending_body.set(isolate, Some(data.to_vec()));
+        let scope_holder = self.scope_holder.clone();
+        let this = self.this.clone();
+        scope_holder.with_scope(move |scope| {
+          let cb = v8::Local::new(scope, &cb);
+          let this = this.get(scope).unwrap();
+          call_write_cb(scope, cb, this, None);
+        });
+        return Ok(());
+      }
+      self.base.maybe_enable_chunked(isolate);
+    } else {
+      self.base.update_chunked_encoding(isolate);
+    }
+
+    if !*self.base.header_sent.get(isolate) {
+      let status_line = self.status_line(isolate, None, None)?;
+      let header = self.base.ensure_header(isolate, &status_line)?;
+      self.base.header_sent.set(isolate, true);
+      payload.extend_from_slice(header.as_bytes());
+    }
+
+    let mut buffered = None;
+    if !header_sent {
+      buffered = self.base.pending_body.get(isolate).clone();
+      self.base.pending_body.set(isolate, None);
+    }
+
+    let chunked = *self.base.chunked_encoding.get(isolate);
+    if let Some(buffered) = buffered {
+      if !buffered.is_empty() {
+        if chunked {
+          let prefix = format!("{:X}\r\n", buffered.len());
+          payload.extend_from_slice(prefix.as_bytes());
+          payload.extend_from_slice(&buffered);
+          payload.extend_from_slice(b"\r\n");
+        } else {
+          payload.extend_from_slice(&buffered);
+        }
+      }
+    }
+    if !data.is_empty() {
+      if chunked {
+        let prefix = format!("{:X}\r\n", data.len());
+        payload.extend_from_slice(prefix.as_bytes());
+        payload.extend_from_slice(&data);
+        payload.extend_from_slice(b"\r\n");
+      } else {
+        payload.extend_from_slice(&data);
+      }
+    }
+    let write = self.write.clone();
+    let scope_holder = self.scope_holder.clone();
+    let this = self.this.clone();
+    let num_wrote = if let Some(mut slot) = write.try_borrow_mut() {
+      if let Some(write) = slot.deref_mut().as_mut() {
+        let nwritten = write.try_write(&payload);
+        match nwritten {
+          Ok(nwritten) => nwritten,
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+          Err(e) => return Err(JsErrorBox::from_err(e)),
+        }
+      } else {
+        0
+      }
+    } else {
+      0
+    };
+
+    if num_wrote >= payload.len() {
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb, this, None);
+      });
+      return Ok(());
+    }
+
+    deno_core::unsync::spawn(async move {
+      let result = write
+        .borrow_mut()
+        .await
+        .deref_mut()
+        .as_mut()
+        .unwrap()
+        .write_all(&payload[num_wrote..])
+        .await
+        .map_err(JsErrorBox::from_err)
+        .err();
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb, this, result);
+      });
+    });
+
+    Ok(())
+  }
+
+  #[rename("_final")]
+  fn final_(
+    &self,
+    isolate: &mut v8::Isolate,
+    #[global] cb: v8::Global<v8::Function>,
+  ) {
+    let mut header_bytes = None;
+    let mut body_bytes = None;
+    if !*self.base.header_sent.get(isolate) {
+      let has_length = self.base.has_header(isolate, "content-length");
+      let has_te = self.base.has_header(isolate, "transfer-encoding");
+      let pending = self.base.pending_body.get(isolate).clone();
+      self.base.pending_body.set(isolate, None);
+      if !has_length && !has_te {
+        let len = pending.as_ref().map(|buf| buf.len()).unwrap_or(0);
+        self.base.set_content_length(isolate, len);
+      } else {
+        self.base.update_chunked_encoding(isolate);
+      }
+      match self
+        .status_line(isolate, None, None)
+        .and_then(|status_line| self.base.ensure_header(isolate, &status_line))
+      {
+        Ok(header) => {
+          self.base.header_sent.set(isolate, true);
+          header_bytes = Some(header.into_bytes());
+          body_bytes = pending;
+        }
+        Err(err) => {
+          let scope_holder = self.scope_holder.clone();
+          let this = self.this.clone();
+          scope_holder.with_scope(move |scope| {
+            let cb = v8::Local::new(scope, &cb);
+            let this = this.get(scope).unwrap();
+            call_write_cb(scope, cb.into(), this, Some(err));
+          });
+          return;
+        }
+      }
+    }
+    let chunked = *self.base.chunked_encoding.get(isolate);
+    let write = self.write.clone();
+    let scope_holder = self.scope_holder.clone();
+    let this = self.this.clone();
+    deno_core::unsync::spawn(async move {
+      let mut result = None;
+      if let Some(write) = write.borrow_mut().await.deref_mut().as_mut() {
+        if let Some(header_bytes) = header_bytes {
+          result = write
+            .write_all(&header_bytes)
+            .await
+            .map_err(JsErrorBox::from_err)
+            .err();
+        }
+        if result.is_none() {
+          if let Some(body_bytes) = body_bytes {
+            if !body_bytes.is_empty() {
+              if chunked {
+                let prefix = format!("{:X}\r\n", body_bytes.len());
+                result = write
+                  .write_all(prefix.as_bytes())
+                  .await
+                  .map_err(JsErrorBox::from_err)
+                  .err();
+                if result.is_none() {
+                  result = write
+                    .write_all(&body_bytes)
+                    .await
+                    .map_err(JsErrorBox::from_err)
+                    .err();
+                }
+                if result.is_none() {
+                  result = write
+                    .write_all(b"\r\n")
+                    .await
+                    .map_err(JsErrorBox::from_err)
+                    .err();
+                }
+              } else {
+                result = write
+                  .write_all(&body_bytes)
+                  .await
+                  .map_err(JsErrorBox::from_err)
+                  .err();
+              }
+            }
+          }
+        }
+        if result.is_none() && chunked {
+          result = write
+            .write_all(b"0\r\n\r\n")
+            .await
+            .map_err(JsErrorBox::from_err)
+            .err();
+        }
+      }
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, result);
+      });
+    });
+  }
+
+  #[rename("_destroy")]
+  fn destroy(
+    &self,
+    _isolate: &mut v8::Isolate,
+    #[global] _error: v8::Global<v8::Value>,
+    #[global] _cb: v8::Global<v8::Function>,
+  ) {
   }
 }
 impl ServerResponse {
@@ -702,11 +1522,67 @@ impl ServerResponse {
     me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
+    write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
   ) -> ServerResponse {
+    let (spawner, this) = {
+      let op_state = op_state.borrow();
+      let spawner = op_state.borrow::<deno_core::V8TaskSpawner>().clone();
+      let local_me = v8::Local::new(scope, &me);
+      let this = Rc::new(v8::TracedReference::new(scope, local_me));
+      (spawner, this)
+    };
+    let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
+    let context = Rc::new(v8::Global::new(scope, scope.get_current_context()));
     ServerResponse {
       base: OutgoingMessage::new_inner(me, scope, op_state),
       status_code: GcCell::new(None),
       status_message: GcCell::new(None),
+      write,
+      scope_holder: Rc::new(ScopeHolder::new(spawner, isolate_ptr, context)),
+      this,
     }
+  }
+
+  fn status_line(
+    &self,
+    isolate: &v8::Isolate,
+    status_code_override: Option<u16>,
+    reason_override: Option<&str>,
+  ) -> Result<String, JsErrorBox> {
+    let status_code = status_code_override
+      .or_else(|| *self.status_code.get(isolate))
+      .unwrap_or(200);
+    let status = StatusCode::from_u16(status_code)
+      .map_err(|_| JsErrorBox::type_error("Invalid status code"))?;
+    let reason = reason_override
+      .map(|reason| reason.to_string())
+      .or_else(|| self.status_message.get(isolate).clone())
+      .or_else(|| status.canonical_reason().map(|reason| reason.to_string()))
+      .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!("HTTP/1.1 {} {}", status.as_u16(), reason))
+  }
+}
+
+fn call_write_cb(
+  scope: &mut v8::PinScope,
+  cb: v8::Local<v8::Value>,
+  this: v8::Local<v8::Object>,
+  result: Option<JsErrorBox>,
+) {
+  v8::tc_scope!(let scope, scope);
+  if let Ok(cb) = cb.try_cast::<v8::Function>() {
+    if let Some(result) = result {
+      let error = result.to_v8(scope).unwrap();
+      let _ = cb.call(scope, this.into(), &[error]);
+    } else {
+      let _ = cb.call(scope, this.into(), &[]);
+    }
+  } else {
+    eprintln!("cb is not a function, it's a {}", cb.type_repr());
+  }
+  if scope.has_caught() {
+    let exception = scope.exception().unwrap();
+    let error = JsError::from_v8_exception(scope, exception);
+    eprintln!("error: {:?}", error);
   }
 }
