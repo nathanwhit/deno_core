@@ -8,9 +8,7 @@ use crate::checkin::runner::ops::StartTime;
 use crate::checkin::runner::ops_async;
 use crate::checkin::runner::ops_buffer;
 use crate::checkin::runner::ops_error;
-use crate::checkin::runner::ops_http;
 use crate::checkin::runner::ops_io;
-use crate::checkin::runner::ops_net;
 use crate::checkin::runner::ops_worker;
 
 pub trait SomeType {}
@@ -71,10 +69,6 @@ deno_core::extension!(
     ops::op_validate_args,
     ops::op_prop_access_static_uncached,
     ops::op_prop_access_internalized_uncached,
-    super::op_set_constructors,
-    ops_net::op_is_ipv4,
-    ops_net::op_is_ipv6,
-    ops_net::op_is_ip,
 
   ],
   objects = [
@@ -83,11 +77,6 @@ deno_core::extension!(
     ops::TestObjectWrap,
     ops::TestEnumWrap,
     ops::Socket,
-    ops_net::SocketCb,
-    ops_net::Server,
-    ops_http::HttpServer,
-    ops_http::IncomingMessage,
-    ops_http::OutgoingMessage,
   ],
   esm_entry_point = "ext:checkin_runtime/__init.js",
   esm = [
@@ -101,8 +90,7 @@ deno_core::extension!(
     "checkin:timers" = "timers.ts",
     "checkin:worker" = "worker.ts",
     "checkin:throw" = "throw.ts",
-    "checkin:callsite" = "callsite.ts",
-    "checkin:net" = "net.ts",
+    "checkin:callsite" = "callsite.ts"
   ],
   state = |state| {
     state.put(TestData::default());

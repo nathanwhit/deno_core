@@ -4,10 +4,9 @@ use deno_core::v8::cppgc::GcCell;
 use deno_core::{GarbageCollected, OpState, op2, v8};
 use deno_error::JsErrorBox;
 
-use crate::checkin::runner::Constructors;
-use crate::checkin::runner::ops_net::{OnAccept, ServerInner};
-
-use super::ops_net::Server;
+use super::Constructors;
+use super::net::Server;
+use super::net::{OnAccept, ServerInner};
 
 #[derive(deno_core::CppgcInherits)]
 #[cppgc_base(Server)]
@@ -61,7 +60,6 @@ impl OnAccept for HttpServerCallback {
     stream: tokio::net::TcpStream,
     addr: std::net::SocketAddr,
   ) -> Result<(), JsErrorBox> {
-    
     Ok(())
   }
 }
@@ -132,12 +130,9 @@ impl IncomingMessage {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> IncomingMessage {
-    let (ops_tracker, super_cons) = {
+    let super_cons = {
       let op_state = op_state.borrow();
-      (
-        op_state.external_ops_tracker.clone(),
-        op_state.borrow::<Constructors>().clone(),
-      )
+      op_state.borrow::<Constructors>().clone()
     };
     let local_me = v8::Local::new(scope, &me);
     let cons = v8::Local::new(scope, &*super_cons.readable);
@@ -420,33 +415,7 @@ impl OutgoingMessage {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> OutgoingMessage {
-    let (ops_tracker, super_cons) = {
-      let op_state = op_state.borrow();
-      (
-        op_state.external_ops_tracker.clone(),
-        op_state.borrow::<Constructors>().clone(),
-      )
-    };
-    let local_me = v8::Local::new(scope, &me);
-    let cons = v8::Local::new(scope, &*super_cons.stream);
-    cons.call(scope, local_me.into(), &[]).unwrap();
-    OutgoingMessage {
-      header: GcCell::new(None),
-      header_sent: GcCell::new(false),
-      finished: GcCell::new(false),
-      chunked_encoding: GcCell::new(false),
-      content_length: GcCell::new(None),
-      should_keep_alive: GcCell::new(true),
-      last: GcCell::new(false),
-      trailer: GcCell::new(String::new()),
-      out_headers: GcCell::new(HashMap::new()),
-      strict_content_length: GcCell::new(false),
-      join_duplicate_headers: GcCell::new(false),
-      closed: GcCell::new(false),
-      writable: GcCell::new(true),
-      destroyed: GcCell::new(false),
-      send_date: GcCell::new(true),
-    }
+    OutgoingMessage::new_inner(me, scope, op_state)
   }
 
   // --- Getters ---
@@ -654,6 +623,39 @@ impl OutgoingMessage {
   }
 }
 
+impl OutgoingMessage {
+  fn new_inner(
+    me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+  ) -> OutgoingMessage {
+    let super_cons = {
+      let op_state = op_state.borrow();
+      op_state.borrow::<Constructors>().clone()
+    };
+    let local_me = v8::Local::new(scope, &me);
+    let cons = v8::Local::new(scope, &*super_cons.stream);
+    cons.call(scope, local_me.into(), &[]).unwrap();
+    OutgoingMessage {
+      header: GcCell::new(None),
+      header_sent: GcCell::new(false),
+      finished: GcCell::new(false),
+      chunked_encoding: GcCell::new(false),
+      content_length: GcCell::new(None),
+      should_keep_alive: GcCell::new(true),
+      last: GcCell::new(false),
+      trailer: GcCell::new(String::new()),
+      out_headers: GcCell::new(HashMap::new()),
+      strict_content_length: GcCell::new(false),
+      join_duplicate_headers: GcCell::new(false),
+      closed: GcCell::new(false),
+      writable: GcCell::new(true),
+      destroyed: GcCell::new(false),
+      send_date: GcCell::new(true),
+    }
+  }
+}
+
 #[derive(deno_core::CppgcInherits)]
 #[cppgc_base(OutgoingMessage)]
 #[repr(C)]
@@ -670,5 +672,41 @@ unsafe impl GarbageCollected for ServerResponse {
 
   fn get_name(&self) -> &'static std::ffi::CStr {
     c"ServerResponse"
+  }
+}
+
+#[op2]
+impl ServerResponse {
+  #[constructor]
+  #[cppgc]
+  fn new(
+    #[this] me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+  ) -> ServerResponse {
+    ServerResponse::new_inner(me, scope, op_state)
+  }
+
+  #[fast]
+  fn write(&self, isolate: &mut v8::Isolate, #[string] data: String) {
+    // self.base.write(isolate, data);
+  }
+
+  #[fast]
+  fn end(&self, isolate: &mut v8::Isolate) {
+    // self.base.end(isolate);
+  }
+}
+impl ServerResponse {
+  fn new_inner(
+    me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+  ) -> ServerResponse {
+    ServerResponse {
+      base: OutgoingMessage::new_inner(me, scope, op_state),
+      status_code: GcCell::new(None),
+      status_message: GcCell::new(None),
+    }
   }
 }

@@ -28,6 +28,8 @@ import * as streamReadable from "node:_stream_readable";
 import * as from from "ext:checkin_node/internal/streams/from.js";
 import * as buffer from "node:buffer";
 import * as compose from "ext:checkin_node/internal/streams/compose.js";
+import * as http from "node:http";
+import * as net from "node:net";
 
 addAbortSignal;
 duplexify;
@@ -52,6 +54,8 @@ streamReadable;
 from;
 buffer;
 compose;
+http;
+net;
 
 export function init(globalThis) {
   globalThis.process = process;

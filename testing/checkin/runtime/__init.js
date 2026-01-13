@@ -8,7 +8,6 @@ import * as throw_ from "checkin:throw";
 import * as object from "checkin:object";
 import * as callsite from "checkin:callsite";
 import * as bench from "checkin:bench";
-import * as net from "checkin:net";
 import init from "ext:checkin_node/__bootstrap.js";
 async;
 error;
@@ -16,7 +15,6 @@ throw_;
 object;
 callsite;
 bench;
-net;
 
 globalThis.console = console.console;
 globalThis.setTimeout = timers.setTimeout;

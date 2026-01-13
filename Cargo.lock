@@ -733,6 +733,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "futures",
+ "httparse",
  "hyper",
  "pretty_assertions",
  "prettyplease",

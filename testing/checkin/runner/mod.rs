@@ -28,68 +28,12 @@ mod ops;
 mod ops_async;
 mod ops_buffer;
 mod ops_error;
-mod ops_http;
 mod ops_io;
-mod ops_net;
 mod ops_worker;
 pub mod snapshot;
 #[cfg(test)]
 pub mod testing;
 mod ts_module_loader;
-
-#[derive(Clone)]
-pub struct Constructors {
-  duplex: Rc<v8::Global<v8::Function>>,
-  event_emitter: Rc<v8::Global<v8::Function>>,
-  stream: Rc<v8::Global<v8::Function>>,
-  readable: Rc<v8::Global<v8::Function>>,
-}
-
-impl Constructors {
-  fn event_emitter<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.event_emitter)
-  }
-
-  fn duplex<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.duplex)
-  }
-
-  fn stream<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.stream)
-  }
-
-  fn readable<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.readable)
-  }
-}
-
-#[op2]
-pub fn op_set_constructors(
-  op_state: &mut OpState,
-  #[global] duplex_constructor: v8::Global<v8::Function>,
-  #[global] event_emitter_constructor: v8::Global<v8::Function>,
-  #[global] stream_constructor: v8::Global<v8::Function>,
-  #[global] readable_constructor: v8::Global<v8::Function>,
-) {
-  op_state.put(Constructors {
-    duplex: Rc::new(duplex_constructor),
-    event_emitter: Rc::new(event_emitter_constructor),
-    stream: Rc::new(stream_constructor),
-    readable: Rc::new(readable_constructor),
-  });
-}
 
 #[derive(Clone, Default)]
 pub struct Output {

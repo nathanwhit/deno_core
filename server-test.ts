@@ -1,4 +1,4 @@
-import { Server, SocketCb } from "checkin:net";
+import { Server, SocketCb } from "node:net";
 
 const server = new Server();
 

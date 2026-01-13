@@ -23,7 +23,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::checkin::runner::Constructors;
+use super::Constructors;
 
 fn is_ipv4(s: &str) -> bool {
   std::net::Ipv4Addr::from_str(s).is_ok()
