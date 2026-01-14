@@ -1,27 +1,38 @@
 use std::{
   cell::RefCell,
   collections::HashMap,
+  collections::VecDeque,
+  error::Error as _,
   io::ErrorKind,
-  ops::DerefMut,
+  pin::Pin,
   rc::Rc,
+  sync::{Arc, Mutex},
   sync::atomic::{AtomicBool, Ordering},
+  task::{Context, Poll, Waker},
 };
 
-use deno_core::AsyncRefCell;
+use bytes::Bytes;
 use deno_core::JsBuffer;
 use deno_core::convert::Uint8Array;
 use deno_core::error::JsError;
 use deno_core::v8::cppgc::{GcCell, Traced};
 use deno_core::{GarbageCollected, OpState, ToV8, op2, v8};
 use deno_error::JsErrorBox;
-use hyper::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedReadHalf;
+use futures::StreamExt;
+use http_body::Body;
+use http_body::Frame;
+use http_body::SizeHint;
+use http_body_util::BodyDataStream;
+use http_body_util::Either;
+use http_body_util::Full;
+use hyper::Request;
+use hyper::Response;
+use hyper::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
-use tokio::time::Duration;
-use tokio::time::timeout;
 
 use crate::checkin::runner::extensions::node::ScopeHolder;
 
@@ -74,110 +85,6 @@ impl HttpServer {
 }
 
 struct HttpServerCallback;
-
-const MAX_HEADER_SIZE: usize = 16 * 1024;
-const READ_BUFFER_SIZE: usize = 16 * 1024;
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
-struct ParsedRequest {
-  method: String,
-  url: String,
-  http_version: String,
-  http_version_major: u8,
-  http_version_minor: u8,
-  headers: HashMap<String, String>,
-  raw_headers: Vec<String>,
-  headers_distinct: HashMap<String, Vec<String>>,
-}
-
-fn parse_request_head(
-  buf: &[u8],
-) -> Result<Option<(ParsedRequest, usize)>, JsErrorBox> {
-  let mut headers_storage = [httparse::EMPTY_HEADER; 64];
-  let mut request = httparse::Request::new(&mut headers_storage);
-  let status = request
-    .parse(buf)
-    .map_err(|_| JsErrorBox::generic("invalid http"))?;
-  let header_len = match status {
-    httparse::Status::Complete(len) => len,
-    httparse::Status::Partial => return Ok(None),
-  };
-  let method = request
-    .method
-    .ok_or_else(|| JsErrorBox::generic("missing method"))?;
-  let url = request
-    .path
-    .ok_or_else(|| JsErrorBox::generic("missing url"))?;
-  let version = request.version.unwrap_or(1);
-  let http_version_major = 1;
-  let http_version_minor = version as u8;
-  let http_version = format!("{http_version_major}.{http_version_minor}");
-
-  let mut headers = HashMap::new();
-  let mut raw_headers = Vec::new();
-  let mut headers_distinct = HashMap::new();
-  for header in request.headers.iter() {
-    let name = header.name;
-    let value = std::str::from_utf8(header.value)
-      .map_err(JsErrorBox::from_err)?
-      .trim();
-    raw_headers.push(name.to_string());
-    raw_headers.push(value.to_string());
-    let lower = name.to_ascii_lowercase();
-    headers_distinct
-      .entry(lower.clone())
-      .or_insert_with(Vec::new)
-      .push(value.to_string());
-    headers
-      .entry(lower)
-      .and_modify(|existing: &mut String| {
-        existing.push_str(", ");
-        existing.push_str(value);
-      })
-      .or_insert_with(|| value.to_string());
-  }
-
-  Ok(Some((
-    ParsedRequest {
-      method: method.to_string(),
-      url: url.to_string(),
-      http_version,
-      http_version_major,
-      http_version_minor,
-      headers,
-      raw_headers,
-      headers_distinct,
-    },
-    header_len,
-  )))
-}
-
-fn is_chunked(headers: &HashMap<String, String>) -> bool {
-  headers.get("transfer-encoding").map_or(false, |value| {
-    value.to_ascii_lowercase().contains("chunked")
-  })
-}
-
-fn parse_content_length(
-  headers: &HashMap<String, String>,
-) -> Result<Option<usize>, JsErrorBox> {
-  let value = match headers.get("content-length") {
-    Some(value) => value,
-    None => return Ok(None),
-  };
-  let value = value.split(',').next().unwrap_or("").trim();
-  if value.is_empty() {
-    return Ok(None);
-  }
-  let len = value
-    .parse::<usize>()
-    .map_err(|_| JsErrorBox::type_error("Invalid Content-Length"))?;
-  Ok(Some(len))
-}
-
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-  buf.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
 fn is_connection_closed(err: &std::io::Error) -> bool {
   matches!(
     err.kind(),
@@ -219,15 +126,137 @@ impl ShouldReadState {
   }
 }
 
-async fn read_socket(
-  read: &mut OwnedReadHalf,
-  buf: &mut [u8],
-) -> Result<Option<usize>, JsErrorBox> {
-  match read.read(buf).await {
-    Ok(0) => Ok(None),
-    Ok(nread) => Ok(Some(nread)),
-    Err(err) if is_connection_closed(&err) => Ok(None),
-    Err(err) => Err(JsErrorBox::from_err(err)),
+const RESPONSE_BODY_HIGH_WATER: usize = 64 * 1024;
+
+struct ResponseBodyState {
+  queue: VecDeque<Bytes>,
+  closed: bool,
+  pending_bytes: usize,
+  waker: Option<Waker>,
+}
+
+#[derive(Clone)]
+struct ResponseBodyHandle {
+  inner: Arc<Mutex<ResponseBodyState>>,
+  drain_notify: Arc<Notify>,
+}
+
+struct ResponseBody {
+  inner: Arc<Mutex<ResponseBodyState>>,
+  drain_notify: Arc<Notify>,
+}
+
+type HttpResponseBody = Either<Full<Bytes>, ResponseBody>;
+
+fn response_body_pair() -> (ResponseBodyHandle, ResponseBody) {
+  let inner = Arc::new(Mutex::new(ResponseBodyState {
+    queue: VecDeque::new(),
+    closed: false,
+    pending_bytes: 0,
+    waker: None,
+  }));
+  let drain_notify = Arc::new(Notify::new());
+  (
+    ResponseBodyHandle {
+      inner: inner.clone(),
+      drain_notify: drain_notify.clone(),
+    },
+    ResponseBody {
+      inner,
+      drain_notify,
+    },
+  )
+}
+
+impl ResponseBodyHandle {
+  fn push_bytes(&self, bytes: Bytes) -> Result<usize, JsErrorBox> {
+    if bytes.is_empty() {
+      return Ok(0);
+    }
+    let (pending, waker) = {
+      let mut state = self.inner.lock().unwrap();
+      if state.closed {
+        return Err(JsErrorBox::generic("Response body closed"));
+      }
+      state.pending_bytes = state.pending_bytes.saturating_add(bytes.len());
+      state.queue.push_back(bytes);
+      (state.pending_bytes, state.waker.take())
+    };
+    if let Some(waker) = waker {
+      waker.wake();
+    }
+    Ok(pending)
+  }
+
+  fn close(&self) {
+    let waker = {
+      let mut state = self.inner.lock().unwrap();
+      state.closed = true;
+      state.waker.take()
+    };
+    if let Some(waker) = waker {
+      waker.wake();
+    }
+    self.drain_notify.notify_waiters();
+  }
+
+  async fn wait_for_drain(&self, target: usize) {
+    loop {
+      let pending = {
+        let state = self.inner.lock().unwrap();
+        if state.closed || state.pending_bytes <= target {
+          return;
+        }
+        state.pending_bytes
+      };
+      let _ = pending;
+      self.drain_notify.notified().await;
+    }
+  }
+}
+
+impl Body for ResponseBody {
+  type Data = Bytes;
+  type Error = hyper::Error;
+
+  fn poll_frame(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+  ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    let (frame, closed, pending_bytes) = {
+      let mut state = self.inner.lock().unwrap();
+      if let Some(bytes) = state.queue.pop_front() {
+        state.pending_bytes = state.pending_bytes.saturating_sub(bytes.len());
+        let pending_bytes = state.pending_bytes;
+        let frame = Frame::data(bytes);
+        (Some(Ok(frame)), state.closed, pending_bytes)
+      } else {
+        if state.closed {
+          (None, true, state.pending_bytes)
+        } else {
+          state.waker = Some(cx.waker().clone());
+          return Poll::Pending;
+        }
+      }
+    };
+
+    if pending_bytes <= RESPONSE_BODY_HIGH_WATER {
+      self.drain_notify.notify_waiters();
+    }
+
+    if closed && frame.is_none() {
+      return Poll::Ready(None);
+    }
+    Poll::Ready(frame)
+  }
+
+  fn is_end_stream(&self) -> bool {
+    let state = self.inner.lock().unwrap();
+    state.closed && state.queue.is_empty()
+  }
+
+  fn size_hint(&self) -> SizeHint {
+    SizeHint::new()
   }
 }
 
@@ -289,314 +318,324 @@ fn internalized<'a>(
   .unwrap()
 }
 
+fn finish_request(
+  inner: Rc<ServerInner>,
+  req_handle: Rc<v8::Global<v8::Object>>,
+  push_handle: Rc<v8::Global<v8::Function>>,
+  mark_complete: bool,
+  aborted: bool,
+) {
+  inner.with_scope(move |scope| {
+    v8::tc_scope!(let scope, scope);
+    let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
+    let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
+    if mark_complete {
+      let _ = req_obj.set(
+        scope,
+        internalized(scope, "complete").into(),
+        v8::Boolean::new(scope, true).into(),
+      );
+    }
+    if aborted {
+      let _ = req_obj.set(
+        scope,
+        internalized(scope, "aborted").into(),
+        v8::Boolean::new(scope, true).into(),
+      );
+    }
+    let _ = push.call(scope, req_obj.into(), &[v8::null(scope).into()]);
+  });
+}
+
+struct RequestMeta {
+  method: String,
+  url: String,
+  http_version: String,
+  http_version_major: u8,
+  http_version_minor: u8,
+  headers: HashMap<String, String>,
+  raw_headers: Vec<String>,
+  headers_distinct: HashMap<String, Vec<String>>,
+  upgrade: bool,
+  should_close: bool,
+}
+
+fn build_request_meta(parts: hyper::http::request::Parts) -> RequestMeta {
+  let method = parts.method.as_str().to_string();
+  let url = parts.uri.to_string();
+  let (http_version_major, http_version_minor, http_version) =
+    match parts.version {
+      Version::HTTP_10 => (1, 0, "1.0".to_string()),
+      Version::HTTP_11 => (1, 1, "1.1".to_string()),
+      Version::HTTP_2 => (2, 0, "2.0".to_string()),
+      Version::HTTP_3 => (3, 0, "3.0".to_string()),
+      _ => (1, 1, "1.1".to_string()),
+    };
+
+  let mut headers = HashMap::new();
+  let mut raw_headers = Vec::new();
+  let mut headers_distinct = HashMap::new();
+  for (name, value) in parts.headers.iter() {
+    let name_str = name.as_str().to_string();
+    let value_str = String::from_utf8_lossy(value.as_bytes()).to_string();
+    raw_headers.push(name_str.clone());
+    raw_headers.push(value_str.clone());
+    let lower = name_str.to_ascii_lowercase();
+    headers_distinct
+      .entry(lower.clone())
+      .or_insert_with(Vec::new)
+      .push(value_str.clone());
+    headers
+      .entry(lower)
+      .and_modify(|existing: &mut String| {
+        if !existing.is_empty() {
+          existing.push_str(", ");
+        }
+        existing.push_str(&value_str);
+      })
+      .or_insert(value_str);
+  }
+
+  let upgrade = headers.get("connection").map_or(false, |value| {
+    value.to_ascii_lowercase().contains("upgrade")
+  }) || headers.contains_key("upgrade");
+  let should_close = should_close_connection(
+    &headers,
+    http_version_major,
+    http_version_minor,
+  );
+
+  RequestMeta {
+    method,
+    url,
+    http_version,
+    http_version_major,
+    http_version_minor,
+    headers,
+    raw_headers,
+    headers_distinct,
+    upgrade,
+    should_close,
+  }
+}
+
+fn init_request_objects(
+  inner: &Rc<ServerInner>,
+  meta: RequestMeta,
+  has_body: bool,
+  should_read: Rc<ShouldReadState>,
+  response_tx: oneshot::Sender<Response<HttpResponseBody>>,
+) -> (Rc<v8::Global<v8::Object>>, Rc<v8::Global<v8::Function>>) {
+  let RequestMeta {
+    method,
+    url,
+    http_version,
+    http_version_major,
+    http_version_minor,
+    headers,
+    raw_headers,
+    headers_distinct,
+    upgrade,
+    should_close,
+  } = meta;
+
+  let req_slot: Rc<RefCell<Option<v8::Global<v8::Object>>>> =
+    Rc::new(RefCell::new(None));
+  let push_slot: Rc<RefCell<Option<v8::Global<v8::Function>>>> =
+    Rc::new(RefCell::new(None));
+
+  inner.with_scope_immediately({
+    let inner = inner.clone();
+    let req_slot = req_slot.clone();
+    let push_slot = push_slot.clone();
+    let should_read = should_read.clone();
+    move |scope| {
+      v8::tc_scope!(let scope, scope);
+      let req_empty =
+        deno_core::cppgc::make_cppgc_empty_object::<IncomingMessage>(scope);
+      let req = IncomingMessage::new_inner(
+        v8::Global::new(scope, req_empty),
+        scope,
+        inner.op_state(),
+        should_read,
+      );
+      req.method.set(scope, Some(method));
+      req.url.set(scope, Some(url));
+      req.http_version.set(scope, http_version);
+      req.http_version_major.set(scope, http_version_major);
+      req.http_version_minor.set(scope, http_version_minor);
+      req.headers.set(scope, headers);
+      req.raw_headers.set(scope, raw_headers);
+      req.headers_distinct.set(scope, headers_distinct);
+      req.complete.set(scope, !has_body);
+      req.upgrade.set(scope, upgrade);
+      let req_obj = deno_core::cppgc::wrap_object(scope, req_empty, req);
+
+      let res_empty =
+        deno_core::cppgc::make_cppgc_empty_object::<ServerResponse>(scope);
+      let res = ServerResponse::new_inner(
+        v8::Global::new(scope, res_empty),
+        scope,
+        inner.op_state(),
+        Some(response_tx),
+        None,
+        should_close,
+      );
+      if should_close {
+        res.base.set_header_internal(scope, "Connection", "close");
+      }
+      let res_obj = deno_core::cppgc::wrap_object(scope, res_empty, res);
+
+      let request_event = internalized(scope, "request");
+      inner.emit_event(
+        scope,
+        &[request_event.into(), req_obj.into(), res_obj.into()],
+      );
+
+      let push = req_obj
+        .get(scope, internalized(scope, "push").into())
+        .unwrap()
+        .cast::<v8::Function>();
+      *req_slot.borrow_mut() = Some(v8::Global::new(scope, req_obj));
+      *push_slot.borrow_mut() = Some(v8::Global::new(scope, push));
+    }
+  });
+
+  (
+    Rc::new(req_slot.borrow_mut().take().unwrap()),
+    Rc::new(push_slot.borrow_mut().take().unwrap()),
+  )
+}
+
+fn spawn_request_body_stream(
+  inner: Rc<ServerInner>,
+  body: hyper::body::Incoming,
+  should_read: Rc<ShouldReadState>,
+  req_handle: Rc<v8::Global<v8::Object>>,
+  push_handle: Rc<v8::Global<v8::Function>>,
+) {
+  deno_core::unsync::spawn(async move {
+    let mut body_stream = BodyDataStream::new(body);
+    loop {
+      should_read.wait_for_should_read().await;
+      let chunk = match body_stream.next().await {
+        Some(chunk) => chunk,
+        None => {
+          finish_request(inner, req_handle, push_handle, true, false);
+          break;
+        }
+      };
+      match chunk {
+        Ok(bytes) => {
+          let ok = push_chunk_with_backpressure(
+            &inner,
+            &req_handle,
+            &push_handle,
+            bytes.to_vec(),
+          )
+          .await;
+          if !ok {
+            should_read.clear_should_read();
+          }
+        }
+        Err(_) => {
+          finish_request(inner, req_handle, push_handle, false, true);
+          break;
+        }
+      }
+    }
+  });
+}
+
+async fn await_response(
+  response_rx: oneshot::Receiver<Response<HttpResponseBody>>,
+) -> Response<HttpResponseBody> {
+  match response_rx.await {
+    Ok(response) => response,
+    Err(_) => {
+      let mut response = Response::new(Either::Left(Full::new(Bytes::new())));
+      *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+      response
+    }
+  }
+}
+
+async fn handle_hyper_request(
+  inner: Rc<ServerInner>,
+  req: Request<hyper::body::Incoming>,
+) -> Result<Response<HttpResponseBody>, hyper::Error> {
+  let (parts, body) = req.into_parts();
+  let meta = build_request_meta(parts);
+  let has_body = !body.is_end_stream();
+  let should_read = Rc::new(ShouldReadState::new());
+
+  let (response_tx, response_rx) = oneshot::channel();
+
+  let (req_handle, push_handle) = init_request_objects(
+    &inner,
+    meta,
+    has_body,
+    should_read.clone(),
+    response_tx,
+  );
+
+  if has_body {
+    spawn_request_body_stream(
+      inner.clone(),
+      body,
+      should_read,
+      req_handle.clone(),
+      push_handle.clone(),
+    );
+  } else {
+    finish_request(
+      inner.clone(),
+      req_handle.clone(),
+      push_handle.clone(),
+      true,
+      false,
+    );
+  }
+
+  let response = await_response(response_rx).await;
+
+  Ok(response)
+}
+
 impl OnAccept for HttpServerCallback {
   async fn on_accept(
     inner: &Rc<ServerInner>,
     stream: tokio::net::TcpStream,
     _addr: std::net::SocketAddr,
   ) -> Result<(), JsErrorBox> {
-    let (mut read, write_half) = stream.into_split();
-    let write = Rc::new(AsyncRefCell::new(Some(write_half)));
-    let mut buf = Vec::with_capacity(READ_BUFFER_SIZE);
-    let mut scratch = [0u8; READ_BUFFER_SIZE];
-
-    loop {
-      let (parsed, header_len) = loop {
-        if let Some(parsed) = parse_request_head(&buf)? {
-          break parsed;
+    let service = {
+      let inner = inner.clone();
+      service_fn(move |req| handle_hyper_request(inner.clone(), req))
+    };
+    let result = http1::Builder::new()
+      .serve_connection(TokioIo::new(stream), service)
+      .await;
+    match result {
+      Ok(()) => Ok(()),
+      Err(err) => {
+        if err.is_closed()
+          || err.is_incomplete_message()
+          || err.is_shutdown()
+          || err.is_canceled()
+        {
+          return Ok(());
         }
-        let nread = if buf.is_empty() {
-          match timeout(KEEP_ALIVE_TIMEOUT, read_socket(&mut read, &mut scratch))
-            .await
-          {
-            Ok(result) => match result? {
-              Some(nread) => nread,
-              None => return Ok(()),
-            },
-            Err(_) => return Ok(()),
-          }
-        } else {
-          match read_socket(&mut read, &mut scratch).await? {
-            Some(nread) => nread,
-            None => return Ok(()),
-          }
-        };
-        buf.extend_from_slice(&scratch[..nread]);
-        if buf.len() > MAX_HEADER_SIZE {
-          return Err(JsErrorBox::generic("http header too large"));
-        }
-      };
-
-      let upgrade = parsed.headers.get("connection").map_or(false, |value| {
-        value.to_ascii_lowercase().contains("upgrade")
-      }) || parsed.headers.contains_key("upgrade");
-      let chunked = is_chunked(&parsed.headers);
-      let content_length = if chunked {
-        None
-      } else {
-        parse_content_length(&parsed.headers)?
-      };
-      let has_body = chunked || content_length.unwrap_or(0) > 0;
-      let should_close = should_close_connection(
-        &parsed.headers,
-        parsed.http_version_major,
-        parsed.http_version_minor,
-      );
-      let should_read = Rc::new(ShouldReadState::new());
-
-      let mut body_buf = buf.split_off(header_len);
-      let req_slot: Rc<RefCell<Option<v8::Global<v8::Object>>>> =
-        Rc::new(RefCell::new(None));
-      let push_slot: Rc<RefCell<Option<v8::Global<v8::Function>>>> =
-        Rc::new(RefCell::new(None));
-      inner.with_scope_immediately({
-        let inner = inner.clone();
-        let req_slot = req_slot.clone();
-        let push_slot = push_slot.clone();
-        let should_read = should_read.clone();
-        let parsed_method = parsed.method;
-        let parsed_url = parsed.url;
-        let parsed_http_version = parsed.http_version;
-        let parsed_http_version_major = parsed.http_version_major;
-        let parsed_http_version_minor = parsed.http_version_minor;
-        let parsed_headers = parsed.headers;
-        let parsed_raw_headers = parsed.raw_headers;
-        let parsed_headers_distinct = parsed.headers_distinct;
-        let write = write.clone();
-        move |scope| {
-          v8::tc_scope!(let scope, scope);
-          let req_empty =
-            deno_core::cppgc::make_cppgc_empty_object::<IncomingMessage>(scope);
-          let req = IncomingMessage::new_inner(
-            v8::Global::new(scope, req_empty),
-            scope,
-            inner.op_state(),
-            should_read,
-          );
-          req.method.set(scope, Some(parsed_method));
-          req.url.set(scope, Some(parsed_url));
-          req.http_version.set(scope, parsed_http_version);
-          req.http_version_major.set(scope, parsed_http_version_major);
-          req.http_version_minor.set(scope, parsed_http_version_minor);
-          req.headers.set(scope, parsed_headers);
-          req.raw_headers.set(scope, parsed_raw_headers);
-          req.headers_distinct.set(scope, parsed_headers_distinct);
-          req.complete.set(scope, !has_body);
-          req.upgrade.set(scope, upgrade);
-          let req_obj = deno_core::cppgc::wrap_object(scope, req_empty, req);
-
-          let res_empty =
-            deno_core::cppgc::make_cppgc_empty_object::<ServerResponse>(scope);
-          let res = ServerResponse::new_inner(
-            v8::Global::new(scope, res_empty),
-            scope,
-            inner.op_state(),
-            write,
-            should_close,
-          );
-          if should_close {
-            res
-              .base
-              .set_header_internal(scope, "Connection", "close");
-          }
-          let res_obj = deno_core::cppgc::wrap_object(scope, res_empty, res);
-
-          let request_event = internalized(scope, "request");
-          inner.emit_event(
-            scope,
-            &[request_event.into(), req_obj.into(), res_obj.into()],
-          );
-
-          let push = req_obj
-            .get(scope, internalized(scope, "push").into())
-            .unwrap()
-            .cast::<v8::Function>();
-          *req_slot.borrow_mut() = Some(v8::Global::new(scope, req_obj));
-          *push_slot.borrow_mut() = Some(v8::Global::new(scope, push));
-        }
-      });
-      let req_handle = Rc::new(req_slot.borrow_mut().take().unwrap());
-      let push_handle = Rc::new(push_slot.borrow_mut().take().unwrap());
-      let should_read = should_read;
-
-      let finish_req = |mark_complete: bool| {
-        let inner = inner.clone();
-        let req_handle = req_handle.clone();
-        let push_handle = push_handle.clone();
-        inner.with_scope(move |scope| {
-          v8::tc_scope!(let scope, scope);
-          let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
-          let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
-          if mark_complete {
-            let _ = req_obj.set(
-              scope,
-              internalized(scope, "complete").into(),
-              v8::Boolean::new(scope, true).into(),
-            );
-          }
-          let _ = push.call(scope, req_obj.into(), &[v8::null(scope).into()]);
-        });
-      };
-
-      if !has_body {
-        buf = body_buf;
-        finish_req(true);
-        if upgrade {
-          break;
-        }
-        continue;
-      }
-
-      if chunked {
-        let mut cursor = 0usize;
-        loop {
-          should_read.wait_for_should_read().await;
-          if cursor >= body_buf.len() {
-            let nread = match read_socket(&mut read, &mut scratch).await? {
-              Some(nread) => nread,
-              None => return Ok(()),
-            };
-            body_buf.extend_from_slice(&scratch[..nread]);
-            continue;
-          }
-
-          let status = httparse::parse_chunk_size(&body_buf[cursor..])
-            .map_err(|_| JsErrorBox::generic("invalid chunk size"))?;
-          let (size_line_len, size) = match status {
-            httparse::Status::Complete(data) => data,
-            httparse::Status::Partial => {
-              let nread = match read_socket(&mut read, &mut scratch).await? {
-                Some(nread) => nread,
-                None => return Ok(()),
-              };
-              body_buf.extend_from_slice(&scratch[..nread]);
-              continue;
-            }
-          };
-          let size = usize::try_from(size)
-            .map_err(|_| JsErrorBox::generic("chunk too large"))?;
-          let chunk_start = cursor + size_line_len;
-
-          if size == 0 {
-            if body_buf.len() >= chunk_start + 2
-              && &body_buf[chunk_start..chunk_start + 2] == b"\r\n"
-            {
-              cursor = chunk_start + 2;
-              break;
-            }
-            if let Some(end) = find_double_crlf(&body_buf[chunk_start..]) {
-              cursor = chunk_start + end + 4;
-              break;
-            }
-            let nread = match read_socket(&mut read, &mut scratch).await? {
-              Some(nread) => nread,
-              None => return Ok(()),
-            };
-            body_buf.extend_from_slice(&scratch[..nread]);
-            continue;
-          }
-
-          if body_buf.len() < chunk_start + size + 2 {
-            let nread = match read_socket(&mut read, &mut scratch).await? {
-              Some(nread) => nread,
-              None => return Ok(()),
-            };
-            body_buf.extend_from_slice(&scratch[..nread]);
-            continue;
-          }
-          let chunk_end = chunk_start + size;
-          if &body_buf[chunk_end..chunk_end + 2] != b"\r\n" {
-            return Err(JsErrorBox::generic("invalid chunk terminator"));
-          }
-          let ok = push_chunk_with_backpressure(
-            inner,
-            &req_handle,
-            &push_handle,
-            body_buf[chunk_start..chunk_end].to_vec(),
-          )
-          .await;
-          if !ok {
-            should_read.clear_should_read();
-          }
-          cursor = chunk_end + 2;
-        }
-        body_buf.drain(..cursor);
-        buf = body_buf;
-        finish_req(true);
-      } else if let Some(mut remaining) = content_length {
-        if remaining == 0 {
-          buf = body_buf;
-          finish_req(true);
-        } else {
-          if !body_buf.is_empty() {
-            let mut offset = 0usize;
-            while remaining > 0 && offset < body_buf.len() {
-              should_read.wait_for_should_read().await;
-              let available = body_buf.len() - offset;
-              let take = remaining.min(available);
-              let ok = push_chunk_with_backpressure(
-                inner,
-                &req_handle,
-                &push_handle,
-                body_buf[offset..offset + take].to_vec(),
-              )
-              .await;
-              if !ok {
-                should_read.clear_should_read();
-              }
-              remaining -= take;
-              offset += take;
-            }
-            if body_buf.len() > offset {
-              buf = body_buf[offset..].to_vec();
-              remaining = 0;
-            }
-          }
-          while remaining > 0 {
-            should_read.wait_for_should_read().await;
-            let nread = match read_socket(&mut read, &mut scratch).await? {
-              Some(nread) => nread,
-              None => return Ok(()),
-            };
-            if nread <= remaining {
-              let ok = push_chunk_with_backpressure(
-                inner,
-                &req_handle,
-                &push_handle,
-                scratch[..nread].to_vec(),
-              )
-              .await;
-              if !ok {
-                should_read.clear_should_read();
-              }
-              remaining -= nread;
-            } else {
-              let ok = push_chunk_with_backpressure(
-                inner,
-                &req_handle,
-                &push_handle,
-                scratch[..remaining].to_vec(),
-              )
-              .await;
-              if !ok {
-                should_read.clear_should_read();
-              }
-              buf.extend_from_slice(&scratch[remaining..nread]);
-              remaining = 0;
-            }
-          }
-          if remaining == 0 {
-            finish_req(true);
+        if let Some(io_err) = err
+          .source()
+          .and_then(|source| source.downcast_ref::<std::io::Error>())
+        {
+          if is_connection_closed(io_err) {
+            return Ok(());
           }
         }
-      }
-
-      if upgrade || should_close {
-        break;
+        Err(JsErrorBox::generic(format!("hyper error: {err}")))
       }
     }
-
-    Ok(())
   }
 }
 /// IncomingMessage represents an incoming HTTP request (for server) or response (for client).
@@ -1350,7 +1389,9 @@ pub struct ServerResponse {
   base: OutgoingMessage,
   status_code: GcCell<Option<u16>>,
   status_message: GcCell<Option<String>>,
-  write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+  response_tx:
+    RefCell<Option<oneshot::Sender<Response<HttpResponseBody>>>>,
+  body_handle: RefCell<Option<ResponseBodyHandle>>,
   scope_holder: Rc<ScopeHolder>,
   this: Rc<v8::TracedReference<v8::Object>>,
   close_after_response: bool,
@@ -1376,13 +1417,7 @@ impl ServerResponse {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> ServerResponse {
-    ServerResponse::new_inner(
-      me,
-      scope,
-      op_state,
-      Rc::new(AsyncRefCell::new(None)),
-      false,
-    )
+    ServerResponse::new_inner(me, scope, op_state, None, None, false)
   }
 
   #[fast]
@@ -1459,7 +1494,6 @@ impl ServerResponse {
     _encoding: v8::Local<v8::String>,
     #[global] cb: v8::Global<v8::Value>,
   ) -> Result<(), JsErrorBox> {
-    let mut payload = Vec::new();
     let header_sent = *self.base.header_sent.get(isolate);
     let has_length = self.base.has_header(isolate, "content-length");
     let has_te = self.base.has_header(isolate, "transfer-encoding");
@@ -1475,66 +1509,24 @@ impl ServerResponse {
         });
         return Ok(());
       }
-      self.base.maybe_enable_chunked(isolate);
-    } else {
-      self.base.update_chunked_encoding(isolate);
     }
 
-    if !*self.base.header_sent.get(isolate) {
-      let status_line = self.status_line(isolate, None, None)?;
-      let header = self.base.ensure_header(isolate, &status_line)?;
-      self.base.header_sent.set(isolate, true);
-      payload.extend_from_slice(header.as_bytes());
-    }
-
-    let mut buffered = None;
-    if !header_sent {
-      buffered = self.base.pending_body.get(isolate).clone();
+    let pending = self.base.pending_body.get(isolate).clone();
+    if pending.is_some() {
       self.base.pending_body.set(isolate, None);
     }
+    self.ensure_response(isolate)?;
 
-    let chunked = *self.base.chunked_encoding.get(isolate);
-    if let Some(buffered) = buffered {
-      if !buffered.is_empty() {
-        if chunked {
-          let prefix = format!("{:X}\r\n", buffered.len());
-          payload.extend_from_slice(prefix.as_bytes());
-          payload.extend_from_slice(&buffered);
-          payload.extend_from_slice(b"\r\n");
-        } else {
-          payload.extend_from_slice(&buffered);
-        }
-      }
+    let mut payload = Vec::new();
+    if let Some(pending) = pending {
+      payload.extend_from_slice(&pending);
     }
     if !data.is_empty() {
-      if chunked {
-        let prefix = format!("{:X}\r\n", data.len());
-        payload.extend_from_slice(prefix.as_bytes());
-        payload.extend_from_slice(&data);
-        payload.extend_from_slice(b"\r\n");
-      } else {
-        payload.extend_from_slice(&data);
-      }
+      payload.extend_from_slice(&data);
     }
-    let write = self.write.clone();
-    let scope_holder = self.scope_holder.clone();
-    let this = self.this.clone();
-    let num_wrote = if let Some(mut slot) = write.try_borrow_mut() {
-      if let Some(write) = slot.deref_mut().as_mut() {
-        let nwritten = write.try_write(&payload);
-        match nwritten {
-          Ok(nwritten) => nwritten,
-          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-          Err(e) => return Err(JsErrorBox::from_err(e)),
-        }
-      } else {
-        0
-      }
-    } else {
-      0
-    };
-
-    if num_wrote >= payload.len() {
+    if payload.is_empty() {
+      let scope_holder = self.scope_holder.clone();
+      let this = self.this.clone();
       scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
@@ -1543,23 +1535,30 @@ impl ServerResponse {
       return Ok(());
     }
 
-    deno_core::unsync::spawn(async move {
-      let result = write
-        .borrow_mut()
-        .await
-        .deref_mut()
-        .as_mut()
-        .unwrap()
-        .write_all(&payload[num_wrote..])
-        .await
-        .map_err(JsErrorBox::from_err)
-        .err();
+    let handle = self
+      .body_handle
+      .borrow()
+      .clone()
+      .ok_or_else(|| JsErrorBox::generic("Response body missing"))?;
+    let scope_holder = self.scope_holder.clone();
+    let this = self.this.clone();
+    let pending_bytes = handle.push_bytes(Bytes::from(payload))?;
+    if pending_bytes > RESPONSE_BODY_HIGH_WATER {
+      deno_core::unsync::spawn(async move {
+        handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
+        scope_holder.with_scope(move |scope| {
+          let cb = v8::Local::new(scope, &cb);
+          let this = this.get(scope).unwrap();
+          call_write_cb(scope, cb, this, None);
+        });
+      });
+    } else {
       scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb, this, result);
+        call_write_cb(scope, cb, this, None);
       });
-    });
+    }
 
     Ok(())
   }
@@ -1570,28 +1569,27 @@ impl ServerResponse {
     isolate: &mut v8::Isolate,
     #[global] cb: v8::Global<v8::Function>,
   ) {
-    let mut header_bytes = None;
-    let mut body_bytes = None;
+    let mut pending = None;
     if !*self.base.header_sent.get(isolate) {
       let has_length = self.base.has_header(isolate, "content-length");
       let has_te = self.base.has_header(isolate, "transfer-encoding");
-      let pending = self.base.pending_body.get(isolate).clone();
+      pending = self.base.pending_body.get(isolate).clone();
       self.base.pending_body.set(isolate, None);
       if !has_length && !has_te {
         let len = pending.as_ref().map(|buf| buf.len()).unwrap_or(0);
         self.base.set_content_length(isolate, len);
-      } else {
-        self.base.update_chunked_encoding(isolate);
       }
-      match self
-        .status_line(isolate, None, None)
-        .and_then(|status_line| self.base.ensure_header(isolate, &status_line))
-      {
-        Ok(header) => {
-          self.base.header_sent.set(isolate, true);
-          header_bytes = Some(header.into_bytes());
-          body_bytes = pending;
-        }
+    }
+
+    if !*self.base.header_sent.get(isolate)
+      && self.body_handle.borrow().is_none()
+      && self.response_tx.borrow().is_some()
+    {
+      let response_tx = self.response_tx.borrow_mut().take().unwrap();
+      let payload = pending.unwrap_or_default();
+      let body = Full::new(Bytes::from(payload));
+      let response = match self.build_response(isolate, Either::Left(body)) {
+        Ok(response) => response,
         Err(err) => {
           let scope_holder = self.scope_holder.clone();
           let this = self.this.clone();
@@ -1602,141 +1600,83 @@ impl ServerResponse {
           });
           return;
         }
-      }
+      };
+      let _ = response_tx.send(response);
+      self.base.header_sent.set(isolate, true);
+      let scope_holder = self.scope_holder.clone();
+      let this = self.this.clone();
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, None);
+      });
+      return;
     }
-    let chunked = *self.base.chunked_encoding.get(isolate);
-    let close_after_response = self.close_after_response;
-    let write = self.write.clone();
+
+    if let Err(err) = self.ensure_response(isolate) {
+      let scope_holder = self.scope_holder.clone();
+      let this = self.this.clone();
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, Some(err));
+      });
+      return;
+    }
+
+    let handle = match self.body_handle.borrow().clone() {
+      Some(handle) => handle,
+      None => {
+        let scope_holder = self.scope_holder.clone();
+        let this = self.this.clone();
+        scope_holder.with_scope(move |scope| {
+          let cb = v8::Local::new(scope, &cb);
+          let this = this.get(scope).unwrap();
+          call_write_cb(
+            scope,
+            cb.into(),
+            this,
+            Some(JsErrorBox::generic("Response body missing")),
+          );
+        });
+        return;
+      }
+    };
+
     let scope_holder = self.scope_holder.clone();
     let this = self.this.clone();
-    let mut segments = Vec::new();
-    if let Some(header_bytes) = header_bytes {
-      if !header_bytes.is_empty() {
-        segments.push(header_bytes);
-      }
-    }
-    if let Some(body_bytes) = body_bytes {
-      if !body_bytes.is_empty() {
-        if chunked {
-          segments.push(format!("{:X}\r\n", body_bytes.len()).into_bytes());
-          segments.push(body_bytes);
-          segments.push(b"\r\n".to_vec());
-        } else {
-          segments.push(body_bytes);
+    let pending_bytes = if let Some(pending) = pending.filter(|buf| !buf.is_empty()) {
+      match handle.push_bytes(Bytes::from(pending)) {
+        Ok(pending) => pending,
+        Err(err) => {
+          scope_holder.with_scope(move |scope| {
+            let cb = v8::Local::new(scope, &cb);
+            let this = this.get(scope).unwrap();
+            call_write_cb(scope, cb.into(), this, Some(err));
+          });
+          return;
         }
       }
-    }
-    if chunked {
-      segments.push(b"0\r\n\r\n".to_vec());
-    }
-
-    if segments.is_empty() && !close_after_response {
+    } else {
+      0
+    };
+    handle.close();
+    if pending_bytes > RESPONSE_BODY_HIGH_WATER {
+      deno_core::unsync::spawn(async move {
+        handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
+        scope_holder.with_scope(move |scope| {
+          let cb = v8::Local::new(scope, &cb);
+          let this = this.get(scope).unwrap();
+          call_write_cb(scope, cb.into(), this, None);
+        });
+      });
+    } else {
       scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
         call_write_cb(scope, cb.into(), this, None);
       });
-      return;
     }
-
-    let mut remaining: Option<Vec<u8>> = None;
-    let mut result: Option<JsErrorBox> = None;
-    let mut wrote_all = segments.is_empty();
-
-    if let Some(mut slot) = write.try_borrow_mut() {
-      if let Some(write) = slot.deref_mut().as_mut() {
-        let mut idx = 0usize;
-        let mut offset = 0usize;
-        while idx < segments.len() {
-          let segment = &segments[idx];
-          if offset >= segment.len() {
-            idx += 1;
-            offset = 0;
-            continue;
-          }
-          match write.try_write(&segment[offset..]) {
-            Ok(0) => break,
-            Ok(nwritten) => {
-              offset += nwritten;
-              if offset == segment.len() {
-                idx += 1;
-                offset = 0;
-              }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(err) => {
-              result = Some(JsErrorBox::from_err(err));
-              break;
-            }
-          }
-        }
-        if result.is_none() {
-          if idx == segments.len() {
-            wrote_all = true;
-          } else {
-            let mut rem = Vec::new();
-            if idx < segments.len() {
-              rem.extend_from_slice(&segments[idx][offset..]);
-              for segment in segments.iter().skip(idx + 1) {
-                rem.extend_from_slice(segment);
-              }
-            }
-            if !rem.is_empty() {
-              remaining = Some(rem);
-            }
-          }
-        }
-      }
-    } else if !segments.is_empty() {
-      let mut rem = Vec::new();
-      for segment in &segments {
-        rem.extend_from_slice(segment);
-      }
-      remaining = Some(rem);
-    }
-
-    if let Some(result) = result {
-      scope_holder.with_scope(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, Some(result));
-      });
-      return;
-    }
-
-    if wrote_all && !close_after_response {
-      scope_holder.with_scope(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, None);
-      });
-      return;
-    }
-
-    deno_core::unsync::spawn(async move {
-      let mut result = None;
-      if let Some(write) = write.borrow_mut().await.deref_mut().as_mut() {
-        if let Some(remaining) = remaining {
-          result = write
-            .write_all(&remaining)
-            .await
-            .map_err(JsErrorBox::from_err)
-            .err();
-        }
-        if result.is_none() && close_after_response {
-          result = write
-            .shutdown()
-            .await
-            .map_err(JsErrorBox::from_err)
-            .err();
-        }
-      }
-      scope_holder.with_scope(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, result);
-      });
-    });
   }
 
   #[rename("_destroy")]
@@ -1753,7 +1693,8 @@ impl ServerResponse {
     me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
-    write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+    response_tx: Option<oneshot::Sender<Response<HttpResponseBody>>>,
+    body_handle: Option<ResponseBodyHandle>,
     close_after_response: bool,
   ) -> ServerResponse {
     let (spawner, this) = {
@@ -1769,11 +1710,52 @@ impl ServerResponse {
       base: OutgoingMessage::new_inner(me, scope, op_state),
       status_code: GcCell::new(None),
       status_message: GcCell::new(None),
-      write,
+      response_tx: RefCell::new(response_tx),
+      body_handle: RefCell::new(body_handle),
       scope_holder: Rc::new(ScopeHolder::new(spawner, isolate_ptr, context)),
       this,
       close_after_response,
     }
+  }
+
+  fn build_response(
+    &self,
+    isolate: &mut v8::Isolate,
+    body: HttpResponseBody,
+  ) -> Result<Response<HttpResponseBody>, JsErrorBox> {
+    let status_code = (*self.status_code.get(isolate)).unwrap_or(200);
+    let status = StatusCode::from_u16(status_code)
+      .map_err(|_| JsErrorBox::type_error("Invalid status code"))?;
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+
+    let mut header_map = HeaderMap::new();
+    let headers = self.base.out_headers.get(isolate).clone();
+    for (_, (name, value)) in headers.iter() {
+      let name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| JsErrorBox::type_error("Invalid header name"))?;
+      let value = HeaderValue::from_str(value)
+        .map_err(|_| JsErrorBox::type_error("Invalid header value"))?;
+      header_map.append(name, value);
+    }
+    *response.headers_mut() = header_map;
+    Ok(response)
+  }
+
+  fn ensure_response(
+    &self,
+    isolate: &mut v8::Isolate,
+  ) -> Result<(), JsErrorBox> {
+    let response_tx = self.response_tx.borrow_mut().take();
+    if response_tx.is_none() {
+      return Ok(());
+    }
+    let (handle, body) = response_body_pair();
+    let response = self.build_response(isolate, Either::Right(body))?;
+    self.body_handle.borrow_mut().replace(handle);
+    let _ = response_tx.unwrap().send(response);
+    self.base.header_sent.set(isolate, true);
+    Ok(())
   }
 
   fn status_line(

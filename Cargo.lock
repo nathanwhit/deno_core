@@ -729,12 +729,17 @@ name = "deno_core_testing"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "deno_ast",
  "deno_core",
  "deno_error",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "httparse",
  "hyper",
+ "hyper-util",
  "pretty_assertions",
  "prettyplease",
  "smallvec",
