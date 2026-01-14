@@ -1,5 +1,10 @@
 use std::{
-  cell::RefCell, collections::HashMap, io::ErrorKind, ops::DerefMut, rc::Rc,
+  cell::RefCell,
+  collections::HashMap,
+  io::ErrorKind,
+  ops::DerefMut,
+  rc::Rc,
+  sync::atomic::{AtomicBool, Ordering},
 };
 
 use deno_core::AsyncRefCell;
@@ -13,6 +18,10 @@ use hyper::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedReadHalf;
+use tokio::sync::Notify;
+use tokio::sync::oneshot;
+use tokio::time::Duration;
+use tokio::time::timeout;
 
 use crate::checkin::runner::extensions::node::ScopeHolder;
 
@@ -67,6 +76,8 @@ impl HttpServer {
 struct HttpServerCallback;
 
 const MAX_HEADER_SIZE: usize = 16 * 1024;
+const READ_BUFFER_SIZE: usize = 16 * 1024;
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 struct ParsedRequest {
   method: String,
   url: String,
@@ -177,6 +188,37 @@ fn is_connection_closed(err: &std::io::Error) -> bool {
   )
 }
 
+struct ShouldReadState {
+  should_read: AtomicBool,
+  notify: Notify,
+}
+
+impl ShouldReadState {
+  fn new() -> Self {
+    Self {
+      should_read: AtomicBool::new(true),
+      notify: Notify::new(),
+    }
+  }
+
+  fn set_should_read(&self) {
+    if !self.should_read.swap(true, Ordering::Relaxed) {
+      self.notify.notify_waiters();
+    }
+  }
+
+  fn clear_should_read(&self) {
+    self.should_read.store(false, Ordering::Relaxed);
+  }
+
+  async fn wait_for_should_read(&self) {
+    if self.should_read.load(Ordering::Relaxed) {
+      return;
+    }
+    self.notify.notified().await;
+  }
+}
+
 async fn read_socket(
   read: &mut OwnedReadHalf,
   buf: &mut [u8],
@@ -187,6 +229,52 @@ async fn read_socket(
     Err(err) if is_connection_closed(&err) => Ok(None),
     Err(err) => Err(JsErrorBox::from_err(err)),
   }
+}
+
+async fn push_chunk_with_backpressure(
+  inner: &Rc<ServerInner>,
+  req_handle: &Rc<v8::Global<v8::Object>>,
+  push_handle: &Rc<v8::Global<v8::Function>>,
+  data: Vec<u8>,
+) -> bool {
+  if data.is_empty() {
+    return true;
+  }
+  let (tx, rx) = oneshot::channel();
+  let inner = inner.clone();
+  let req_handle = req_handle.clone();
+  let push_handle = push_handle.clone();
+  inner.with_scope(move |scope| {
+    v8::tc_scope!(let scope, scope);
+    let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
+    let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
+    let data = Uint8Array(data);
+    let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
+    let result = push.call(scope, req_obj.into(), &[arg]);
+    let ok = result
+      .and_then(|value| value.try_cast::<v8::Boolean>().ok())
+      .map(|value| value.is_true())
+      .unwrap_or(true);
+    let _ = tx.send(ok);
+  });
+  rx.await.unwrap_or(true)
+}
+
+fn should_close_connection(
+  headers: &HashMap<String, String>,
+  http_version_major: u8,
+  http_version_minor: u8,
+) -> bool {
+  if let Some(value) = headers.get("connection") {
+    let value = value.to_ascii_lowercase();
+    if value.contains("close") {
+      return true;
+    }
+    if value.contains("keep-alive") {
+      return false;
+    }
+  }
+  http_version_major == 1 && http_version_minor == 0
 }
 
 fn internalized<'a>(
@@ -209,17 +297,29 @@ impl OnAccept for HttpServerCallback {
   ) -> Result<(), JsErrorBox> {
     let (mut read, write_half) = stream.into_split();
     let write = Rc::new(AsyncRefCell::new(Some(write_half)));
-    let mut buf = Vec::with_capacity(1024);
-    let mut scratch = [0u8; 1024];
+    let mut buf = Vec::with_capacity(READ_BUFFER_SIZE);
+    let mut scratch = [0u8; READ_BUFFER_SIZE];
 
     loop {
       let (parsed, header_len) = loop {
         if let Some(parsed) = parse_request_head(&buf)? {
           break parsed;
         }
-        let nread = match read_socket(&mut read, &mut scratch).await? {
-          Some(nread) => nread,
-          None => return Ok(()),
+        let nread = if buf.is_empty() {
+          match timeout(KEEP_ALIVE_TIMEOUT, read_socket(&mut read, &mut scratch))
+            .await
+          {
+            Ok(result) => match result? {
+              Some(nread) => nread,
+              None => return Ok(()),
+            },
+            Err(_) => return Ok(()),
+          }
+        } else {
+          match read_socket(&mut read, &mut scratch).await? {
+            Some(nread) => nread,
+            None => return Ok(()),
+          }
         };
         buf.extend_from_slice(&scratch[..nread]);
         if buf.len() > MAX_HEADER_SIZE {
@@ -237,6 +337,12 @@ impl OnAccept for HttpServerCallback {
         parse_content_length(&parsed.headers)?
       };
       let has_body = chunked || content_length.unwrap_or(0) > 0;
+      let should_close = should_close_connection(
+        &parsed.headers,
+        parsed.http_version_major,
+        parsed.http_version_minor,
+      );
+      let should_read = Rc::new(ShouldReadState::new());
 
       let mut body_buf = buf.split_off(header_len);
       let req_slot: Rc<RefCell<Option<v8::Global<v8::Object>>>> =
@@ -247,6 +353,7 @@ impl OnAccept for HttpServerCallback {
         let inner = inner.clone();
         let req_slot = req_slot.clone();
         let push_slot = push_slot.clone();
+        let should_read = should_read.clone();
         let parsed_method = parsed.method;
         let parsed_url = parsed.url;
         let parsed_http_version = parsed.http_version;
@@ -264,6 +371,7 @@ impl OnAccept for HttpServerCallback {
             v8::Global::new(scope, req_empty),
             scope,
             inner.op_state(),
+            should_read,
           );
           req.method.set(scope, Some(parsed_method));
           req.url.set(scope, Some(parsed_url));
@@ -284,7 +392,13 @@ impl OnAccept for HttpServerCallback {
             scope,
             inner.op_state(),
             write,
+            should_close,
           );
+          if should_close {
+            res
+              .base
+              .set_header_internal(scope, "Connection", "close");
+          }
           let res_obj = deno_core::cppgc::wrap_object(scope, res_empty, res);
 
           let request_event = internalized(scope, "request");
@@ -303,28 +417,7 @@ impl OnAccept for HttpServerCallback {
       });
       let req_handle = Rc::new(req_slot.borrow_mut().take().unwrap());
       let push_handle = Rc::new(push_slot.borrow_mut().take().unwrap());
-
-      let push_chunk = |data: Vec<u8>| {
-        if data.is_empty() {
-          return;
-        }
-        let inner = inner.clone();
-        let req_handle = req_handle.clone();
-        let push_handle = push_handle.clone();
-        inner.with_scope(move |scope| {
-          v8::tc_scope!(let scope, scope);
-          let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
-          let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
-          let data = Uint8Array(data);
-          let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-          let result = push.call(scope, req_obj.into(), &[arg]);
-          if result.is_none() {
-            let exception = scope.exception().unwrap();
-            let error = JsError::from_v8_exception(scope, exception);
-            eprintln!("error in push: {:?}", error);
-          }
-        });
-      };
+      let should_read = should_read;
 
       let finish_req = |mark_complete: bool| {
         let inner = inner.clone();
@@ -357,6 +450,7 @@ impl OnAccept for HttpServerCallback {
       if chunked {
         let mut cursor = 0usize;
         loop {
+          should_read.wait_for_should_read().await;
           if cursor >= body_buf.len() {
             let nread = match read_socket(&mut read, &mut scratch).await? {
               Some(nread) => nread,
@@ -414,7 +508,16 @@ impl OnAccept for HttpServerCallback {
           if &body_buf[chunk_end..chunk_end + 2] != b"\r\n" {
             return Err(JsErrorBox::generic("invalid chunk terminator"));
           }
-          push_chunk(body_buf[chunk_start..chunk_end].to_vec());
+          let ok = push_chunk_with_backpressure(
+            inner,
+            &req_handle,
+            &push_handle,
+            body_buf[chunk_start..chunk_end].to_vec(),
+          )
+          .await;
+          if !ok {
+            should_read.clear_should_read();
+          }
           cursor = chunk_end + 2;
         }
         body_buf.drain(..cursor);
@@ -426,26 +529,58 @@ impl OnAccept for HttpServerCallback {
           finish_req(true);
         } else {
           if !body_buf.is_empty() {
-            let take = remaining.min(body_buf.len());
-            push_chunk(body_buf[..take].to_vec());
-            remaining -= take;
-            if body_buf.len() > take {
-              buf = body_buf[take..].to_vec();
+            let mut offset = 0usize;
+            while remaining > 0 && offset < body_buf.len() {
+              should_read.wait_for_should_read().await;
+              let available = body_buf.len() - offset;
+              let take = remaining.min(available);
+              let ok = push_chunk_with_backpressure(
+                inner,
+                &req_handle,
+                &push_handle,
+                body_buf[offset..offset + take].to_vec(),
+              )
+              .await;
+              if !ok {
+                should_read.clear_should_read();
+              }
+              remaining -= take;
+              offset += take;
+            }
+            if body_buf.len() > offset {
+              buf = body_buf[offset..].to_vec();
               remaining = 0;
-            } else {
-              body_buf.clear();
             }
           }
           while remaining > 0 {
+            should_read.wait_for_should_read().await;
             let nread = match read_socket(&mut read, &mut scratch).await? {
               Some(nread) => nread,
               None => return Ok(()),
             };
             if nread <= remaining {
-              push_chunk(scratch[..nread].to_vec());
+              let ok = push_chunk_with_backpressure(
+                inner,
+                &req_handle,
+                &push_handle,
+                scratch[..nread].to_vec(),
+              )
+              .await;
+              if !ok {
+                should_read.clear_should_read();
+              }
               remaining -= nread;
             } else {
-              push_chunk(scratch[..remaining].to_vec());
+              let ok = push_chunk_with_backpressure(
+                inner,
+                &req_handle,
+                &push_handle,
+                scratch[..remaining].to_vec(),
+              )
+              .await;
+              if !ok {
+                should_read.clear_should_read();
+              }
               buf.extend_from_slice(&scratch[remaining..nread]);
               remaining = 0;
             }
@@ -456,7 +591,7 @@ impl OnAccept for HttpServerCallback {
         }
       }
 
-      if upgrade {
+      if upgrade || should_close {
         break;
       }
     }
@@ -512,6 +647,8 @@ pub struct IncomingMessage {
   upgrade: GcCell<bool>,
   /// Whether to join duplicate headers
   join_duplicate_headers: GcCell<bool>,
+  /// Backpressure signal from Readable
+  should_read: Rc<ShouldReadState>,
 }
 
 unsafe impl GarbageCollected for IncomingMessage {
@@ -531,7 +668,12 @@ impl IncomingMessage {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> IncomingMessage {
-    IncomingMessage::new_inner(me, scope, op_state)
+    IncomingMessage::new_inner(
+      me,
+      scope,
+      op_state,
+      Rc::new(ShouldReadState::new()),
+    )
   }
 
   // --- Getters ---
@@ -710,7 +852,7 @@ impl IncomingMessage {
   #[fast]
   #[rename("_read")]
   fn read(&self) {
-    // Placeholder - resumes socket in full implementation
+    self.should_read.set_should_read();
   }
 
   #[fast]
@@ -734,6 +876,7 @@ impl IncomingMessage {
     me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
+    should_read: Rc<ShouldReadState>,
   ) -> IncomingMessage {
     let super_cons = {
       let op_state = op_state.borrow();
@@ -760,6 +903,7 @@ impl IncomingMessage {
       aborted: GcCell::new(false),
       upgrade: GcCell::new(false),
       join_duplicate_headers: GcCell::new(false),
+      should_read,
     }
   }
 }
@@ -1135,6 +1279,20 @@ impl OutgoingMessage {
     self.out_headers.get(isolate).contains_key(name)
   }
 
+  fn set_header_internal(
+    &self,
+    isolate: &mut v8::Isolate,
+    name: &str,
+    value: &str,
+  ) {
+    let mut headers = self.out_headers.get(isolate).clone();
+    headers.insert(
+      name.to_ascii_lowercase(),
+      (name.to_string(), value.to_string()),
+    );
+    self.out_headers.set(isolate, headers);
+  }
+
   fn clear_header_cache(&self, isolate: &mut v8::Isolate) {
     if self.header.get(isolate).is_some() {
       self.header.set(isolate, None);
@@ -1195,6 +1353,7 @@ pub struct ServerResponse {
   write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
   scope_holder: Rc<ScopeHolder>,
   this: Rc<v8::TracedReference<v8::Object>>,
+  close_after_response: bool,
 }
 
 unsafe impl GarbageCollected for ServerResponse {
@@ -1222,6 +1381,7 @@ impl ServerResponse {
       scope,
       op_state,
       Rc::new(AsyncRefCell::new(None)),
+      false,
     )
   }
 
@@ -1445,56 +1605,127 @@ impl ServerResponse {
       }
     }
     let chunked = *self.base.chunked_encoding.get(isolate);
+    let close_after_response = self.close_after_response;
     let write = self.write.clone();
     let scope_holder = self.scope_holder.clone();
     let this = self.this.clone();
+    let mut segments = Vec::new();
+    if let Some(header_bytes) = header_bytes {
+      if !header_bytes.is_empty() {
+        segments.push(header_bytes);
+      }
+    }
+    if let Some(body_bytes) = body_bytes {
+      if !body_bytes.is_empty() {
+        if chunked {
+          segments.push(format!("{:X}\r\n", body_bytes.len()).into_bytes());
+          segments.push(body_bytes);
+          segments.push(b"\r\n".to_vec());
+        } else {
+          segments.push(body_bytes);
+        }
+      }
+    }
+    if chunked {
+      segments.push(b"0\r\n\r\n".to_vec());
+    }
+
+    if segments.is_empty() && !close_after_response {
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, None);
+      });
+      return;
+    }
+
+    let mut remaining: Option<Vec<u8>> = None;
+    let mut result: Option<JsErrorBox> = None;
+    let mut wrote_all = segments.is_empty();
+
+    if let Some(mut slot) = write.try_borrow_mut() {
+      if let Some(write) = slot.deref_mut().as_mut() {
+        let mut idx = 0usize;
+        let mut offset = 0usize;
+        while idx < segments.len() {
+          let segment = &segments[idx];
+          if offset >= segment.len() {
+            idx += 1;
+            offset = 0;
+            continue;
+          }
+          match write.try_write(&segment[offset..]) {
+            Ok(0) => break,
+            Ok(nwritten) => {
+              offset += nwritten;
+              if offset == segment.len() {
+                idx += 1;
+                offset = 0;
+              }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => {
+              result = Some(JsErrorBox::from_err(err));
+              break;
+            }
+          }
+        }
+        if result.is_none() {
+          if idx == segments.len() {
+            wrote_all = true;
+          } else {
+            let mut rem = Vec::new();
+            if idx < segments.len() {
+              rem.extend_from_slice(&segments[idx][offset..]);
+              for segment in segments.iter().skip(idx + 1) {
+                rem.extend_from_slice(segment);
+              }
+            }
+            if !rem.is_empty() {
+              remaining = Some(rem);
+            }
+          }
+        }
+      }
+    } else if !segments.is_empty() {
+      let mut rem = Vec::new();
+      for segment in &segments {
+        rem.extend_from_slice(segment);
+      }
+      remaining = Some(rem);
+    }
+
+    if let Some(result) = result {
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, Some(result));
+      });
+      return;
+    }
+
+    if wrote_all && !close_after_response {
+      scope_holder.with_scope(move |scope| {
+        let cb = v8::Local::new(scope, &cb);
+        let this = this.get(scope).unwrap();
+        call_write_cb(scope, cb.into(), this, None);
+      });
+      return;
+    }
+
     deno_core::unsync::spawn(async move {
       let mut result = None;
       if let Some(write) = write.borrow_mut().await.deref_mut().as_mut() {
-        if let Some(header_bytes) = header_bytes {
+        if let Some(remaining) = remaining {
           result = write
-            .write_all(&header_bytes)
+            .write_all(&remaining)
             .await
             .map_err(JsErrorBox::from_err)
             .err();
         }
-        if result.is_none() {
-          if let Some(body_bytes) = body_bytes {
-            if !body_bytes.is_empty() {
-              if chunked {
-                let prefix = format!("{:X}\r\n", body_bytes.len());
-                result = write
-                  .write_all(prefix.as_bytes())
-                  .await
-                  .map_err(JsErrorBox::from_err)
-                  .err();
-                if result.is_none() {
-                  result = write
-                    .write_all(&body_bytes)
-                    .await
-                    .map_err(JsErrorBox::from_err)
-                    .err();
-                }
-                if result.is_none() {
-                  result = write
-                    .write_all(b"\r\n")
-                    .await
-                    .map_err(JsErrorBox::from_err)
-                    .err();
-                }
-              } else {
-                result = write
-                  .write_all(&body_bytes)
-                  .await
-                  .map_err(JsErrorBox::from_err)
-                  .err();
-              }
-            }
-          }
-        }
-        if result.is_none() && chunked {
+        if result.is_none() && close_after_response {
           result = write
-            .write_all(b"0\r\n\r\n")
+            .shutdown()
             .await
             .map_err(JsErrorBox::from_err)
             .err();
@@ -1523,6 +1754,7 @@ impl ServerResponse {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
     write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+    close_after_response: bool,
   ) -> ServerResponse {
     let (spawner, this) = {
       let op_state = op_state.borrow();
@@ -1540,6 +1772,7 @@ impl ServerResponse {
       write,
       scope_holder: Rc::new(ScopeHolder::new(spawner, isolate_ptr, context)),
       this,
+      close_after_response,
     }
   }
 
