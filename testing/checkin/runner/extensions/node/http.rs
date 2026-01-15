@@ -273,7 +273,7 @@ async fn push_chunk_with_backpressure(
   let inner = inner.clone();
   let req_handle = req_handle.clone();
   let push_handle = push_handle.clone();
-  inner.with_scope(move |scope| {
+  inner.with_scope_immediately(move |scope| {
     v8::tc_scope!(let scope, scope);
     let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
     let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
@@ -308,7 +308,7 @@ fn finish_request(
   mark_complete: bool,
   aborted: bool,
 ) {
-  inner.with_scope(move |scope| {
+  inner.with_scope_immediately(move |scope| {
     v8::tc_scope!(let scope, scope);
     let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
     let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
@@ -1557,7 +1557,7 @@ impl ServerResponse {
         self.base.pending_body.set(isolate, Some(data.to_vec()));
         let scope_holder = self.scope_holder.clone();
         let this = self.this.clone();
-        scope_holder.with_scope(move |scope| {
+        scope_holder.with_scope_immediately(move |scope| {
           let cb = v8::Local::new(scope, &cb);
           let this = this.get(scope).unwrap();
           call_write_cb(scope, cb, this, None);
@@ -1582,7 +1582,7 @@ impl ServerResponse {
     if payload.is_empty() {
       let scope_holder = self.scope_holder.clone();
       let this = self.this.clone();
-      scope_holder.with_scope(move |scope| {
+      scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
         call_write_cb(scope, cb, this, None);
@@ -1601,14 +1601,14 @@ impl ServerResponse {
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
       deno_core::unsync::spawn(async move {
         handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
-        scope_holder.with_scope(move |scope| {
+        scope_holder.with_scope_immediately(move |scope| {
           let cb = v8::Local::new(scope, &cb);
           let this = this.get(scope).unwrap();
           call_write_cb(scope, cb, this, None);
         });
       });
     } else {
-      scope_holder.with_scope(move |scope| {
+      scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
         call_write_cb(scope, cb, this, None);
@@ -1648,7 +1648,7 @@ impl ServerResponse {
         Err(err) => {
           let scope_holder = self.scope_holder.clone();
           let this = self.this.clone();
-          scope_holder.with_scope(move |scope| {
+          scope_holder.with_scope_immediately(move |scope| {
             let cb = v8::Local::new(scope, &cb);
             let this = this.get(scope).unwrap();
             call_write_cb(scope, cb.into(), this, Some(err));
@@ -1660,7 +1660,7 @@ impl ServerResponse {
       self.base.header_sent.set(isolate, true);
       let scope_holder = self.scope_holder.clone();
       let this = self.this.clone();
-      scope_holder.with_scope(move |scope| {
+      scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
         call_write_cb(scope, cb.into(), this, None);
@@ -1671,7 +1671,7 @@ impl ServerResponse {
     if let Err(err) = self.ensure_response(isolate) {
       let scope_holder = self.scope_holder.clone();
       let this = self.this.clone();
-      scope_holder.with_scope(move |scope| {
+      scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
         call_write_cb(scope, cb.into(), this, Some(err));
@@ -1684,7 +1684,7 @@ impl ServerResponse {
       None => {
         let scope_holder = self.scope_holder.clone();
         let this = self.this.clone();
-        scope_holder.with_scope(move |scope| {
+        scope_holder.with_scope_immediately(move |scope| {
           let cb = v8::Local::new(scope, &cb);
           let this = this.get(scope).unwrap();
           call_write_cb(
@@ -1705,7 +1705,7 @@ impl ServerResponse {
         match handle.push_bytes(Bytes::from(pending)) {
           Ok(pending) => pending,
           Err(err) => {
-            scope_holder.with_scope(move |scope| {
+            scope_holder.with_scope_immediately(move |scope| {
               let cb = v8::Local::new(scope, &cb);
               let this = this.get(scope).unwrap();
               call_write_cb(scope, cb.into(), this, Some(err));
@@ -1720,14 +1720,14 @@ impl ServerResponse {
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
       deno_core::unsync::spawn(async move {
         handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
-        scope_holder.with_scope(move |scope| {
+        scope_holder.with_scope_immediately(move |scope| {
           let cb = v8::Local::new(scope, &cb);
           let this = this.get(scope).unwrap();
           call_write_cb(scope, cb.into(), this, None);
         });
       });
     } else {
-      scope_holder.with_scope(move |scope| {
+      scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = this.get(scope).unwrap();
         call_write_cb(scope, cb.into(), this, None);
