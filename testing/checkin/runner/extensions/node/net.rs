@@ -202,6 +202,7 @@ struct SocketCbInner {
   should_read: Rc<ShouldReadState>,
 
   emit_func: Rc<v8::TracedReference<v8::Function>>,
+  on_event_func: Rc<v8::TracedReference<v8::Function>>,
 }
 
 pub struct SocketCb {
@@ -213,6 +214,7 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
     self.inner.push_func.trace(visitor);
     self.inner.this.trace(visitor);
     self.inner.emit_func.trace(visitor);
+    self.inner.on_event_func.trace(visitor);
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
@@ -280,8 +282,13 @@ impl SocketCb {
       .get(scope, emit.into())
       .unwrap()
       .cast::<v8::Function>();
+    let on_event = internalized(scope, "on");
+    let on_event_func = local_me
+      .get(scope, on_event.into())
+      .unwrap()
+      .cast::<v8::Function>();
     let emit_func = Rc::new(v8::TracedReference::new(scope, emit_func));
-
+    let on_event_func = Rc::new(v8::TracedReference::new(scope, on_event_func));
     let cb = SocketCb {
       inner: Rc::new(SocketCbInner {
         write: Rc::new(AsyncRefCell::new(None)),
@@ -296,6 +303,7 @@ impl SocketCb {
         scope_holder,
         should_read: Rc::new(ShouldReadState::new()),
         emit_func,
+        on_event_func,
       }),
     };
     Ok(cb)
@@ -346,6 +354,7 @@ impl SocketCb {
         move |scope| {
           let zero = Smi(0u8).to_v8(scope).unwrap();
           inner.call_method(scope, "read", &[zero]).unwrap();
+          inner.emit_event(scope, &[internalized(scope, "connect").into()]);
         }
       });
       Ok(())
@@ -611,6 +620,12 @@ impl GetThis for SocketCbInner {
 }
 
 impl EventEmitter for SocketCbInner {
+  fn cached_on_event_func<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    self.on_event_func.get(scope).unwrap()
+  }
   fn cached_emit_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
@@ -659,6 +674,7 @@ pub(crate) struct ServerInner {
   this: Rc<v8::Global<v8::Object>>,
   ref_tracker: RefTracker,
   emit_func: Rc<v8::Global<v8::Function>>,
+  on_event_func: Rc<v8::Global<v8::Function>>,
 }
 
 #[derive(deno_core::ToV8)]
@@ -695,6 +711,12 @@ impl Server {
       .unwrap()
       .cast::<v8::Function>();
     let emit_func = Rc::new(v8::Global::new(scope, emit_func));
+    let on_event = internalized(scope, "on");
+    let on_event_func = local_me
+      .get(scope, on_event.into())
+      .unwrap()
+      .cast::<v8::Function>();
+    let on_event_func = Rc::new(v8::Global::new(scope, on_event_func));
     Server {
       inner: Rc::new(ServerInner {
         host: RefCell::new(None),
@@ -705,6 +727,7 @@ impl Server {
         this,
         ref_tracker: RefTracker::new(ops_tracker),
         emit_func,
+        on_event_func,
       }),
     }
   }
@@ -759,7 +782,20 @@ impl Server {
   }
 
   #[fast]
-  fn listen(&self, #[smi] port: u16, #[string] host: String) {
+  #[reentrant]
+  fn listen(
+    &self,
+    scope: &mut v8::PinScope,
+    #[smi] port: u16,
+    #[string] host: String,
+    on_listen: Option<v8::Local<v8::Function>>,
+  ) {
+    if let Some(on_listen) = on_listen {
+      self.inner.on_event(
+        scope,
+        &[internalized(scope, "listening").into(), on_listen.into()],
+      );
+    }
     self.inner.listen_inner::<SocketCallback>(port, host);
   }
 }
@@ -911,6 +947,15 @@ pub trait EventEmitter: GetThis {
     let emit_func = self.cached_emit_func(scope);
     emit_func.call(scope, this.into(), args);
   }
+  fn cached_on_event_func<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function>;
+  fn on_event(&self, scope: &mut v8::PinScope, args: &[v8::Local<v8::Value>]) {
+    let this = self.this(scope);
+    let on_event_func = self.cached_on_event_func(scope);
+    on_event_func.call(scope, this.into(), args);
+  }
 }
 
 impl GetThis for ServerInner {
@@ -928,6 +973,12 @@ impl EventEmitter for ServerInner {
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
     v8::Local::new(scope, &*self.emit_func)
+  }
+  fn cached_on_event_func<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    v8::Local::new(scope, &*self.on_event_func)
   }
 }
 

@@ -76,7 +76,19 @@ impl HttpServer {
   }
 
   #[fast]
-  fn listen(&self, #[smi] port: u16, #[string] host: String) {
+  fn listen(
+    &self,
+    #[smi] port: u16,
+    #[string] host: String,
+    scope: &mut v8::PinScope,
+    on_listen: Option<v8::Local<v8::Function>>,
+  ) {
+    if let Some(on_listen) = on_listen {
+      self.base.inner.on_event(
+        scope,
+        &[internalized(scope, "listening").into(), on_listen.into()],
+      );
+    }
     self
       .base
       .inner
@@ -1372,19 +1384,6 @@ impl OutgoingMessage {
     Ok(())
   }
 
-  fn ensure_header(
-    &self,
-    isolate: &mut v8::Isolate,
-    first_line: &str,
-  ) -> Result<String, JsErrorBox> {
-    if let Some(header) = self.header.get(isolate).clone() {
-      return Ok(header);
-    }
-    let header = self.render_header(isolate, first_line)?;
-    self.header.set(isolate, Some(header.clone()));
-    Ok(header)
-  }
-
   fn has_header(&self, isolate: &v8::Isolate, name: &str) -> bool {
     self.out_headers.get(isolate).contains_key(name)
   }
@@ -1418,38 +1417,6 @@ impl OutgoingMessage {
     self.out_headers.set(isolate, headers);
     self.content_length.set(isolate, Some(len as u64));
     self.clear_header_cache(isolate);
-  }
-
-  fn update_chunked_encoding(&self, isolate: &mut v8::Isolate) {
-    if *self.chunked_encoding.get(isolate) {
-      return;
-    }
-    let headers = self.out_headers.get(isolate);
-    if let Some((_, value)) = headers.get("transfer-encoding") {
-      if value.to_ascii_lowercase().contains("chunked") {
-        self.chunked_encoding.set(isolate, true);
-      }
-    }
-  }
-
-  fn maybe_enable_chunked(&self, isolate: &mut v8::Isolate) {
-    if *self.chunked_encoding.get(isolate) {
-      return;
-    }
-    let mut headers = self.out_headers.get(isolate).clone();
-    if headers.contains_key("content-length") {
-      return;
-    }
-    if headers.contains_key("transfer-encoding") {
-      return;
-    }
-    self.clear_header_cache(isolate);
-    headers.insert(
-      "transfer-encoding".to_string(),
-      ("Transfer-Encoding".to_string(), "chunked".to_string()),
-    );
-    self.out_headers.set(isolate, headers);
-    self.chunked_encoding.set(isolate, true);
   }
 }
 

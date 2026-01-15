@@ -10,7 +10,6 @@ use std::rc::Rc;
 pub struct Constructors {
   duplex: Rc<v8::Global<v8::Function>>,
   event_emitter: Rc<v8::Global<v8::Function>>,
-  stream: Rc<v8::Global<v8::Function>>,
   readable: Rc<v8::Global<v8::Function>>,
   writable: Rc<v8::Global<v8::Function>>,
 }
@@ -28,13 +27,6 @@ impl Constructors {
     scope: &v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
     v8::Local::new(scope, &*self.duplex)
-  }
-
-  fn stream<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.stream)
   }
 
   fn readable<'s>(
@@ -57,14 +49,12 @@ pub fn op_set_constructors(
   op_state: &mut OpState,
   #[global] duplex_constructor: v8::Global<v8::Function>,
   #[global] event_emitter_constructor: v8::Global<v8::Function>,
-  #[global] stream_constructor: v8::Global<v8::Function>,
   #[global] readable_constructor: v8::Global<v8::Function>,
   #[global] writable_constructor: v8::Global<v8::Function>,
 ) {
   op_state.put(Constructors {
     duplex: Rc::new(duplex_constructor),
     event_emitter: Rc::new(event_emitter_constructor),
-    stream: Rc::new(stream_constructor),
     readable: Rc::new(readable_constructor),
     writable: Rc::new(writable_constructor),
   });

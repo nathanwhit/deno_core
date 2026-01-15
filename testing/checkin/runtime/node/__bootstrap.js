@@ -66,7 +66,6 @@ export function init(globalThis) {
   op_set_constructors(
     stream.Duplex,
     events.EventEmitter,
-    legacy.Stream,
     stream.Readable,
     stream.Writable,
   );
