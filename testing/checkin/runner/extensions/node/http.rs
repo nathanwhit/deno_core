@@ -6,8 +6,8 @@ use std::{
   io::ErrorKind,
   pin::Pin,
   rc::Rc,
-  sync::{Arc, Mutex},
   sync::atomic::{AtomicBool, Ordering},
+  sync::{Arc, Mutex},
   task::{Context, Poll, Waker},
 };
 
@@ -289,23 +289,6 @@ async fn push_chunk_with_backpressure(
   rx.await.unwrap_or(true)
 }
 
-fn should_close_connection(
-  headers: &HashMap<String, String>,
-  http_version_major: u8,
-  http_version_minor: u8,
-) -> bool {
-  if let Some(value) = headers.get("connection") {
-    let value = value.to_ascii_lowercase();
-    if value.contains("close") {
-      return true;
-    }
-    if value.contains("keep-alive") {
-      return false;
-    }
-  }
-  http_version_major == 1 && http_version_minor == 0
-}
-
 fn internalized<'a>(
   scope: &v8::PinScope<'a, '_>,
   s: &str,
@@ -347,97 +330,139 @@ fn finish_request(
   });
 }
 
-struct RequestMeta {
-  method: String,
-  url: String,
-  http_version: String,
-  http_version_major: u8,
-  http_version_minor: u8,
-  headers: HashMap<String, String>,
-  raw_headers: Vec<String>,
-  headers_distinct: HashMap<String, Vec<String>>,
-  upgrade: bool,
-  should_close: bool,
+struct RequestParts {
+  method: hyper::http::Method,
+  uri: hyper::http::Uri,
+  version: Version,
+  headers: HeaderMap,
 }
 
-fn build_request_meta(parts: hyper::http::request::Parts) -> RequestMeta {
-  let method = parts.method.as_str().to_string();
-  let url = parts.uri.to_string();
-  let (http_version_major, http_version_minor, http_version) =
-    match parts.version {
-      Version::HTTP_10 => (1, 0, "1.0".to_string()),
-      Version::HTTP_11 => (1, 1, "1.1".to_string()),
-      Version::HTTP_2 => (2, 0, "2.0".to_string()),
-      Version::HTTP_3 => (3, 0, "3.0".to_string()),
-      _ => (1, 1, "1.1".to_string()),
-    };
+fn should_close_from_parts(headers: &HeaderMap, version: Version) -> bool {
+  if let Some(value) = headers.get("connection") {
+    if let Ok(value) = value.to_str() {
+      let value = value.to_ascii_lowercase();
+      if value.contains("close") {
+        return true;
+      }
+      if value.contains("keep-alive") {
+        return false;
+      }
+    }
+  }
+  matches!(version, Version::HTTP_10)
+}
 
+fn upgrade_from_parts(headers: &HeaderMap) -> bool {
+  if let Some(value) = headers.get("connection") {
+    if let Ok(value) = value.to_str() {
+      if value.to_ascii_lowercase().contains("upgrade") {
+        return true;
+      }
+    }
+  }
+  headers.contains_key("upgrade")
+}
+
+fn ensure_method(inner: &mut IncomingMessageInner) {
+  if inner.method.is_some() {
+    return;
+  }
+  if let Some(parts) = inner.parts.as_ref() {
+    inner.method = Some(parts.method.as_str().to_string());
+  }
+}
+
+fn ensure_url(inner: &mut IncomingMessageInner) {
+  if inner.url.is_some() {
+    return;
+  }
+  if let Some(parts) = inner.parts.as_ref() {
+    inner.url = Some(parts.uri.to_string());
+  }
+}
+
+fn ensure_version(inner: &mut IncomingMessageInner) {
+  if inner.http_version.is_some() {
+    return;
+  }
+  if let Some(parts) = inner.parts.as_ref() {
+    let (http_version_major, http_version_minor, http_version) =
+      match parts.version {
+        Version::HTTP_10 => (1, 0, "1.0".to_string()),
+        Version::HTTP_11 => (1, 1, "1.1".to_string()),
+        Version::HTTP_2 => (2, 0, "2.0".to_string()),
+        Version::HTTP_3 => (3, 0, "3.0".to_string()),
+        _ => (1, 1, "1.1".to_string()),
+      };
+    inner.http_version_major = http_version_major;
+    inner.http_version_minor = http_version_minor;
+    inner.http_version = Some(http_version);
+  }
+}
+
+fn ensure_headers(inner: &mut IncomingMessageInner) {
+  if inner.headers.is_some()
+    && inner.raw_headers.is_some()
+    && inner.headers_distinct.is_some()
+  {
+    return;
+  }
   let mut headers = HashMap::new();
   let mut raw_headers = Vec::new();
   let mut headers_distinct = HashMap::new();
-  for (name, value) in parts.headers.iter() {
-    let name_str = name.as_str().to_string();
-    let value_str = String::from_utf8_lossy(value.as_bytes()).to_string();
-    raw_headers.push(name_str.clone());
-    raw_headers.push(value_str.clone());
-    let lower = name_str.to_ascii_lowercase();
-    headers_distinct
-      .entry(lower.clone())
-      .or_insert_with(Vec::new)
-      .push(value_str.clone());
-    headers
-      .entry(lower)
-      .and_modify(|existing: &mut String| {
-        if !existing.is_empty() {
-          existing.push_str(", ");
-        }
-        existing.push_str(&value_str);
-      })
-      .or_insert(value_str);
+  if let Some(parts) = inner.parts.as_ref() {
+    for (name, value) in parts.headers.iter() {
+      let name_str = name.as_str().to_string();
+      let value_str = String::from_utf8_lossy(value.as_bytes()).to_string();
+      raw_headers.push(name_str.clone());
+      raw_headers.push(value_str.clone());
+      let lower = name_str.to_ascii_lowercase();
+      headers_distinct
+        .entry(lower.clone())
+        .or_insert_with(Vec::new)
+        .push(value_str.clone());
+      headers
+        .entry(lower)
+        .and_modify(|existing: &mut String| {
+          if !existing.is_empty() {
+            existing.push_str(", ");
+          }
+          existing.push_str(&value_str);
+        })
+        .or_insert(value_str);
+    }
   }
+  inner.headers = Some(headers);
+  inner.raw_headers = Some(raw_headers);
+  inner.headers_distinct = Some(headers_distinct);
+}
 
-  let upgrade = headers.get("connection").map_or(false, |value| {
-    value.to_ascii_lowercase().contains("upgrade")
-  }) || headers.contains_key("upgrade");
-  let should_close = should_close_connection(
-    &headers,
-    http_version_major,
-    http_version_minor,
-  );
-
-  RequestMeta {
-    method,
-    url,
-    http_version,
-    http_version_major,
-    http_version_minor,
-    headers,
-    raw_headers,
-    headers_distinct,
-    upgrade,
-    should_close,
+fn ensure_upgrade(inner: &mut IncomingMessageInner) {
+  if inner.upgrade.is_some() {
+    return;
   }
+  let upgrade = inner
+    .parts
+    .as_ref()
+    .map(|parts| upgrade_from_parts(&parts.headers))
+    .unwrap_or(false);
+  inner.upgrade = Some(upgrade);
 }
 
 fn init_request_objects(
   inner: &Rc<ServerInner>,
-  meta: RequestMeta,
+  parts: hyper::http::request::Parts,
   has_body: bool,
   should_read: Rc<ShouldReadState>,
   response_tx: oneshot::Sender<Response<HttpResponseBody>>,
+  should_close: bool,
 ) -> (Rc<v8::Global<v8::Object>>, Rc<v8::Global<v8::Function>>) {
-  let RequestMeta {
-    method,
-    url,
-    http_version,
-    http_version_major,
-    http_version_minor,
-    headers,
-    raw_headers,
-    headers_distinct,
-    upgrade,
-    should_close,
-  } = meta;
+  let request_parts = RequestParts {
+    method: parts.method,
+    uri: parts.uri,
+    version: parts.version,
+    headers: parts.headers,
+  };
 
   let req_slot: Rc<RefCell<Option<v8::Global<v8::Object>>>> =
     Rc::new(RefCell::new(None));
@@ -459,16 +484,11 @@ fn init_request_objects(
         inner.op_state(),
         should_read,
       );
-      req.method.set(scope, Some(method));
-      req.url.set(scope, Some(url));
-      req.http_version.set(scope, http_version);
-      req.http_version_major.set(scope, http_version_major);
-      req.http_version_minor.set(scope, http_version_minor);
-      req.headers.set(scope, headers);
-      req.raw_headers.set(scope, raw_headers);
-      req.headers_distinct.set(scope, headers_distinct);
-      req.complete.set(scope, !has_body);
-      req.upgrade.set(scope, upgrade);
+      {
+        let mut inner = req.inner.borrow_mut();
+        inner.parts = Some(request_parts);
+        inner.complete = !has_body;
+      }
       let req_obj = deno_core::cppgc::wrap_object(scope, req_empty, req);
 
       let res_empty =
@@ -565,7 +585,7 @@ async fn handle_hyper_request(
   req: Request<hyper::body::Incoming>,
 ) -> Result<Response<HttpResponseBody>, hyper::Error> {
   let (parts, body) = req.into_parts();
-  let meta = build_request_meta(parts);
+  let should_close = should_close_from_parts(&parts.headers, parts.version);
   let has_body = !body.is_end_stream();
   let should_read = Rc::new(ShouldReadState::new());
 
@@ -573,10 +593,11 @@ async fn handle_hyper_request(
 
   let (req_handle, push_handle) = init_request_objects(
     &inner,
-    meta,
+    parts,
     has_body,
     should_read.clone(),
     response_tx,
+    should_close,
   );
 
   if has_body {
@@ -652,42 +673,47 @@ impl OnAccept for HttpServerCallback {
 /// - complete, aborted, upgrade
 /// - joinDuplicateHeaders
 pub struct IncomingMessage {
-  /// HTTP method (GET, POST, etc.) - only for server-side requests
-  method: GcCell<Option<String>>,
-  /// Request URL - only for server-side requests  
-  url: GcCell<Option<String>>,
-  /// HTTP status code - only for client-side responses
-  status_code: GcCell<Option<u16>>,
-  /// HTTP status message - only for client-side responses
-  status_message: GcCell<Option<String>>,
-  /// HTTP version string (e.g., "1.1")
-  http_version: GcCell<String>,
-  /// Major HTTP version number
-  http_version_major: GcCell<u8>,
-  /// Minor HTTP version number
-  http_version_minor: GcCell<u8>,
-  /// Parsed headers (lowercase keys, values joined according to spec)
-  headers: GcCell<HashMap<String, String>>,
-  /// Raw headers as alternating key/value pairs
-  raw_headers: GcCell<Vec<String>>,
-  /// Headers with distinct values (array for each key)
-  headers_distinct: GcCell<HashMap<String, Vec<String>>>,
-  /// Parsed trailers
-  trailers: GcCell<HashMap<String, String>>,
-  /// Raw trailers as alternating key/value pairs
-  raw_trailers: GcCell<Vec<String>>,
-  /// Trailers with distinct values
-  trailers_distinct: GcCell<HashMap<String, Vec<String>>>,
-  /// Whether the message has been fully received
-  complete: GcCell<bool>,
-  /// Whether the request was aborted
-  aborted: GcCell<bool>,
-  /// Whether this is an upgrade request
-  upgrade: GcCell<bool>,
-  /// Whether to join duplicate headers
-  join_duplicate_headers: GcCell<bool>,
+  inner: RefCell<IncomingMessageInner>,
   /// Backpressure signal from Readable
   should_read: Rc<ShouldReadState>,
+}
+
+struct IncomingMessageInner {
+  parts: Option<RequestParts>,
+  /// HTTP method (GET, POST, etc.) - only for server-side requests
+  method: Option<String>,
+  /// Request URL - only for server-side requests
+  url: Option<String>,
+  /// HTTP status code - only for client-side responses
+  status_code: Option<u16>,
+  /// HTTP status message - only for client-side responses
+  status_message: Option<String>,
+  /// HTTP version string (e.g., "1.1")
+  http_version: Option<String>,
+  /// Major HTTP version number
+  http_version_major: u8,
+  /// Minor HTTP version number
+  http_version_minor: u8,
+  /// Parsed headers (lowercase keys, values joined according to spec)
+  headers: Option<HashMap<String, String>>,
+  /// Raw headers as alternating key/value pairs
+  raw_headers: Option<Vec<String>>,
+  /// Headers with distinct values (array for each key)
+  headers_distinct: Option<HashMap<String, Vec<String>>>,
+  /// Parsed trailers
+  trailers: HashMap<String, String>,
+  /// Raw trailers as alternating key/value pairs
+  raw_trailers: Vec<String>,
+  /// Trailers with distinct values
+  trailers_distinct: HashMap<String, Vec<String>>,
+  /// Whether the message has been fully received
+  complete: bool,
+  /// Whether the request was aborted
+  aborted: bool,
+  /// Whether this is an upgrade request
+  upgrade: Option<bool>,
+  /// Whether to join duplicate headers
+  join_duplicate_headers: bool,
 }
 
 unsafe impl GarbageCollected for IncomingMessage {
@@ -719,57 +745,74 @@ impl IncomingMessage {
 
   #[getter]
   #[string]
-  fn method(&self, isolate: &v8::Isolate) -> Option<String> {
-    self.method.get(isolate).clone()
+  fn method(&self, _isolate: &v8::Isolate) -> Option<String> {
+    let mut inner = self.inner.borrow_mut();
+    ensure_method(&mut inner);
+    inner.method.clone()
   }
 
   #[getter]
   #[string]
-  fn url(&self, isolate: &v8::Isolate) -> Option<String> {
-    self.url.get(isolate).clone()
+  fn url(&self, _isolate: &v8::Isolate) -> Option<String> {
+    let mut inner = self.inner.borrow_mut();
+    ensure_url(&mut inner);
+    inner.url.clone()
   }
 
   #[getter]
   #[smi]
-  fn status_code(&self, isolate: &v8::Isolate) -> Option<u16> {
-    *self.status_code.get(isolate)
+  fn status_code(&self, _isolate: &v8::Isolate) -> Option<u16> {
+    self.inner.borrow().status_code
   }
 
   #[getter]
   #[string]
-  fn status_message(&self, isolate: &v8::Isolate) -> Option<String> {
-    self.status_message.get(isolate).clone()
+  fn status_message(&self, _isolate: &v8::Isolate) -> Option<String> {
+    self.inner.borrow().status_message.clone()
   }
 
   #[getter]
   #[string]
-  fn http_version(&self, isolate: &v8::Isolate) -> String {
-    self.http_version.get(isolate).clone()
+  fn http_version(&self, _isolate: &v8::Isolate) -> String {
+    let mut inner = self.inner.borrow_mut();
+    ensure_version(&mut inner);
+    inner
+      .http_version
+      .clone()
+      .unwrap_or_else(|| "1.1".to_string())
   }
 
   #[getter]
   #[smi]
-  fn http_version_major(&self, isolate: &v8::Isolate) -> u8 {
-    *self.http_version_major.get(isolate)
+  fn http_version_major(&self, _isolate: &v8::Isolate) -> u8 {
+    let mut inner = self.inner.borrow_mut();
+    ensure_version(&mut inner);
+    inner.http_version_major
   }
 
   #[getter]
   #[smi]
-  fn http_version_minor(&self, isolate: &v8::Isolate) -> u8 {
-    *self.http_version_minor.get(isolate)
+  fn http_version_minor(&self, _isolate: &v8::Isolate) -> u8 {
+    let mut inner = self.inner.borrow_mut();
+    ensure_version(&mut inner);
+    inner.http_version_minor
   }
 
   #[getter]
   #[serde]
-  fn headers(&self, isolate: &v8::Isolate) -> HashMap<String, String> {
-    self.headers.get(isolate).clone()
+  fn headers(&self, _isolate: &v8::Isolate) -> HashMap<String, String> {
+    let mut inner = self.inner.borrow_mut();
+    ensure_headers(&mut inner);
+    inner.headers.clone().unwrap_or_default()
   }
 
   #[getter]
   #[serde]
   #[rename("rawHeaders")]
-  fn raw_headers(&self, isolate: &v8::Isolate) -> Vec<String> {
-    self.raw_headers.get(isolate).clone()
+  fn raw_headers(&self, _isolate: &v8::Isolate) -> Vec<String> {
+    let mut inner = self.inner.borrow_mut();
+    ensure_headers(&mut inner);
+    inner.raw_headers.clone().unwrap_or_default()
   }
 
   #[getter]
@@ -777,22 +820,24 @@ impl IncomingMessage {
   #[rename("headersDistinct")]
   fn headers_distinct(
     &self,
-    isolate: &v8::Isolate,
+    _isolate: &v8::Isolate,
   ) -> HashMap<String, Vec<String>> {
-    self.headers_distinct.get(isolate).clone()
+    let mut inner = self.inner.borrow_mut();
+    ensure_headers(&mut inner);
+    inner.headers_distinct.clone().unwrap_or_default()
   }
 
   #[getter]
   #[serde]
-  fn trailers(&self, isolate: &v8::Isolate) -> HashMap<String, String> {
-    self.trailers.get(isolate).clone()
+  fn trailers(&self, _isolate: &v8::Isolate) -> HashMap<String, String> {
+    self.inner.borrow().trailers.clone()
   }
 
   #[getter]
   #[serde]
   #[rename("rawTrailers")]
-  fn raw_trailers(&self, isolate: &v8::Isolate) -> Vec<String> {
-    self.raw_trailers.get(isolate).clone()
+  fn raw_trailers(&self, _isolate: &v8::Isolate) -> Vec<String> {
+    self.inner.borrow().raw_trailers.clone()
   }
 
   #[getter]
@@ -800,90 +845,97 @@ impl IncomingMessage {
   #[rename("trailersDistinct")]
   fn trailers_distinct(
     &self,
-    isolate: &v8::Isolate,
+    _isolate: &v8::Isolate,
   ) -> HashMap<String, Vec<String>> {
-    self.trailers_distinct.get(isolate).clone()
+    self.inner.borrow().trailers_distinct.clone()
   }
 
   #[getter]
-  fn complete(&self, isolate: &v8::Isolate) -> bool {
-    *self.complete.get(isolate)
+  fn complete(&self, _isolate: &v8::Isolate) -> bool {
+    self.inner.borrow().complete
   }
 
   #[getter]
-  fn aborted(&self, isolate: &v8::Isolate) -> bool {
-    *self.aborted.get(isolate)
+  fn aborted(&self, _isolate: &v8::Isolate) -> bool {
+    self.inner.borrow().aborted
   }
 
   #[getter]
-  fn upgrade(&self, isolate: &v8::Isolate) -> bool {
-    *self.upgrade.get(isolate)
+  fn upgrade(&self, _isolate: &v8::Isolate) -> bool {
+    let mut inner = self.inner.borrow_mut();
+    ensure_upgrade(&mut inner);
+    inner.upgrade.unwrap_or(false)
   }
 
   #[getter]
-  fn join_duplicate_headers(&self, isolate: &v8::Isolate) -> bool {
-    *self.join_duplicate_headers.get(isolate)
+  fn join_duplicate_headers(&self, _isolate: &v8::Isolate) -> bool {
+    self.inner.borrow().join_duplicate_headers
   }
 
   // --- Setters ---
 
   #[setter]
-  fn method(&self, isolate: &mut v8::Isolate, #[string] value: Option<String>) {
-    self.method.set(isolate, value);
+  fn method(
+    &self,
+    _isolate: &mut v8::Isolate,
+    #[string] value: Option<String>,
+  ) {
+    self.inner.borrow_mut().method = value;
   }
 
   #[setter]
-  fn url(&self, isolate: &mut v8::Isolate, #[string] value: Option<String>) {
-    self.url.set(isolate, value);
+  fn url(&self, _isolate: &mut v8::Isolate, #[string] value: Option<String>) {
+    self.inner.borrow_mut().url = value;
   }
 
   #[setter]
-  fn status_code(&self, isolate: &mut v8::Isolate, #[smi] value: Option<u16>) {
-    self.status_code.set(isolate, value);
+  fn status_code(&self, _isolate: &mut v8::Isolate, #[smi] value: Option<u16>) {
+    self.inner.borrow_mut().status_code = value;
   }
 
   #[setter]
   fn status_message(
     &self,
-    isolate: &mut v8::Isolate,
+    _isolate: &mut v8::Isolate,
     #[string] value: Option<String>,
   ) {
-    self.status_message.set(isolate, value);
+    self.inner.borrow_mut().status_message = value;
   }
 
   #[setter]
-  fn http_version(&self, isolate: &mut v8::Isolate, #[string] value: String) {
-    self.http_version.set(isolate, value);
+  fn http_version(&self, _isolate: &mut v8::Isolate, #[string] value: String) {
+    let mut inner = self.inner.borrow_mut();
+    inner.http_version = Some(value);
   }
 
   #[setter]
-  fn http_version_major(&self, isolate: &mut v8::Isolate, #[smi] value: u8) {
-    self.http_version_major.set(isolate, value);
+  fn http_version_major(&self, _isolate: &mut v8::Isolate, #[smi] value: u8) {
+    self.inner.borrow_mut().http_version_major = value;
   }
 
   #[setter]
-  fn http_version_minor(&self, isolate: &mut v8::Isolate, #[smi] value: u8) {
-    self.http_version_minor.set(isolate, value);
+  fn http_version_minor(&self, _isolate: &mut v8::Isolate, #[smi] value: u8) {
+    self.inner.borrow_mut().http_version_minor = value;
   }
 
   #[setter]
-  fn complete(&self, isolate: &mut v8::Isolate, value: bool) {
-    self.complete.set(isolate, value);
+  fn complete(&self, _isolate: &mut v8::Isolate, value: bool) {
+    self.inner.borrow_mut().complete = value;
   }
 
   #[setter]
-  fn aborted(&self, isolate: &mut v8::Isolate, value: bool) {
-    self.aborted.set(isolate, value);
+  fn aborted(&self, _isolate: &mut v8::Isolate, value: bool) {
+    self.inner.borrow_mut().aborted = value;
   }
 
   #[setter]
-  fn upgrade(&self, isolate: &mut v8::Isolate, value: bool) {
-    self.upgrade.set(isolate, value);
+  fn upgrade(&self, _isolate: &mut v8::Isolate, value: bool) {
+    self.inner.borrow_mut().upgrade = Some(value);
   }
 
   #[setter]
-  fn join_duplicate_headers(&self, isolate: &mut v8::Isolate, value: bool) {
-    self.join_duplicate_headers.set(isolate, value);
+  fn join_duplicate_headers(&self, _isolate: &mut v8::Isolate, value: bool) {
+    self.inner.borrow_mut().join_duplicate_headers = value;
   }
 
   // --- Methods ---
@@ -896,10 +948,11 @@ impl IncomingMessage {
 
   #[fast]
   #[rename("_destroy")]
-  fn destroy(&self, isolate: &mut v8::Isolate) {
+  fn destroy(&self, _isolate: &mut v8::Isolate) {
     // Mark as aborted if not complete
-    if !*self.complete.get(isolate) {
-      self.aborted.set(isolate, true);
+    let mut inner = self.inner.borrow_mut();
+    if !inner.complete {
+      inner.aborted = true;
     }
   }
 
@@ -925,23 +978,26 @@ impl IncomingMessage {
     let cons = super_cons.readable(scope);
     cons.call(scope, local_me.into(), &[]).unwrap();
     IncomingMessage {
-      method: GcCell::new(None),
-      url: GcCell::new(None),
-      status_code: GcCell::new(None),
-      status_message: GcCell::new(None),
-      http_version: GcCell::new("1.1".to_string()),
-      http_version_major: GcCell::new(1),
-      http_version_minor: GcCell::new(1),
-      headers: GcCell::new(HashMap::new()),
-      raw_headers: GcCell::new(Vec::new()),
-      headers_distinct: GcCell::new(HashMap::new()),
-      trailers: GcCell::new(HashMap::new()),
-      raw_trailers: GcCell::new(Vec::new()),
-      trailers_distinct: GcCell::new(HashMap::new()),
-      complete: GcCell::new(false),
-      aborted: GcCell::new(false),
-      upgrade: GcCell::new(false),
-      join_duplicate_headers: GcCell::new(false),
+      inner: RefCell::new(IncomingMessageInner {
+        parts: None,
+        method: None,
+        url: None,
+        status_code: None,
+        status_message: None,
+        http_version: None,
+        http_version_major: 1,
+        http_version_minor: 1,
+        headers: None,
+        raw_headers: None,
+        headers_distinct: None,
+        trailers: HashMap::new(),
+        raw_trailers: Vec::new(),
+        trailers_distinct: HashMap::new(),
+        complete: false,
+        aborted: false,
+        upgrade: None,
+        join_duplicate_headers: false,
+      }),
       should_read,
     }
   }
@@ -1389,8 +1445,7 @@ pub struct ServerResponse {
   base: OutgoingMessage,
   status_code: GcCell<Option<u16>>,
   status_message: GcCell<Option<String>>,
-  response_tx:
-    RefCell<Option<oneshot::Sender<Response<HttpResponseBody>>>>,
+  response_tx: RefCell<Option<oneshot::Sender<Response<HttpResponseBody>>>>,
   body_handle: RefCell<Option<ResponseBodyHandle>>,
   scope_holder: Rc<ScopeHolder>,
   this: Rc<v8::TracedReference<v8::Object>>,
@@ -1645,21 +1700,22 @@ impl ServerResponse {
 
     let scope_holder = self.scope_holder.clone();
     let this = self.this.clone();
-    let pending_bytes = if let Some(pending) = pending.filter(|buf| !buf.is_empty()) {
-      match handle.push_bytes(Bytes::from(pending)) {
-        Ok(pending) => pending,
-        Err(err) => {
-          scope_holder.with_scope(move |scope| {
-            let cb = v8::Local::new(scope, &cb);
-            let this = this.get(scope).unwrap();
-            call_write_cb(scope, cb.into(), this, Some(err));
-          });
-          return;
+    let pending_bytes =
+      if let Some(pending) = pending.filter(|buf| !buf.is_empty()) {
+        match handle.push_bytes(Bytes::from(pending)) {
+          Ok(pending) => pending,
+          Err(err) => {
+            scope_holder.with_scope(move |scope| {
+              let cb = v8::Local::new(scope, &cb);
+              let this = this.get(scope).unwrap();
+              call_write_cb(scope, cb.into(), this, Some(err));
+            });
+            return;
+          }
         }
-      }
-    } else {
-      0
-    };
+      } else {
+        0
+      };
     handle.close();
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
       deno_core::unsync::spawn(async move {
