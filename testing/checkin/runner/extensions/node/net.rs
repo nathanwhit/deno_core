@@ -229,6 +229,105 @@ struct SocketOptions {
   allow_half_open: Option<bool>,
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", crate = "serde")]
+struct ConnectOptions {
+  host: Option<String>,
+  port: Option<u16>,
+  path: Option<String>,
+  #[serde(default)]
+  allow_half_open: Option<bool>,
+}
+
+fn normalize_connect_args<'s>(
+  scope: &mut v8::PinScope<'s, '_>,
+  port_or_options: Option<v8::Local<'s, v8::Value>>,
+  host_or_connect_cb: Option<v8::Local<'s, v8::Value>>,
+  connect_cb: Option<v8::Local<'s, v8::Function>>,
+) -> Result<
+  (
+    Option<u16>,
+    Option<String>,
+    Option<v8::Local<'s, v8::Function>>,
+    Option<ConnectOptions>,
+  ),
+  JsErrorBox,
+> {
+  enum ConnectArgsKind {
+    Port,
+    Options,
+    Path,
+  }
+
+  let mut kind = None;
+  let mut port = None;
+  let mut host = None;
+  let mut connect_listener: Option<v8::Local<v8::Function>> = None;
+  let mut connect_options = None;
+  let invalid_args = || JsErrorBox::type_error("Invalid connect arguments");
+  let parse_port = |value: v8::Local<v8::Value>| {
+    let port_value = value
+      .integer_value(scope)
+      .ok_or_else(|| JsErrorBox::type_error("Invalid port"))?;
+    let port_value: u16 = port_value
+      .try_into()
+      .map_err(|_| JsErrorBox::type_error("Invalid port"))?;
+    Ok::<_, JsErrorBox>(port_value)
+  };
+
+  if let Some(port_or_options) = port_or_options {
+    let value = port_or_options;
+    if value.is_function() {
+      connect_listener = Some(value.cast::<v8::Function>());
+    } else if value.is_number() {
+      port = Some(parse_port(value)?);
+      kind = Some(ConnectArgsKind::Port);
+    } else if value.is_string() {
+      kind = Some(ConnectArgsKind::Path);
+    } else if value.is_object() {
+      let options: ConnectOptions = deno_core::serde_v8::from_v8(scope, value)
+        .map_err(JsErrorBox::from_err)?;
+      if options.path.is_some() {
+        kind = Some(ConnectArgsKind::Path);
+      } else {
+        port = options.port;
+        host = options.host.clone();
+        kind = Some(ConnectArgsKind::Options);
+        connect_options = Some(options);
+      }
+    } else if !value.is_null_or_undefined() {
+      return Err(invalid_args());
+    }
+  }
+
+  if matches!(kind, Some(ConnectArgsKind::Path)) {
+    return Err(JsErrorBox::type_error("IPC connections are not supported"));
+  }
+
+  if let Some(host_or_connect_cb) = host_or_connect_cb {
+    let value = host_or_connect_cb;
+    if value.is_function() {
+      connect_listener = Some(value.cast::<v8::Function>());
+    } else if value.is_string() {
+      if matches!(kind, Some(ConnectArgsKind::Port)) {
+        host = Some(value.to_rust_string_lossy(scope));
+      } else if !value.is_null_or_undefined() {
+        return Err(invalid_args());
+      }
+    } else if !value.is_null_or_undefined() {
+      return Err(invalid_args());
+    }
+  }
+
+  if connect_listener.is_none() {
+    if let Some(connect_cb) = connect_cb {
+      connect_listener = Some(connect_cb);
+    }
+  }
+
+  Ok((port, host, connect_listener, connect_options))
+}
+
 #[derive(serde::Serialize, Default)]
 #[serde(rename_all = "camelCase", crate = "serde")]
 struct DuplexOptions {
@@ -328,36 +427,41 @@ impl SocketCb {
   #[async_method]
   pub fn connect<'a, 'b>(
     &self,
-    #[smi] port: Option<u16>,
-    #[string] host: Option<String>,
+    #[global] port_or_options: Option<v8::Global<v8::Value>>,
+    #[global] host_or_connect_cb: Option<v8::Global<v8::Value>>,
+    #[global] connect_cb: Option<v8::Global<v8::Function>>,
   ) -> impl Future<Output = Result<(), JsErrorBox>> {
     let inner = self.inner.clone();
     inner.ref_tracker.ref_();
+    let inner_for_scope = inner.clone();
+    let normalized = inner.scope_holder.with_scope_immediately(move |scope| {
+      let port_or_options =
+        port_or_options.map(|value| v8::Local::new(scope, &value));
+      let host_or_connect_cb =
+        host_or_connect_cb.map(|value| v8::Local::new(scope, &value));
+      let connect_cb = connect_cb.map(|value| v8::Local::new(scope, &value));
+      let (port, host, connect_listener, _connect_options) =
+        normalize_connect_args(
+          scope,
+          port_or_options,
+          host_or_connect_cb,
+          connect_cb,
+        )?;
+      if let Some(connect_listener) = connect_listener {
+        inner_for_scope.on_event(
+          scope,
+          &[
+            internalized(scope, "connect").into(),
+            connect_listener.into(),
+          ],
+        );
+      }
+
+      Ok::<_, JsErrorBox>((port, host))
+    });
     async move {
-      *inner.host.borrow_mut() =
-        Some(host.unwrap_or_else(|| "localhost".to_string()));
-      *inner.port.borrow_mut() = Some(port.unwrap_or(0));
-      let stream = tokio::net::TcpStream::connect((
-        inner.host.borrow().as_deref().unwrap(),
-        inner.port.borrow().unwrap(),
-      ))
-      .await
-      .map_err(JsErrorBox::from_err)
-      .unwrap();
-      let (read, write) = stream.into_split();
-      *inner.write.borrow_mut().await = Some(write);
-      *inner.read.borrow_mut().await = Some(read);
-      inner.connected.set_connected(true);
-      inner.start_read();
-      inner.scope_holder.with_scope({
-        let inner = inner.clone();
-        move |scope| {
-          let zero = Smi(0u8).to_v8(scope).unwrap();
-          inner.call_method(scope, "read", &[zero]).unwrap();
-          inner.emit_event(scope, &[internalized(scope, "connect").into()]);
-        }
-      });
-      Ok(())
+      let (port, host) = normalized?;
+      inner.connect_inner(port, host).await
     }
   }
 
@@ -512,6 +616,39 @@ fn call_write_cb(
 }
 
 impl SocketCbInner {
+  fn connect_inner(
+    self: Rc<Self>,
+    port: Option<u16>,
+    host: Option<String>,
+  ) -> impl Future<Output = Result<(), JsErrorBox>> {
+    async move {
+      *self.host.borrow_mut() =
+        Some(host.unwrap_or_else(|| "localhost".to_string()));
+      *self.port.borrow_mut() = Some(port.unwrap_or(0));
+      let stream = tokio::net::TcpStream::connect((
+        self.host.borrow().as_deref().unwrap(),
+        self.port.borrow().unwrap(),
+      ))
+      .await
+      .map_err(JsErrorBox::from_err)
+      .unwrap();
+      let (read, write) = stream.into_split();
+      *self.write.borrow_mut().await = Some(write);
+      *self.read.borrow_mut().await = Some(read);
+      self.connected.set_connected(true);
+      self.start_read();
+      self.scope_holder.with_scope({
+        let inner = self.clone();
+        move |scope| {
+          let zero = Smi(0u8).to_v8(scope).unwrap();
+          inner.call_method(scope, "read", &[zero]).unwrap();
+          inner.emit_event(scope, &[internalized(scope, "connect").into()]);
+        }
+      });
+      Ok(())
+    }
+  }
+
   fn start_read(self: &Rc<Self>) {
     if self.should_read.swap_read_once() {
       return;
@@ -900,6 +1037,58 @@ impl ServerInner {
   }
 }
 
+#[op2(reentrant)]
+pub fn op_net_connect<'a>(
+  scope: &mut v8::PinScope<'a, '_>,
+  op_state: Rc<RefCell<OpState>>,
+  port_or_options: Option<v8::Local<'a, v8::Value>>,
+  host_or_connect_cb: Option<v8::Local<'a, v8::Value>>,
+  connect_cb: Option<v8::Local<'a, v8::Function>>,
+) -> Result<v8::Local<'a, v8::Object>, JsErrorBox> {
+  let (port, host, connect_listener, connect_options) = normalize_connect_args(
+    scope,
+    port_or_options,
+    host_or_connect_cb,
+    connect_cb,
+  )?;
+  let connect_host = host.clone();
+  let connect_port = port;
+
+  let socket_obj = deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
+  let socket = SocketCb::new_inner(
+    v8::Global::new(scope, socket_obj),
+    scope,
+    op_state,
+    SocketOptions {
+      allow_half_open: connect_options
+        .as_ref()
+        .and_then(|options| options.allow_half_open),
+    },
+    host,
+    port,
+  )?;
+  let inner = socket.inner.clone();
+  let socket_obj = deno_core::cppgc::wrap_object(scope, socket_obj, socket);
+  inner.ref_tracker.ref_();
+  if let Some(connect_listener) = connect_listener {
+    inner.on_event(
+      scope,
+      &[
+        internalized(scope, "connect").into(),
+        connect_listener.into(),
+      ],
+    );
+  }
+  deno_core::unsync::spawn(async move {
+    if let Err(err) =
+      SocketCbInner::connect_inner(inner, connect_port, connect_host).await
+    {
+      eprintln!("error in op_net_connect: {:?}", err);
+    }
+  });
+  Ok(socket_obj)
+}
+
 pub trait GetThis {
   fn this<'s>(
     &self,
@@ -1140,7 +1329,7 @@ mod tests {
   async fn constructor_accepts_options() {
     let result = js_test(
       "
-      import { Socket } from 'checkin:net';
+      import { Socket } from 'node:net';
       new Socket({ allowHalfOpen: true });
     ",
     );
@@ -1162,7 +1351,7 @@ mod tests {
     });
     let port = addr.port();
     let code = "
-    import { Socket } from 'checkin:net';
+    import { Socket } from 'node:net';
     import { equal } from 'checkin:testing';
     const socket = new Socket();
     
@@ -1192,6 +1381,42 @@ mod tests {
   }
 
   #[tokio::test(flavor = "current_thread")]
+  async fn socket_connect_registers_callback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::task::spawn(async move {
+      for _ in 0..2 {
+        let _ = listener.accept().await.unwrap();
+      }
+    });
+    let port = addr.port();
+    let code = "
+    import { Socket } from 'node:net';
+    
+    const first = Promise.withResolvers();
+    const second = Promise.withResolvers();
+    
+    const socket1 = new Socket();
+    socket1.connect(${PORT}, () => {
+      first.resolve();
+      socket1.destroy();
+    });
+    
+    const socket2 = new Socket();
+    socket2.connect(${PORT}, '127.0.0.1', () => {
+      second.resolve();
+      socket2.destroy();
+    });
+    
+    await first.promise;
+    await second.promise;
+  "
+    .replace("${PORT}", &port.to_string());
+    let result = js_test(&code);
+    result.await.unwrap();
+  }
+
+  #[tokio::test(flavor = "current_thread")]
   async fn server_accepts_connections() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1199,7 +1424,7 @@ mod tests {
     drop(listener);
 
     let code = "
-    import { Server, Socket } from 'checkin:net';
+    import { Server, Socket } from 'node:net';
     
     const server = new Server();
     

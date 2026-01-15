@@ -1,9 +1,9 @@
-import { SocketCb } from "checkin:net";
+import { Socket } from "node:net";
 import { Duplex, Writable } from "node:stream";
 
 // await new Promise((resolve) => setTimeout(resolve, 10000));
 
-const socket = new SocketCb("localhost", 8080);
+const socket = new Socket();
 
 const prom = Promise.withResolvers<void>();
 
@@ -13,7 +13,7 @@ let got = 0;
 const expected = 4 * 1024 * 1024 * 1024;
 const lengths: Record<number, number> = {};
 
-await socket.connect();
+await socket.connect(8080, "localhost");
 const start = performance.now();
 socket.on("data", (data) => {
   // got += data.length;
@@ -37,8 +37,6 @@ socket.on("end", () => {
 socket.on("close", () => {
   console.log("close");
 });
-
-console.log("autodestroy", socket.readable.autoDestroy);
 
 // socket.end(new Uint8Array([1, 2, 3, 4, 5]));
 // socket.destroy();

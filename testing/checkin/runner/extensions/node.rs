@@ -22,12 +22,12 @@ impl Constructors {
     v8::Local::new(scope, &*self.event_emitter)
   }
 
-  fn duplex<'s>(
-    &self,
-    scope: &v8::PinScope<'s, '_>,
-  ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.duplex)
-  }
+  // fn duplex<'s>(
+  //   &self,
+  //   scope: &v8::PinScope<'s, '_>,
+  // ) -> v8::Local<'s, v8::Function> {
+  //   v8::Local::new(scope, &*self.duplex)
+  // }
 
   fn readable<'s>(
     &self,
@@ -95,13 +95,16 @@ impl ScopeHolder {
     })
   }
 
-  pub fn with_scope_immediately(&self, f: impl FnOnce(&mut v8::PinScope)) {
+  pub fn with_scope_immediately<R>(
+    &self,
+    f: impl FnOnce(&mut v8::PinScope) -> R,
+  ) -> R {
     let mut isolate =
       unsafe { v8::Isolate::from_raw_isolate_ptr(self.isolate_ptr) };
     v8::scope!(let scope, &mut isolate);
     let context = v8::Local::new(scope, &*self.context);
     let scope = &mut v8::ContextScope::new(scope, context);
-    f(scope);
+    f(scope)
   }
 }
 
@@ -113,6 +116,7 @@ deno_core::extension!(
     net::op_is_ipv4,
     net::op_is_ipv6,
     net::op_is_ip,
+    net::op_net_connect,
   ],
   objects = [
     net::SocketCb,
