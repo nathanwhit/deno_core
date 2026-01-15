@@ -273,7 +273,7 @@ async fn push_chunk_with_backpressure(
   let inner = inner.clone();
   let req_handle = req_handle.clone();
   let push_handle = push_handle.clone();
-  inner.with_scope_immediately(move |scope| {
+  inner.with_scope(move |scope| {
     v8::tc_scope!(let scope, scope);
     let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
     let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
@@ -308,23 +308,38 @@ fn finish_request(
   mark_complete: bool,
   aborted: bool,
 ) {
-  inner.with_scope_immediately(move |scope| {
+  inner.with_scope(move |scope| {
     v8::tc_scope!(let scope, scope);
     let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
     let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
-    if mark_complete {
-      let _ = req_obj.set(
-        scope,
-        internalized(scope, "complete").into(),
-        v8::Boolean::new(scope, true).into(),
-      );
-    }
-    if aborted {
-      let _ = req_obj.set(
-        scope,
-        internalized(scope, "aborted").into(),
-        v8::Boolean::new(scope, true).into(),
-      );
+
+    if mark_complete || aborted {
+      if let Some(req_obj) = deno_core::cppgc::try_unwrap_cppgc_object::<
+        IncomingMessage,
+      >(scope, req_obj.into())
+      {
+        if mark_complete {
+          unsafe { req_obj.as_ref() }.inner.borrow_mut().complete = true;
+        }
+        if aborted {
+          unsafe { req_obj.as_ref() }.inner.borrow_mut().aborted = true;
+        }
+      } else {
+        if mark_complete {
+          let _ = req_obj.set(
+            scope,
+            internalized(scope, "complete").into(),
+            v8::Boolean::new(scope, true).into(),
+          );
+        }
+        if aborted {
+          let _ = req_obj.set(
+            scope,
+            internalized(scope, "aborted").into(),
+            v8::Boolean::new(scope, true).into(),
+          );
+        }
+      }
     }
     let _ = push.call(scope, req_obj.into(), &[v8::null(scope).into()]);
   });
