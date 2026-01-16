@@ -16,6 +16,20 @@ object;
 callsite;
 bench;
 
+class TextEncoder {
+  encode(string) {
+    return Deno.core.encode(string);
+  }
+}
+
+class TextDecoder {
+  decode(buffer) {
+    return Deno.core.decode(buffer);
+  }
+}
+
+globalThis.TextEncoder = TextEncoder;
+globalThis.TextDecoder = TextDecoder;
 globalThis.console = console.console;
 globalThis.setTimeout = timers.setTimeout;
 globalThis.setInterval = timers.setInterval;

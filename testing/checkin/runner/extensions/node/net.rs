@@ -550,9 +550,7 @@ impl SocketCb {
         drop(write);
         #[cfg(unix)]
         {
-          if let (Some(read_half), Some(write_half)) =
-            (read_half, write_half)
-          {
+          if let (Some(read_half), Some(write_half)) = (read_half, write_half) {
             if let Ok(stream) = read_half.reunite(write_half) {
               if let Ok(std_stream) = stream.into_std() {
                 let _ = std_stream.shutdown(std::net::Shutdown::Both);
@@ -1224,7 +1222,9 @@ impl EventEmitter for ServerInner {
 mod tests {
   use std::sync::{OnceLock, atomic::AtomicUsize};
 
-  use deno_core::{ModuleSpecifier, RequestedModuleType, RuntimeOptions};
+  use deno_core::{
+    JsRuntime, ModuleSpecifier, RequestedModuleType, RuntimeOptions,
+  };
 
   use super::*;
 
@@ -1338,7 +1338,7 @@ mod tests {
 
   async fn js_test(
     contents: &str,
-  ) -> Result<v8::Global<v8::Value>, JsErrorBox> {
+  ) -> Result<(JsRuntime, v8::Global<v8::Value>), JsErrorBox> {
     let (mut runtime, _worker_host_side) =
       crate::checkin::runner::create_runtime_without_snapshot(
         false,
@@ -1368,10 +1368,13 @@ mod tests {
         RequestedModuleType::None,
       )
       .unwrap();
-    deno_core::scope!(scope, runtime);
-    let namespace = v8::Local::new(scope, namespace);
-    let namespace = namespace.cast::<v8::Value>();
-    Ok(v8::Global::new(scope, namespace))
+    let namespace = {
+      deno_core::scope!(scope, runtime);
+      let namespace = v8::Local::new(scope, namespace);
+      let namespace = namespace.cast::<v8::Value>();
+      v8::Global::new(scope, namespace)
+    };
+    Ok((runtime, namespace))
   }
 
   #[tokio::test]
@@ -1459,10 +1462,20 @@ mod tests {
     
     await first.promise;
     await second.promise;
+    export const success = true;
   "
     .replace("${PORT}", &port.to_string());
     let result = js_test(&code);
-    result.await.unwrap();
+    let (mut runtime, value) = result.await.unwrap();
+    deno_core::scope!(scope, &mut runtime);
+    let value = v8::Local::new(scope, value);
+    let success = value
+      .cast::<v8::Object>()
+      .get(scope, internalized(scope, "success").into())
+      .unwrap()
+      .cast::<v8::Boolean>()
+      .is_true();
+    assert!(success);
   }
 
   #[tokio::test(flavor = "current_thread")]
