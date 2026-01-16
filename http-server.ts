@@ -1,6 +1,19 @@
 import { createServer } from "node:http";
 
 const server = createServer((req, res) => {
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
+  req.headers;
   res.end(
     new Uint8Array([
       0x48,

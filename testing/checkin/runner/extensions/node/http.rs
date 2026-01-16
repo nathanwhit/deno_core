@@ -31,6 +31,8 @@ use hyper::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 
@@ -38,7 +40,7 @@ use crate::checkin::runner::extensions::node::ScopeHolder;
 
 use super::Constructors;
 use super::net::Server;
-use super::net::{EventEmitter, OnAccept, ServerInner};
+use super::net::{EventEmitter, OnAccept, ServerInner, SocketCb};
 
 #[derive(deno_core::CppgcInherits)]
 #[cppgc_base(Server)]
@@ -364,6 +366,76 @@ struct RequestParts {
   headers: HeaderMap,
 }
 
+struct LazySocket {
+  inner: Rc<ServerInner>,
+  #[cfg(unix)]
+  raw_fd: RawFd,
+  host: Option<String>,
+  port: Option<u16>,
+  socket_obj: RefCell<Option<v8::Global<v8::Object>>>,
+}
+
+impl LazySocket {
+  fn new(
+    inner: Rc<ServerInner>,
+    stream: &tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+  ) -> LazySocket {
+    LazySocket {
+      inner,
+      #[cfg(unix)]
+      raw_fd: stream.as_raw_fd(),
+      host: Some(addr.ip().to_string()),
+      port: Some(addr.port() as u16),
+      socket_obj: RefCell::new(None),
+    }
+  }
+
+  #[cfg(unix)]
+  fn dup_stream(&self) -> Result<tokio::net::TcpStream, JsErrorBox> {
+    let fd = unsafe { libc::dup(self.raw_fd) };
+    if fd < 0 {
+      return Err(JsErrorBox::from_err(std::io::Error::last_os_error()));
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    std_stream
+      .set_nonblocking(true)
+      .map_err(JsErrorBox::from_err)?;
+    tokio::net::TcpStream::from_std(std_stream).map_err(JsErrorBox::from_err)
+  }
+
+  #[cfg(not(unix))]
+  fn dup_stream(&self) -> Result<tokio::net::TcpStream, JsErrorBox> {
+    Err(JsErrorBox::generic(
+      "res.socket is not supported on this platform yet",
+    ))
+  }
+
+  fn get_or_create<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> Result<v8::Local<'a, v8::Object>, JsErrorBox> {
+    if let Some(socket_obj) = self.socket_obj.borrow().as_ref() {
+      return Ok(v8::Local::new(scope, socket_obj));
+    }
+    let stream = self.dup_stream()?;
+    let socket_obj =
+      deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
+    let socket = SocketCb::new_server(
+      v8::Global::new(scope, socket_obj),
+      scope,
+      self.inner.op_state(),
+      self.host.clone(),
+      self.port,
+    )?;
+    socket.attach_stream(stream);
+    let socket_obj = deno_core::cppgc::wrap_object(scope, socket_obj, socket);
+    let socket_global = v8::Global::new(scope, socket_obj);
+    *self.socket_obj.borrow_mut() = Some(socket_global);
+    Ok(socket_obj)
+  }
+}
+
 fn should_close_from_parts(headers: &HeaderMap, version: Version) -> bool {
   if let Some(value) = headers.get("connection") {
     if let Ok(value) = value.to_str() {
@@ -483,6 +555,7 @@ fn init_request_objects(
   should_read: Rc<ShouldReadState>,
   response_tx: oneshot::Sender<Response<HttpResponseBody>>,
   should_close: bool,
+  socket_state: Rc<LazySocket>,
 ) -> (Rc<v8::Global<v8::Object>>, Rc<v8::Global<v8::Function>>) {
   let request_parts = RequestParts {
     method: parts.method,
@@ -527,6 +600,7 @@ fn init_request_objects(
         Some(response_tx),
         None,
         should_close,
+        Some(socket_state.clone()),
       );
       if should_close {
         res.base.set_header_internal(scope, "Connection", "close");
@@ -609,6 +683,7 @@ async fn await_response(
 
 async fn handle_hyper_request(
   inner: Rc<ServerInner>,
+  socket_state: Rc<LazySocket>,
   req: Request<hyper::body::Incoming>,
 ) -> Result<Response<HttpResponseBody>, hyper::Error> {
   let (parts, body) = req.into_parts();
@@ -625,6 +700,7 @@ async fn handle_hyper_request(
     should_read.clone(),
     response_tx,
     should_close,
+    socket_state,
   );
 
   if has_body {
@@ -656,9 +732,13 @@ impl OnAccept for HttpServerCallback {
     stream: tokio::net::TcpStream,
     _addr: std::net::SocketAddr,
   ) -> Result<(), JsErrorBox> {
+    let socket_state = Rc::new(LazySocket::new(inner.clone(), &stream, _addr));
     let service = {
       let inner = inner.clone();
-      service_fn(move |req| handle_hyper_request(inner.clone(), req))
+      let socket_state = socket_state.clone();
+      service_fn(move |req| {
+        handle_hyper_request(inner.clone(), socket_state.clone(), req)
+      })
     };
     let result = http1::Builder::new()
       .serve_connection(TokioIo::new(stream), service)
@@ -1429,6 +1509,7 @@ pub struct ServerResponse {
   status_message: GcCell<Option<String>>,
   response_tx: RefCell<Option<oneshot::Sender<Response<HttpResponseBody>>>>,
   body_handle: RefCell<Option<ResponseBodyHandle>>,
+  socket_state: RefCell<Option<Rc<LazySocket>>>,
   scope_holder: Rc<ScopeHolder>,
   this: Rc<v8::TracedReference<v8::Object>>,
   close_after_response: bool,
@@ -1454,7 +1535,7 @@ impl ServerResponse {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> ServerResponse {
-    ServerResponse::new_inner(me, scope, op_state, None, None, false)
+    ServerResponse::new_inner(me, scope, op_state, None, None, false, None)
   }
 
   #[fast]
@@ -1520,6 +1601,19 @@ impl ServerResponse {
       self.status_line(scope, Some(status_code), reason.as_deref())?;
     self.base.store_header(scope, &status_line)?;
     Ok(())
+  }
+
+  #[getter]
+  fn socket<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox> {
+    let socket_state = self.socket_state.borrow().clone();
+    let Some(socket_state) = socket_state else {
+      return Ok(v8::undefined(scope).into());
+    };
+    let socket_obj = socket_state.get_or_create(scope)?;
+    Ok(socket_obj.into())
   }
 
   #[reentrant]
@@ -1600,6 +1694,7 @@ impl ServerResponse {
     Ok(())
   }
 
+  #[reentrant]
   #[rename("_final")]
   fn final_(
     &self,
@@ -1734,6 +1829,7 @@ impl ServerResponse {
     response_tx: Option<oneshot::Sender<Response<HttpResponseBody>>>,
     body_handle: Option<ResponseBodyHandle>,
     close_after_response: bool,
+    socket_state: Option<Rc<LazySocket>>,
   ) -> ServerResponse {
     let (spawner, this) = {
       let op_state = op_state.borrow();
@@ -1750,6 +1846,7 @@ impl ServerResponse {
       status_message: GcCell::new(None),
       response_tx: RefCell::new(response_tx),
       body_handle: RefCell::new(body_handle),
+      socket_state: RefCell::new(socket_state),
       scope_holder: Rc::new(ScopeHolder::new(spawner, isolate_ptr, context)),
       this,
       close_after_response,

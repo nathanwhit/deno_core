@@ -25,6 +25,7 @@ http = "1.3"
 http-body = "1.0"
 http-body-util = "0.1.3"
 httparse = "1.10.1"
+libc.workspace = true
 hyper = { version = "1.8.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.10", features = ["tokio"] }
 smallvec.workspace = true

@@ -337,6 +337,32 @@ struct DuplexOptions {
 }
 
 impl SocketCb {
+  pub(crate) fn new_server(
+    me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+    host: Option<String>,
+    port: Option<u16>,
+  ) -> Result<SocketCb, JsErrorBox> {
+    SocketCb::new_inner(
+      me,
+      scope,
+      op_state,
+      SocketOptions {
+        allow_half_open: None,
+      },
+      host,
+      port,
+    )
+  }
+
+  pub(crate) fn attach_stream(&self, stream: tokio::net::TcpStream) {
+    let (read, write) = stream.into_split();
+    *self.inner.write.try_borrow_mut().unwrap() = Some(write);
+    *self.inner.read.try_borrow_mut().unwrap() = Some(read);
+    self.inner.connected.set_connected(true);
+  }
+
   fn new_inner(
     me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
@@ -515,8 +541,31 @@ impl SocketCb {
     let inner = self.inner.clone();
 
     deno_core::unsync::spawn(async move {
-      inner.read.borrow_mut().await.take();
-      inner.write.borrow_mut().await.take();
+      {
+        let mut read = inner.read.borrow_mut().await;
+        let mut write = inner.write.borrow_mut().await;
+        let read_half = read.take();
+        let write_half = write.take();
+        drop(read);
+        drop(write);
+        #[cfg(unix)]
+        {
+          if let (Some(read_half), Some(write_half)) =
+            (read_half, write_half)
+          {
+            if let Ok(stream) = read_half.reunite(write_half) {
+              if let Ok(std_stream) = stream.into_std() {
+                let _ = std_stream.shutdown(std::net::Shutdown::Both);
+              }
+            }
+          }
+        }
+        #[cfg(not(unix))]
+        {
+          let _ = read_half;
+          let _ = write_half;
+        }
+      }
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);

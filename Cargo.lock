@@ -740,6 +740,7 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
+ "libc",
  "pretty_assertions",
  "prettyplease",
  "smallvec",
