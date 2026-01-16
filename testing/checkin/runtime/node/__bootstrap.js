@@ -1,4 +1,4 @@
-import { op_set_constructors } from "ext:core/ops";
+import { op_set_constructors, op_set_next_tick_func } from "ext:core/ops";
 import {
   processTicksAndRejections,
   runNextTicks,
@@ -68,6 +68,9 @@ export function init(globalThis) {
     events.EventEmitter,
     stream.Readable,
     stream.Writable,
+  );
+  op_set_next_tick_func((func, recv, ...args) =>
+    process.nextTick(func.bind(recv), ...args)
   );
 }
 

@@ -203,10 +203,20 @@ impl CoreError {
   pub fn to_v8_error(&self, scope: &mut v8::PinScope) -> v8::Global<v8::Value> {
     self.as_kind().to_v8_error(scope)
   }
+
+  pub fn to_v8_error_local<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Value> {
+    self.as_kind().to_v8_error_local(scope)
+  }
 }
 
 impl CoreErrorKind {
-  pub fn to_v8_error(&self, scope: &mut v8::PinScope) -> v8::Global<v8::Value> {
+  pub fn to_v8_error_local<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Value> {
     let err_string = self.get_message().to_string();
     let mut error_chain = vec![];
     let mut intermediary_error: Option<&dyn Error> = Some(&self);
@@ -234,8 +244,10 @@ impl CoreErrorKind {
       err_string
     };
 
-    let exception =
-      js_class_and_message_to_exception(scope, &self.get_class(), &message);
+    js_class_and_message_to_exception(scope, &self.get_class(), &message)
+  }
+  pub fn to_v8_error(&self, scope: &mut v8::PinScope) -> v8::Global<v8::Value> {
+    let exception = self.to_v8_error_local(scope);
     v8::Global::new(scope, exception)
   }
 }
@@ -317,7 +329,6 @@ pub fn to_v8_error<'s, 'i>(
   }
 
   let maybe_exception = cb.call(tc_scope, this, &args);
-
   match maybe_exception {
     Some(exception) => exception,
     None => {

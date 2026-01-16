@@ -1,4 +1,4 @@
-import { Server, SocketCb } from "node:net";
+import { Server, Socket } from "node:net";
 
 const server = new Server();
 

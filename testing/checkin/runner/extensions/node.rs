@@ -60,6 +60,30 @@ pub fn op_set_constructors(
   });
 }
 
+#[op2]
+pub fn op_set_next_tick_func(
+  op_state: &mut OpState,
+  #[global] func: v8::Global<v8::Function>,
+) {
+  op_state.put(NextTickFunc {
+    func: Rc::new(func),
+  });
+}
+
+#[derive(Clone)]
+pub struct NextTickFunc {
+  func: Rc<v8::Global<v8::Function>>,
+}
+
+impl NextTickFunc {
+  pub fn get<'s>(
+    &self,
+    scope: &mut v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    v8::Local::new(scope, &*self.func)
+  }
+}
+
 pub struct ScopeHolder {
   spawner: deno_core::V8TaskSpawner,
   isolate_ptr: v8::UnsafeRawIsolatePtr,
@@ -113,6 +137,7 @@ deno_core::extension!(
   ops = [
     op_exit,
     op_set_constructors,
+    op_set_next_tick_func,
     net::op_is_ipv4,
     net::op_is_ipv6,
     net::op_is_ip,

@@ -837,7 +837,7 @@ impl<'s> ToV8<'s> for JsErrorBox {
     self,
     scope: &mut v8::PinScope<'s, 'i>,
   ) -> Result<v8::Local<'s, v8::Value>, Self::Error> {
-    Ok(crate::error::to_v8_error(scope, &self).into())
+    Ok(deno_core::error::CoreError::from(self).to_v8_error_local(scope))
   }
 }
 

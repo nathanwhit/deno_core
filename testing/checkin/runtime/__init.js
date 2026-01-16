@@ -9,6 +9,7 @@ import * as object from "checkin:object";
 import * as callsite from "checkin:callsite";
 import * as bench from "checkin:bench";
 import init from "ext:checkin_node/__bootstrap.js";
+import { Buffer } from "node:buffer";
 async;
 error;
 throw_;
@@ -28,6 +29,7 @@ class TextDecoder {
   }
 }
 
+globalThis.Buffer = Buffer;
 globalThis.TextEncoder = TextEncoder;
 globalThis.TextDecoder = TextDecoder;
 globalThis.console = console.console;

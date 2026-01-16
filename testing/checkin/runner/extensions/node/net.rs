@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::checkin::runner::extensions::node::NextTickFunc;
 use crate::checkin::runner::extensions::node::ScopeHolder;
 
 use super::Constructors;
@@ -203,6 +204,7 @@ struct SocketInner {
 
   emit_func: Rc<v8::TracedReference<v8::Function>>,
   on_event_func: Rc<v8::TracedReference<v8::Function>>,
+  next_tick_func: NextTickFunc,
 }
 
 pub struct Socket {
@@ -371,12 +373,13 @@ impl Socket {
     host: Option<String>,
     port: Option<u16>,
   ) -> Result<Socket, JsErrorBox> {
-    let (ops_tracker, super_cons, spawner) = {
+    let (ops_tracker, super_cons, spawner, next_tick_func) = {
       let op_state = op_state.borrow();
       (
         op_state.external_ops_tracker.clone(),
         op_state.borrow::<Constructors>().clone(),
         op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
+        op_state.borrow::<NextTickFunc>().clone(),
       )
     };
 
@@ -429,6 +432,7 @@ impl Socket {
         should_read: Rc::new(ShouldReadState::new()),
         emit_func,
         on_event_func,
+        next_tick_func,
       }),
     };
     Ok(cb)
@@ -663,6 +667,26 @@ fn call_write_cb(
 }
 
 impl SocketInner {
+  fn emit_error_next_tick(self: Rc<Self>, error: JsErrorBox) {
+    let inner = self.clone();
+    self.scope_holder.with_scope(move |scope| {
+      let error = error.to_v8(scope).unwrap();
+      let next_tick_func = inner.next_tick_func.clone();
+      next_tick_func
+        .get(scope)
+        .call(
+          scope,
+          v8::null(scope).into(),
+          &[
+            inner.emit_func.get(scope).unwrap().into(),
+            inner.this.get(scope).unwrap().into(),
+            internalized(scope, "error").into(),
+            error.into(),
+          ],
+        )
+        .unwrap();
+    });
+  }
   fn connect_inner(
     self: Rc<Self>,
     port: Option<u16>,
@@ -677,8 +701,14 @@ impl SocketInner {
         self.port.borrow().unwrap(),
       ))
       .await
-      .map_err(JsErrorBox::from_err)
-      .unwrap();
+      .map_err(JsErrorBox::from_err);
+      let stream = match stream {
+        Ok(stream) => stream,
+        Err(e) => {
+          self.emit_error_next_tick(e);
+          return Ok(());
+        }
+      };
       let (read, write) = stream.into_split();
       *self.write.borrow_mut().await = Some(write);
       *self.read.borrow_mut().await = Some(read);
@@ -1475,6 +1505,56 @@ mod tests {
       .cast::<v8::Boolean>()
       .is_true();
     assert!(success);
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_write_sends_data() {
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::oneshot;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn(async move {
+      let (mut stream, _addr) = listener.accept().await.unwrap();
+      let mut buf = [0u8; 5];
+      stream.read_exact(&mut buf).await.unwrap();
+      let _ = tx.send(buf.to_vec());
+    });
+
+    let port = addr.port();
+    let code = "
+    import { Socket } from 'node:net';
+    const socket = new Socket();
+    const done = Promise.withResolvers();
+    const data = 'hello';
+
+    socket.on('connect', () => {
+      socket.write(data, () => {
+        socket.end();
+      });
+    });
+    socket.on('close', () => done.resolve());
+
+    socket.connect(${PORT}, '127.0.0.1');
+    await done.promise;
+    export const success = true;
+  "
+    .replace("${PORT}", &port.to_string());
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(timeout, js_test(&code)).await;
+    match result {
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("Test failed: {:?}", e),
+      Err(_) => panic!("Test timed out after {:?}", timeout),
+    }
+
+    let received = tokio::time::timeout(timeout, rx)
+      .await
+      .expect("timed out waiting for server read")
+      .expect("server read failed");
+    assert_eq!(received, b"hello".to_vec());
   }
 
   #[tokio::test(flavor = "current_thread")]
