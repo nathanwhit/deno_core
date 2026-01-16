@@ -15,6 +15,7 @@ use bytes::Bytes;
 use deno_core::JsBuffer;
 use deno_core::convert::Uint8Array;
 use deno_core::error::JsError;
+use deno_core::serde;
 use deno_core::v8::cppgc::{GcCell, Traced};
 use deno_core::{GarbageCollected, OpState, ToV8, op2, v8};
 use deno_error::JsErrorBox;
@@ -366,6 +367,74 @@ struct RequestParts {
   headers: HeaderMap,
 }
 
+struct V8Cached<T> {
+  value: Option<T>,
+  v8: Option<v8::Global<v8::Value>>,
+}
+
+impl<T> V8Cached<T> {
+  fn new() -> Self {
+    Self {
+      value: None,
+      v8: None,
+    }
+  }
+
+  fn is_initialized(&self) -> bool {
+    self.value.is_some()
+  }
+
+  fn set(&mut self, value: T) {
+    self.value = Some(value);
+    self.v8 = None;
+  }
+
+  fn get_or_init_v8_with<'a>(
+    &mut self,
+    scope: &mut v8::PinScope<'a, '_>,
+    init: impl FnOnce() -> T,
+    serialize: impl FnOnce(
+      &mut v8::PinScope<'a, '_>,
+      &T,
+    ) -> v8::Local<'a, v8::Value>,
+  ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox>
+  where
+    T: serde::Serialize,
+  {
+    if let Some(value) = self.v8.as_ref() {
+      return Ok(v8::Local::new(scope, value));
+    }
+    if self.value.is_none() {
+      self.value = Some(init());
+    }
+    let value = self.value.as_ref().unwrap();
+    let v8_value = serialize(scope, value);
+    self.v8 = Some(v8::Global::new(scope, v8_value));
+    Ok(v8_value)
+  }
+
+  fn get_or_init_v8<'a>(
+    &mut self,
+    scope: &mut v8::PinScope<'a, '_>,
+    init: impl FnOnce() -> T,
+  ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox>
+  where
+    T: serde::Serialize,
+  {
+    if let Some(value) = self.v8.as_ref() {
+      return Ok(v8::Local::new(scope, value));
+    }
+    if self.value.is_none() {
+      self.value = Some(init());
+    }
+    let value = self.value.as_ref().unwrap();
+    let v8_value =
+      deno_core::serde_v8::to_v8(scope, value).map_err(JsErrorBox::from_err)?;
+    self.v8 = Some(v8::Global::new(scope, v8_value));
+    Ok(v8_value)
+  }
+}
+
 struct LazySocket {
   inner: Rc<ServerInner>,
   #[cfg(unix)]
@@ -500,9 +569,9 @@ fn ensure_version(inner: &mut IncomingMessageInner) {
 }
 
 fn ensure_headers(inner: &mut IncomingMessageInner) {
-  if inner.headers.is_some()
-    && inner.raw_headers.is_some()
-    && inner.headers_distinct.is_some()
+  if inner.headers.is_initialized()
+    && inner.raw_headers.is_initialized()
+    && inner.headers_distinct.is_initialized()
   {
     return;
   }
@@ -531,9 +600,9 @@ fn ensure_headers(inner: &mut IncomingMessageInner) {
         .or_insert(value_str);
     }
   }
-  inner.headers = Some(headers);
-  inner.raw_headers = Some(raw_headers);
-  inner.headers_distinct = Some(headers_distinct);
+  inner.headers.set(headers);
+  inner.raw_headers.set(raw_headers);
+  inner.headers_distinct.set(headers_distinct);
 }
 
 fn ensure_upgrade(inner: &mut IncomingMessageInner) {
@@ -802,11 +871,11 @@ struct IncomingMessageInner {
   /// Minor HTTP version number
   http_version_minor: u8,
   /// Parsed headers (lowercase keys, values joined according to spec)
-  headers: Option<HashMap<String, String>>,
+  headers: V8Cached<HashMap<String, String>>,
   /// Raw headers as alternating key/value pairs
-  raw_headers: Option<Vec<String>>,
+  raw_headers: V8Cached<Vec<String>>,
   /// Headers with distinct values (array for each key)
-  headers_distinct: Option<HashMap<String, Vec<String>>>,
+  headers_distinct: V8Cached<HashMap<String, Vec<String>>>,
   /// Parsed trailers
   trailers: HashMap<String, String>,
   /// Raw trailers as alternating key/value pairs
@@ -906,32 +975,37 @@ impl IncomingMessage {
   }
 
   #[getter]
-  #[serde]
-  fn headers(&self, _isolate: &v8::Isolate) -> HashMap<String, String> {
-    let mut inner = self.inner.borrow_mut();
-    ensure_headers(&mut inner);
-    inner.headers.clone().unwrap_or_default()
-  }
-
-  #[getter]
-  #[serde]
-  #[rename("rawHeaders")]
-  fn raw_headers(&self, _isolate: &v8::Isolate) -> Vec<String> {
-    let mut inner = self.inner.borrow_mut();
-    ensure_headers(&mut inner);
-    inner.raw_headers.clone().unwrap_or_default()
-  }
-
-  #[getter]
-  #[serde]
-  #[rename("headersDistinct")]
-  fn headers_distinct(
+  fn headers<'a>(
     &self,
-    _isolate: &v8::Isolate,
-  ) -> HashMap<String, Vec<String>> {
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox> {
     let mut inner = self.inner.borrow_mut();
     ensure_headers(&mut inner);
-    inner.headers_distinct.clone().unwrap_or_default()
+    inner
+      .headers
+      .get_or_init_v8_with(scope, HashMap::new, to_v8_map)
+  }
+
+  #[getter]
+  #[rename("rawHeaders")]
+  fn raw_headers<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox> {
+    let mut inner = self.inner.borrow_mut();
+    ensure_headers(&mut inner);
+    inner.raw_headers.get_or_init_v8(scope, Vec::new)
+  }
+
+  #[getter]
+  #[rename("headersDistinct")]
+  fn headers_distinct<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox> {
+    let mut inner = self.inner.borrow_mut();
+    ensure_headers(&mut inner);
+    inner.headers_distinct.get_or_init_v8(scope, HashMap::new)
   }
 
   #[getter]
@@ -1094,9 +1168,9 @@ impl IncomingMessage {
         http_version: None,
         http_version_major: 1,
         http_version_minor: 1,
-        headers: None,
-        raw_headers: None,
-        headers_distinct: None,
+        headers: V8Cached::new(),
+        raw_headers: V8Cached::new(),
+        headers_distinct: V8Cached::new(),
         trailers: HashMap::new(),
         raw_trailers: Vec::new(),
         trailers_distinct: HashMap::new(),
@@ -1935,4 +2009,27 @@ fn call_write_cb(
     let error = JsError::from_v8_exception(scope, exception);
     eprintln!("error: {:?}", error);
   }
+}
+
+fn to_v8_map<'a>(
+  scope: &mut v8::PinScope<'a, '_>,
+  headers: &HashMap<String, String>,
+) -> v8::Local<'a, v8::Value> {
+  let map = v8::Map::new(scope);
+  for (key, value) in headers.iter() {
+    let key = v8::String::new_from_utf8(
+      scope,
+      key.as_bytes(),
+      v8::NewStringType::Normal,
+    )
+    .unwrap();
+    let value = v8::String::new_from_utf8(
+      scope,
+      value.as_bytes(),
+      v8::NewStringType::Normal,
+    )
+    .unwrap();
+    map.set(scope, key.into(), value.into()).unwrap();
+  }
+  map.into()
 }
