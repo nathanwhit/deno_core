@@ -76,7 +76,7 @@ deno_core::extension!(
     ops::DOMPoint,
     ops::TestObjectWrap,
     ops::TestEnumWrap,
-    ops::Socket,
+    ops::FooBar,
   ],
   esm_entry_point = "ext:checkin_runtime/__init.js",
   esm = [

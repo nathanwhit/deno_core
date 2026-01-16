@@ -41,7 +41,7 @@ use crate::checkin::runner::extensions::node::ScopeHolder;
 
 use super::Constructors;
 use super::net::Server;
-use super::net::{EventEmitter, OnAccept, ServerInner, SocketCb};
+use super::net::{EventEmitter, OnAccept, ServerInner, Socket};
 
 #[derive(deno_core::CppgcInherits)]
 #[cppgc_base(Server)]
@@ -488,9 +488,8 @@ impl LazySocket {
       return Ok(v8::Local::new(scope, socket_obj));
     }
     let stream = self.dup_stream()?;
-    let socket_obj =
-      deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
-    let socket = SocketCb::new_server(
+    let socket_obj = deno_core::cppgc::make_cppgc_empty_object::<Socket>(scope);
+    let socket = Socket::new_server(
       v8::Global::new(scope, socket_obj),
       scope,
       self.inner.op_state(),

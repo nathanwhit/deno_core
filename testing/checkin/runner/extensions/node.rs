@@ -119,7 +119,7 @@ deno_core::extension!(
     net::op_net_connect,
   ],
   objects = [
-    net::SocketCb,
+    net::Socket,
     net::Server,
     http::HttpServer,
     http::IncomingMessage,

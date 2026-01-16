@@ -186,7 +186,7 @@ impl RefTracker {
   }
 }
 
-struct SocketCbInner {
+struct SocketInner {
   write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
   read: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedReadHalf>>>,
   push_func: Rc<v8::TracedReference<v8::Function>>,
@@ -205,11 +205,11 @@ struct SocketCbInner {
   on_event_func: Rc<v8::TracedReference<v8::Function>>,
 }
 
-pub struct SocketCb {
-  inner: Rc<SocketCbInner>,
+pub struct Socket {
+  inner: Rc<SocketInner>,
 }
 
-unsafe impl deno_core::GarbageCollected for SocketCb {
+unsafe impl deno_core::GarbageCollected for Socket {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
     self.inner.push_func.trace(visitor);
     self.inner.this.trace(visitor);
@@ -218,7 +218,7 @@ unsafe impl deno_core::GarbageCollected for SocketCb {
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
-    c"SocketCb"
+    c"Socket"
   }
 }
 
@@ -336,15 +336,15 @@ struct DuplexOptions {
   auto_destroy: bool,
 }
 
-impl SocketCb {
+impl Socket {
   pub(crate) fn new_server(
     me: v8::Global<v8::Object>,
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
     host: Option<String>,
     port: Option<u16>,
-  ) -> Result<SocketCb, JsErrorBox> {
-    SocketCb::new_inner(
+  ) -> Result<Socket, JsErrorBox> {
+    Socket::new_inner(
       me,
       scope,
       op_state,
@@ -370,7 +370,7 @@ impl SocketCb {
     options: SocketOptions,
     host: Option<String>,
     port: Option<u16>,
-  ) -> Result<SocketCb, JsErrorBox> {
+  ) -> Result<Socket, JsErrorBox> {
     let (ops_tracker, super_cons, spawner) = {
       let op_state = op_state.borrow();
       (
@@ -414,8 +414,8 @@ impl SocketCb {
       .cast::<v8::Function>();
     let emit_func = Rc::new(v8::TracedReference::new(scope, emit_func));
     let on_event_func = Rc::new(v8::TracedReference::new(scope, on_event_func));
-    let cb = SocketCb {
-      inner: Rc::new(SocketCbInner {
+    let cb = Socket {
+      inner: Rc::new(SocketInner {
         write: Rc::new(AsyncRefCell::new(None)),
         read: Rc::new(AsyncRefCell::new(None)),
         push_func,
@@ -436,7 +436,7 @@ impl SocketCb {
 }
 
 #[op2]
-impl SocketCb {
+impl Socket {
   #[constructor]
   #[cppgc]
   #[reentrant]
@@ -445,9 +445,9 @@ impl SocketCb {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
     #[serde] options: Option<SocketOptions>,
-  ) -> Result<SocketCb, JsErrorBox> {
+  ) -> Result<Socket, JsErrorBox> {
     let options = options.unwrap_or_default();
-    SocketCb::new_inner(me, scope, op_state, options, None, None)
+    Socket::new_inner(me, scope, op_state, options, None, None)
   }
 
   #[async_method]
@@ -662,7 +662,7 @@ fn call_write_cb(
   }
 }
 
-impl SocketCbInner {
+impl SocketInner {
   fn connect_inner(
     self: Rc<Self>,
     port: Option<u16>,
@@ -794,7 +794,7 @@ impl SocketCbInner {
   // pub fn push_data()
 }
 
-impl GetThis for SocketCbInner {
+impl GetThis for SocketInner {
   fn this<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
@@ -803,7 +803,7 @@ impl GetThis for SocketCbInner {
   }
 }
 
-impl EventEmitter for SocketCbInner {
+impl EventEmitter for SocketInner {
   fn cached_on_event_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
@@ -818,7 +818,7 @@ impl EventEmitter for SocketCbInner {
   }
 }
 
-impl Obj for SocketCbInner {}
+impl Obj for SocketInner {}
 
 fn internalized<'a>(
   scope: &v8::PinScope<'a, '_>,
@@ -1003,9 +1003,8 @@ impl OnAccept for SocketCallback {
     inner.holder.with_scope({
       let inner = inner.clone();
       move |scope| {
-        let empty =
-          deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
-        let socket = SocketCb::new_inner(
+        let empty = deno_core::cppgc::make_cppgc_empty_object::<Socket>(scope);
+        let socket = Socket::new_inner(
           v8::Global::new(scope, empty),
           scope,
           inner.op_state.clone(),
@@ -1101,8 +1100,8 @@ pub fn op_net_connect<'a>(
   let connect_host = host.clone();
   let connect_port = port;
 
-  let socket_obj = deno_core::cppgc::make_cppgc_empty_object::<SocketCb>(scope);
-  let socket = SocketCb::new_inner(
+  let socket_obj = deno_core::cppgc::make_cppgc_empty_object::<Socket>(scope);
+  let socket = Socket::new_inner(
     v8::Global::new(scope, socket_obj),
     scope,
     op_state,
@@ -1128,7 +1127,7 @@ pub fn op_net_connect<'a>(
   }
   deno_core::unsync::spawn(async move {
     if let Err(err) =
-      SocketCbInner::connect_inner(inner, connect_port, connect_host).await
+      SocketInner::connect_inner(inner, connect_port, connect_host).await
     {
       eprintln!("error in op_net_connect: {:?}", err);
     }

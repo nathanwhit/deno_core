@@ -520,22 +520,22 @@ pub fn op_nop_generic<T: SomeType + 'static>(state: &mut OpState) {
   state.take::<T>();
 }
 
-unsafe impl GarbageCollected for Socket {
+unsafe impl GarbageCollected for FooBar {
   fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
 
   fn get_name(&self) -> &'static std::ffi::CStr {
-    c"Socket"
+    c"FooBar"
   }
 }
 
-pub struct Socket {}
+pub struct FooBar {}
 
 #[op2]
-impl Socket {
+impl FooBar {
   #[constructor]
   #[cppgc]
-  fn new(_: bool) -> Socket {
-    Socket {}
+  fn new(_: bool) -> FooBar {
+    FooBar {}
   }
 }
 
