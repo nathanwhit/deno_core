@@ -1,22 +1,17 @@
-import { Server } from "checkin:net";
+import { Server } from "node:net";
+
+const port = 3001;
 
 const server = new Server();
 
 server.on("listening", () => {
-  console.log("Server is listening on port 3000");
+  console.log(`Server is listening on port ${port}`);
 });
 
-const expected = 10000;
-
-let count = 0;
-
 server.on("connection", (socket) => {
-  // socket.destroy();
-  // socket.write(new Uint8Array([1, 2, 3, 4, 5]));
-  count++;
-  socket.on("close", () => {
-    console.log("close");
+  socket.on("data", (data) => {
+    socket.write(data);
   });
 });
 
-server.listen(8080, "0.0.0.0");
+server.listen(port, "0.0.0.0");

@@ -199,11 +199,11 @@ struct SocketInner {
   scope_holder: ScopeHolder,
   should_read: Rc<ShouldReadState>,
 
-  this: Rc<v8::TracedReference<v8::Object>>,
+  this: Rc<v8::Global<v8::Object>>,
 
-  push_func: Rc<v8::TracedReference<v8::Function>>,
-  emit_func: Rc<v8::TracedReference<v8::Function>>,
-  on_event_func: Rc<v8::TracedReference<v8::Function>>,
+  push_func: Rc<v8::Global<v8::Function>>,
+  emit_func: Rc<v8::Global<v8::Function>>,
+  on_event_func: Rc<v8::Global<v8::Function>>,
   next_tick_func: NextTickFunc,
 }
 
@@ -213,10 +213,10 @@ pub struct Socket {
 
 unsafe impl deno_core::GarbageCollected for Socket {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
-    self.inner.push_func.trace(visitor);
-    self.inner.this.trace(visitor);
-    self.inner.emit_func.trace(visitor);
-    self.inner.on_event_func.trace(visitor);
+    // self.inner.push_func.trace(visitor);
+    // self.inner.this.trace(visitor);
+    // self.inner.emit_func.trace(visitor);
+    // self.inner.on_event_func.trace(visitor);
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
@@ -385,7 +385,7 @@ impl Socket {
 
     let local_me = v8::Local::new(&scope, &me);
     let cons = v8::Local::new(scope, &*super_cons.duplex);
-    let this = Rc::new(v8::TracedReference::new(scope, local_me));
+    let this = Rc::new(v8::Global::new(scope, local_me));
 
     let duplex_options = DuplexOptions {
       allow_half_open: Some(options.allow_half_open.unwrap_or(false)),
@@ -402,7 +402,7 @@ impl Socket {
       .get(scope, push.into())
       .unwrap()
       .cast::<v8::Function>();
-    let push_func = Rc::new(v8::TracedReference::new(scope, push_func));
+    let push_func = Rc::new(v8::Global::new(scope, push_func));
     let scope_holder = ScopeHolder::new_from_scope(spawner, scope);
 
     let emit = internalized(scope, "emit");
@@ -415,8 +415,8 @@ impl Socket {
       .get(scope, on_event.into())
       .unwrap()
       .cast::<v8::Function>();
-    let emit_func = Rc::new(v8::TracedReference::new(scope, emit_func));
-    let on_event_func = Rc::new(v8::TracedReference::new(scope, on_event_func));
+    let emit_func = Rc::new(v8::Global::new(scope, emit_func));
+    let on_event_func = Rc::new(v8::Global::new(scope, on_event_func));
     let cb = Socket {
       inner: Rc::new(SocketInner {
         write: Rc::new(AsyncRefCell::new(None)),
@@ -526,7 +526,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
-        let this = inner2.this.get(scope).unwrap();
+        let this = v8::Local::new(scope, &*inner2.this);
         call_write_cb(scope, cb.into(), this, result);
       });
     });
@@ -571,7 +571,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
-        let this = inner2.this.get(scope).unwrap();
+        let this = v8::Local::new(scope, &*inner2.this);
         let error = v8::Local::new(scope, &error);
         cb.call(scope, this.into(), &[error]).unwrap();
         inner2.emit_event(scope, &[internalized(scope, "close").into()]);
@@ -609,7 +609,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let local_cb = v8::Local::new(scope, &cb);
-        let this = inner2.this.get(scope).unwrap();
+        let this = v8::Local::new(scope, &*inner2.this);
         call_write_cb(scope, local_cb, this, None);
       });
       return Ok(());
@@ -633,7 +633,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
-        let this = inner2.this.get(scope).unwrap();
+        let this = v8::Local::new(scope, &*inner2.this);
         call_write_cb(scope, cb, this, result);
       });
     });
@@ -678,8 +678,8 @@ impl SocketInner {
           scope,
           v8::null(scope).into(),
           &[
-            inner.emit_func.get(scope).unwrap().into(),
-            inner.this.get(scope).unwrap().into(),
+            v8::Local::new(scope, &*inner.emit_func).into(),
+            v8::Local::new(scope, &*inner.this).into(),
             internalized(scope, "error").into(),
             error.into(),
           ],
@@ -773,11 +773,8 @@ impl SocketInner {
             inner.scope_holder.with_scope({
               let inner = inner.clone();
               move |scope| {
-                let this = this.get(scope).unwrap();
-                let _result = inner
-                  .push_func
-                  .get(scope)
-                  .unwrap()
+                let this = v8::Local::new(scope, &*this);
+                let _result = v8::Local::new(scope, &*inner.push_func)
                   .call(scope, this.into(), &[v8::null(scope).into()])
                   .unwrap();
                 let zero = Smi(0u8).to_v8(scope).unwrap();
@@ -795,10 +792,10 @@ impl SocketInner {
           let inner2 = inner.clone();
           inner.scope_holder.with_scope(move |scope| {
             v8::tc_scope!(let scope, scope);
-            let this = this.get(scope).unwrap();
+            let this = v8::Local::new(scope, &*this);
             let data = Uint8Array(buf);
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-            let result = inner2.push_func.get(scope).unwrap().call(
+            let result = v8::Local::new(scope, &*inner2.push_func).call(
               scope,
               this.into(),
               &[arg],
@@ -829,7 +826,7 @@ impl GetThis for SocketInner {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Object> {
-    self.this.get(scope).unwrap()
+    v8::Local::new(scope, &*self.this)
   }
 }
 
@@ -838,13 +835,13 @@ impl EventEmitter for SocketInner {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    self.on_event_func.get(scope).unwrap()
+    v8::Local::new(scope, &*self.on_event_func)
   }
   fn cached_emit_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    self.emit_func.get(scope).unwrap()
+    v8::Local::new(scope, &*self.emit_func)
   }
 }
 
