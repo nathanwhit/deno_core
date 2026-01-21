@@ -1,5 +1,7 @@
 mod http;
 mod net;
+#[cfg(test)]
+mod test_utils;
 
 use deno_core::OpState;
 use deno_core::op2;
@@ -130,6 +132,54 @@ impl ScopeHolder {
     let scope = &mut v8::ContextScope::new(scope, context);
     f(scope)
   }
+}
+
+pub struct JsMethod {
+  function: Rc<v8::Global<v8::Function>>,
+}
+
+impl JsMethod {
+  #[allow(unused)]
+  pub fn new(function: v8::Global<v8::Function>) -> Self {
+    JsMethod {
+      function: Rc::new(function),
+    }
+  }
+
+  pub fn capture(
+    scope: &v8::PinScope,
+    object: v8::Local<v8::Object>,
+    name: &str,
+  ) -> Self {
+    JsMethod {
+      function: Rc::new(v8::Global::new(
+        scope,
+        object
+          .get(scope, internalized(scope, name).into())
+          .unwrap()
+          .cast::<v8::Function>(),
+      )),
+    }
+  }
+
+  pub fn get<'s>(
+    &self,
+    scope: &v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    v8::Local::new(scope, &*self.function)
+  }
+}
+
+pub fn internalized<'a>(
+  scope: &v8::PinScope<'a, '_>,
+  s: &str,
+) -> v8::Local<'a, v8::String> {
+  v8::String::new_from_one_byte(
+    scope,
+    s.as_bytes(),
+    v8::NewStringType::Internalized,
+  )
+  .unwrap()
 }
 
 deno_core::extension!(

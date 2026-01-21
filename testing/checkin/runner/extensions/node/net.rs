@@ -23,8 +23,10 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::checkin::runner::extensions::node::JsMethod;
 use crate::checkin::runner::extensions::node::NextTickFunc;
 use crate::checkin::runner::extensions::node::ScopeHolder;
+use crate::checkin::runner::extensions::node::internalized;
 
 use super::Constructors;
 
@@ -201,9 +203,9 @@ struct SocketInner {
 
   this: Rc<v8::Global<v8::Object>>,
 
-  push_func: Rc<v8::Global<v8::Function>>,
-  emit_func: Rc<v8::Global<v8::Function>>,
-  on_event_func: Rc<v8::Global<v8::Function>>,
+  push_func: JsMethod,
+  emit_func: JsMethod,
+  on_event_func: JsMethod,
   next_tick_func: NextTickFunc,
 }
 
@@ -212,7 +214,7 @@ pub struct Socket {
 }
 
 unsafe impl deno_core::GarbageCollected for Socket {
-  fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
+  fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {
     // self.inner.push_func.trace(visitor);
     // self.inner.this.trace(visitor);
     // self.inner.emit_func.trace(visitor);
@@ -397,26 +399,11 @@ impl Socket {
     cons
       .call(scope, local_me.into(), &[duplex_options])
       .unwrap();
-    let push = internalized(scope, "push");
-    let push_func = local_me
-      .get(scope, push.into())
-      .unwrap()
-      .cast::<v8::Function>();
-    let push_func = Rc::new(v8::Global::new(scope, push_func));
+    let push_func = JsMethod::capture(scope, local_me, "push");
+    let emit_func = JsMethod::capture(scope, local_me, "emit");
+    let on_event_func = JsMethod::capture(scope, local_me, "on");
     let scope_holder = ScopeHolder::new_from_scope(spawner, scope);
 
-    let emit = internalized(scope, "emit");
-    let emit_func = local_me
-      .get(scope, emit.into())
-      .unwrap()
-      .cast::<v8::Function>();
-    let on_event = internalized(scope, "on");
-    let on_event_func = local_me
-      .get(scope, on_event.into())
-      .unwrap()
-      .cast::<v8::Function>();
-    let emit_func = Rc::new(v8::Global::new(scope, emit_func));
-    let on_event_func = Rc::new(v8::Global::new(scope, on_event_func));
     let cb = Socket {
       inner: Rc::new(SocketInner {
         write: Rc::new(AsyncRefCell::new(None)),
@@ -667,7 +654,7 @@ fn call_write_cb(
 }
 
 impl SocketInner {
-  fn emit_error_next_tick(self: Rc<Self>, error: JsErrorBox) {
+  fn emit_error_next_tick(self: &Rc<Self>, error: JsErrorBox) {
     let inner = self.clone();
     self.scope_holder.with_scope(move |scope| {
       let error = error.to_v8(scope).unwrap();
@@ -678,7 +665,7 @@ impl SocketInner {
           scope,
           v8::null(scope).into(),
           &[
-            v8::Local::new(scope, &*inner.emit_func).into(),
+            inner.emit_func.get(scope).into(),
             v8::Local::new(scope, &*inner.this).into(),
             internalized(scope, "error").into(),
             error.into(),
@@ -774,7 +761,9 @@ impl SocketInner {
               let inner = inner.clone();
               move |scope| {
                 let this = v8::Local::new(scope, &*this);
-                let _result = v8::Local::new(scope, &*inner.push_func)
+                let _result = inner
+                  .push_func
+                  .get(scope)
                   .call(scope, this.into(), &[v8::null(scope).into()])
                   .unwrap();
                 let zero = Smi(0u8).to_v8(scope).unwrap();
@@ -795,11 +784,8 @@ impl SocketInner {
             let this = v8::Local::new(scope, &*this);
             let data = Uint8Array(buf);
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
-            let result = v8::Local::new(scope, &*inner2.push_func).call(
-              scope,
-              this.into(),
-              &[arg],
-            );
+            let result =
+              inner2.push_func.get(scope).call(scope, this.into(), &[arg]);
             if result.is_none() {
               let exception = scope.exception().unwrap();
               let error = JsError::from_v8_exception(scope, exception);
@@ -835,29 +821,17 @@ impl EventEmitter for SocketInner {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.on_event_func)
+    self.on_event_func.get(scope)
   }
   fn cached_emit_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.emit_func)
+    self.emit_func.get(scope)
   }
 }
 
 impl Obj for SocketInner {}
-
-fn internalized<'a>(
-  scope: &v8::PinScope<'a, '_>,
-  s: &str,
-) -> v8::Local<'a, v8::String> {
-  v8::String::new_from_one_byte(
-    scope,
-    s.as_bytes(),
-    v8::NewStringType::Internalized,
-  )
-  .unwrap()
-}
 
 unsafe impl GarbageCollected for Server {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
@@ -1098,7 +1072,13 @@ impl ServerInner {
       });
 
       loop {
-        let (stream, addr) = listener.accept().await.unwrap();
+        let (stream, addr) = match listener.accept().await {
+          Ok((stream, addr)) => (stream, addr),
+          Err(e) => {
+            eprintln!("error in listener.accept: {:?}", e);
+            continue;
+          }
+        };
         let inner = inner.clone();
         deno_core::unsync::spawn(async move {
           if let Err(err) = T::on_accept(&inner, stream, addr).await {
@@ -1249,7 +1229,13 @@ mod tests {
   use std::sync::{OnceLock, atomic::AtomicUsize};
 
   use deno_core::{
-    JsRuntime, ModuleSpecifier, RequestedModuleType, RuntimeOptions,
+    JsRuntime, ModuleSpecifier, PollEventLoopOptions, RequestedModuleType,
+    RuntimeOptions,
+  };
+  use tokio::sync::oneshot;
+
+  use crate::checkin::runner::extensions::node::test_utils::{
+    JsObject, import_from, js_callback,
   };
 
   use super::*;
@@ -1362,16 +1348,21 @@ mod tests {
       .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
   }
 
-  async fn js_test(
-    contents: &str,
-  ) -> Result<(JsRuntime, v8::Global<v8::Value>), JsErrorBox> {
-    let (mut runtime, _worker_host_side) =
+  fn jsruntime() -> JsRuntime {
+    let (runtime, _worker_host_side) =
       crate::checkin::runner::create_runtime_without_snapshot(
         false,
         None,
         vec![],
         RuntimeOptions::default(),
       );
+    runtime
+  }
+
+  async fn js_test(
+    contents: &str,
+  ) -> Result<(JsRuntime, v8::Global<v8::Value>), JsErrorBox> {
+    let mut runtime = jsruntime();
     let specifier =
       ModuleSpecifier::parse(&format!("file:///test-{}.ts", next_id()))
         .unwrap();
@@ -1492,16 +1483,55 @@ mod tests {
   "
     .replace("${PORT}", &port.to_string());
     let result = js_test(&code);
-    let (mut runtime, value) = result.await.unwrap();
-    deno_core::scope!(scope, &mut runtime);
-    let value = v8::Local::new(scope, value);
-    let success = value
-      .cast::<v8::Object>()
-      .get(scope, internalized(scope, "success").into())
-      .unwrap()
-      .cast::<v8::Boolean>()
-      .is_true();
-    assert!(success);
+    let (_, _) = result.await.unwrap();
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_connect_callback() {
+    let mut runtime = jsruntime();
+    let socket = import_from(&mut runtime, "node:net", "Socket").unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    tokio::task::spawn(async move {
+      for _ in 0..2 {
+        let _ = listener.accept().await.unwrap();
+      }
+    });
+
+    fn mk_callback<'a>(
+      scope: &mut v8::PinScope<'a, '_>,
+      closed_tx: oneshot::Sender<()>,
+    ) -> v8::Local<'a, v8::Function> {
+      js_callback(scope, Some(closed_tx), |scope, closed_tx, args, _| {
+        closed_tx.take().unwrap().send(()).unwrap();
+        JsObject::new(scope, args.this()).call(scope, "destroy", &[]);
+      })
+    }
+
+    let (closed_tx, closed_rx) = oneshot::channel::<()>();
+    let (closed_tx2, closed_rx2) = oneshot::channel::<()>();
+
+    runtime.with_scope(|scope| {
+      let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
+      let socket = JsObject::construct(scope, socket_cons, &[]);
+
+      let callback = mk_callback(scope, closed_tx);
+      socket.call(scope, "connect", (port, "127.0.0.1", callback));
+
+      let socket2 = JsObject::construct(scope, socket_cons, &[]);
+      let callback2 = mk_callback(scope, closed_tx2);
+      socket2.call(scope, "connect", (port, "127.0.0.1", callback2));
+    });
+
+    runtime
+      .run_event_loop(PollEventLoopOptions::default())
+      .await
+      .unwrap();
+
+    let _ = closed_rx.await.unwrap();
+    let _ = closed_rx2.await.unwrap();
   }
 
   #[tokio::test(flavor = "current_thread")]

@@ -47,7 +47,7 @@ pub(crate) fn make_cppgc_template<'s, 'i>(
 
 #[doc(hidden)]
 pub fn make_cppgc_empty_object<'a, 'i, T: GarbageCollected + 'static>(
-  scope: &mut v8::PinScope<'a, 'i>,
+  scope: &v8::PinScope<'a, 'i>,
 ) -> v8::Local<'a, v8::Object> {
   let state = JsRuntime::state_from(scope);
   let templates = state.function_templates.borrow();

@@ -841,6 +841,19 @@ impl<'s> ToV8<'s> for JsErrorBox {
   }
 }
 
+impl<'s, T> ToV8<'s> for v8::Local<'s, T>
+where
+  v8::Local<'s, v8::Value>: From<v8::Local<'s, T>>,
+{
+  type Error = Infallible;
+  fn to_v8<'i>(
+    self,
+    _scope: &mut v8::PinScope<'s, 'i>,
+  ) -> Result<v8::Local<'s, v8::Value>, Self::Error> {
+    Ok(self.into())
+  }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
   use super::*;

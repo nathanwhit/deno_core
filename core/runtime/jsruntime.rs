@@ -2207,6 +2207,14 @@ impl JsRuntime {
 
     Poll::Pending
   }
+
+  pub fn with_scope<'i, R, F>(&'i mut self, f: F) -> R
+  where
+    F: for<'a> FnOnce(&mut v8::PinScope<'a, 'i>) -> R,
+  {
+    scope!(scope, self);
+    f(scope)
+  }
 }
 
 fn find_and_report_stalled_level_await_in_any_realm(
