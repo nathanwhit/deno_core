@@ -1,10 +1,6 @@
 import { createServer } from "node:http";
 
-const server = createServer((req, res) => {
-  req.on("data", (data) => {
-    console.log("data", new TextDecoder().decode(data));
-  });
-
+const server = createServer((_req, res) => {
   res.end(
     new Uint8Array([
       0x48,

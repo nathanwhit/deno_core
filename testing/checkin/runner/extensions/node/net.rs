@@ -190,18 +190,18 @@ impl RefTracker {
 struct SocketInner {
   write: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedWriteHalf>>>,
   read: Rc<AsyncRefCell<Option<tokio::net::tcp::OwnedReadHalf>>>,
-  push_func: Rc<v8::TracedReference<v8::Function>>,
   host: RefCell<Option<String>>,
   port: RefCell<Option<u16>>,
-  this: Rc<v8::TracedReference<v8::Object>>,
 
   ref_tracker: RefTracker,
   cancel: Rc<CancelHandle>,
   connected: Rc<ConnectedState>,
   scope_holder: ScopeHolder,
-
   should_read: Rc<ShouldReadState>,
 
+  this: Rc<v8::TracedReference<v8::Object>>,
+
+  push_func: Rc<v8::TracedReference<v8::Function>>,
   emit_func: Rc<v8::TracedReference<v8::Function>>,
   on_event_func: Rc<v8::TracedReference<v8::Function>>,
   next_tick_func: NextTickFunc,
@@ -1538,7 +1538,6 @@ mod tests {
 
     socket.connect(${PORT}, '127.0.0.1');
     await done.promise;
-    export const success = true;
   "
     .replace("${PORT}", &port.to_string());
 

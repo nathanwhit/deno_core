@@ -389,6 +389,7 @@ impl<T> V8Cached<T> {
     self.v8 = None;
   }
 
+  #[allow(unused)]
   fn get_or_init_v8_with<'a>(
     &mut self,
     scope: &mut v8::PinScope<'a, '_>,
@@ -980,9 +981,8 @@ impl IncomingMessage {
   ) -> Result<v8::Local<'a, v8::Value>, JsErrorBox> {
     let mut inner = self.inner.borrow_mut();
     ensure_headers(&mut inner);
-    inner
-      .headers
-      .get_or_init_v8_with(scope, HashMap::new, to_v8_map)
+    let headers = inner.headers.get_or_init_v8(scope, HashMap::new)?;
+    Ok(headers)
   }
 
   #[getter]
@@ -2008,27 +2008,4 @@ fn call_write_cb(
     let error = JsError::from_v8_exception(scope, exception);
     eprintln!("error: {:?}", error);
   }
-}
-
-fn to_v8_map<'a>(
-  scope: &mut v8::PinScope<'a, '_>,
-  headers: &HashMap<String, String>,
-) -> v8::Local<'a, v8::Value> {
-  let map = v8::Map::new(scope);
-  for (key, value) in headers.iter() {
-    let key = v8::String::new_from_utf8(
-      scope,
-      key.as_bytes(),
-      v8::NewStringType::Normal,
-    )
-    .unwrap();
-    let value = v8::String::new_from_utf8(
-      scope,
-      value.as_bytes(),
-      v8::NewStringType::Normal,
-    )
-    .unwrap();
-    map.set(scope, key.into(), value.into()).unwrap();
-  }
-  map.into()
 }
