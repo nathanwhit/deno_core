@@ -45,7 +45,7 @@ pub trait ToArgs<'a>: Sized {
 }
 
 macro_rules! impl_to_args_for_tuples {
-    ($($len: expr; ($($name: ident),*)),+) => {
+    ($(($($name: ident),*)),+) => {
       $(
 
         impl<'a, $($name),+> ToArgs<'a> for ($($name,)+)
@@ -95,18 +95,18 @@ impl<'a, T: ToV8<'a>> ToArgs<'a> for Vec<T> {
 }
 
 impl_to_args_for_tuples!(
-  1; (A),
-  2; (A, B),
-  3; (A, B, C),
-  4; (A, B, C, D),
-  5; (A, B, C, D, E),
-  6; (A, B, C, D, E, F),
-  7; (A, B, C, D, E, F, G),
-  8; (A, B, C, D, E, F, G, H),
-  9; (A, B, C, D, E, F, G, H, I),
-  10; (A, B, C, D, E, F, G, H, I, J),
-  11; (A, B, C, D, E, F, G, H, I, J, K),
-  12; (A, B, C, D, E, F, G, H, I, J, K, L)
+  (A),
+  (A, B),
+  (A, B, C),
+  (A, B, C, D),
+  (A, B, C, D, E),
+  (A, B, C, D, E, F),
+  (A, B, C, D, E, F, G),
+  (A, B, C, D, E, F, G, H),
+  (A, B, C, D, E, F, G, H, I),
+  (A, B, C, D, E, F, G, H, I, J),
+  (A, B, C, D, E, F, G, H, I, J, K),
+  (A, B, C, D, E, F, G, H, I, J, K, L)
 );
 
 // impl ToArgs for {
@@ -155,17 +155,19 @@ pub fn js_callback<
   .unwrap()
 }
 
+#[derive(Clone)]
 pub struct JsObject {
   obj: Rc<v8::Global<v8::Object>>,
 }
 
 impl JsObject {
   pub fn construct<'s>(
-    scope: &v8::PinScope<'s, '_>,
+    scope: &mut v8::PinScope<'s, '_>,
     constructor: v8::Local<'s, v8::Function>,
-    args: &[v8::Local<'s, v8::Value>],
+    args: impl ToArgs<'s>,
   ) -> Self {
-    JsObject::new(scope, constructor.new_instance(scope, args).unwrap())
+    let args = args.to_args(scope);
+    JsObject::new(scope, constructor.new_instance(scope, &args).unwrap())
   }
 
   pub fn new(scope: &v8::PinScope, obj: v8::Local<v8::Object>) -> Self {

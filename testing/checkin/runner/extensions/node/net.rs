@@ -1515,8 +1515,8 @@ mod tests {
 
     runtime.with_scope(|scope| {
       let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
-      let socket = JsObject::construct(scope, socket_cons, &[]);
 
+      let socket = JsObject::construct(scope, socket_cons, &[]);
       let callback = mk_callback(scope, closed_tx);
       socket.call(scope, "connect", (port, "127.0.0.1", callback));
 
@@ -1580,6 +1580,67 @@ mod tests {
       .await
       .expect("timed out waiting for server read")
       .expect("server read failed");
+    assert_eq!(received, b"hello".to_vec());
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_write_sends_data_rust() {
+    use tokio::io::AsyncReadExt;
+
+    let mut runtime = jsruntime();
+    let socket = import_from(&mut runtime, "node:net", "Socket").unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
+    tokio::task::spawn(async move {
+      let (mut stream, _addr) = listener.accept().await.unwrap();
+      let mut buf = [0u8; 5];
+      stream.read_exact(&mut buf).await.unwrap();
+      let _ = tx.send(buf.to_vec());
+    });
+
+    let (closed_tx, closed_rx) = oneshot::channel::<()>();
+
+    runtime.with_scope(|scope| {
+      let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
+      let socket_local = socket_cons.new_instance(scope, &[]).unwrap();
+      let socket_obj = JsObject::new(scope, socket_local);
+
+      // Set up 'connect' handler: write data and end
+      let connect_cb = {
+        let socket = socket_obj.clone();
+        js_callback(scope, socket, |scope, socket, _, _| {
+          let write_cb =
+            js_callback(scope, socket.clone(), |scope, socket, _, _| {
+              socket.call(scope, "end", &[]);
+            });
+          socket.call(scope, "write", ("hello", write_cb));
+        })
+      };
+      socket_obj.call(scope, "on", ("connect", connect_cb));
+
+      // Set up 'close' handler
+      let close_cb =
+        js_callback(scope, Some(closed_tx), |_scope, closed_tx, _, _| {
+          closed_tx.take().unwrap().send(()).unwrap();
+        });
+      socket_obj.call(scope, "on", ("close", close_cb));
+
+      // Connect
+      socket_obj.call(scope, "connect", (port, "127.0.0.1"));
+    });
+
+    runtime
+      .run_event_loop(PollEventLoopOptions::default())
+      .await
+      .unwrap();
+
+    let _ = closed_rx.await.unwrap();
+
+    let received = rx.await.expect("server read failed");
     assert_eq!(received, b"hello".to_vec());
   }
 
