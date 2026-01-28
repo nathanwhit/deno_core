@@ -158,7 +158,7 @@ struct RefTrackerInner {
 }
 
 #[derive(Clone)]
-struct RefTracker(Arc<RefTrackerInner>);
+pub(crate) struct RefTracker(Arc<RefTrackerInner>);
 
 impl RefTracker {
   fn new(ops_tracker: ExternalOpsTracker) -> Self {
@@ -178,7 +178,7 @@ impl RefTracker {
     }
   }
 
-  fn unref(&self) {
+  pub(crate) fn unref(&self) {
     if self
       .0
       .refed
@@ -851,21 +851,21 @@ pub struct Server {
 }
 
 pub(crate) struct ServerInner {
-  host: RefCell<Option<String>>,
-  port: RefCell<Option<u16>>,
+  pub(crate) host: RefCell<Option<String>>,
+  pub(crate) port: RefCell<Option<u16>>,
   on_listening: Option<v8::TracedReference<v8::Function>>,
-  holder: Rc<ScopeHolder>,
+  pub(crate) holder: Rc<ScopeHolder>,
   op_state: Rc<RefCell<OpState>>,
   this: Rc<v8::Global<v8::Object>>,
-  ref_tracker: RefTracker,
+  pub(crate) ref_tracker: RefTracker,
   emit_func: Rc<v8::Global<v8::Function>>,
   on_event_func: Rc<v8::Global<v8::Function>>,
 }
 
 #[derive(deno_core::ToV8)]
-struct ServerAddress {
-  address: String,
-  port: u16,
+pub struct ServerAddress {
+  pub address: String,
+  pub port: u16,
 }
 
 impl Server {
@@ -1722,5 +1722,68 @@ mod tests {
       Ok(Err(e)) => panic!("Test failed: {:?}", e),
       Err(_) => panic!("Test timed out after {:?}", timeout),
     }
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_receives_end_event_on_server_close() {
+    use std::pin::pin;
+    use tokio::io::AsyncWriteExt;
+
+    let mut runtime = jsruntime();
+    let socket_mod = import_from(&mut runtime, "node:net", "Socket").unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    // Server: accept connection, send data, then close
+    tokio::task::spawn(async move {
+      let (mut stream, _) = listener.accept().await.unwrap();
+      stream.write_all(b"hello").await.unwrap();
+      stream.shutdown().await.unwrap();
+    });
+
+    let (end_tx, end_rx) = oneshot::channel::<()>();
+
+    runtime.with_scope(|scope| {
+      let socket_cons =
+        v8::Local::new(scope, &socket_mod).cast::<v8::Function>();
+      let socket = JsObject::construct(scope, socket_cons, ());
+
+      // Set up 'data' event handler to consume data (required for 'end' to fire)
+      let data_cb = js_callback(scope, None::<()>, |_scope, _, _, _| {});
+      socket.call(scope, "on", ("data", data_cb));
+
+      // Set up 'end' event handler
+      let end_cb = js_callback(scope, Some(end_tx), |_scope, end_tx, _, _| {
+        end_tx.take().unwrap().send(()).unwrap();
+      });
+      socket.call(scope, "on", ("end", end_cb));
+
+      // Connect to server
+      socket.call(scope, "connect", (port, "127.0.0.1"));
+    });
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let mut event_loop =
+      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+    let mut end_rx = pin!(end_rx);
+
+    let result = loop {
+      tokio::select! {
+        _ = &mut event_loop => {}
+        result = &mut end_rx => {
+          break result.ok();
+        }
+        _ = tokio::time::sleep(timeout) => {
+          break None;
+        }
+      }
+    };
+
+    assert!(
+      result.is_some(),
+      "Socket should have received 'end' event when server closed connection"
+    );
   }
 }

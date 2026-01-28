@@ -1,30 +1,145 @@
-import { createServer } from "node:http";
-import { Writable } from "node:stream";
+import * as http from "node:http";
+import * as net from "node:net";
+import assert from "node:assert";
+const body = "hello world\n";
 
-const server = createServer((req, res) => {
-  console.log(
-    "request",
-    typeof res.end,
-    typeof res.write,
-    typeof res._write,
-    res.end === Writable.prototype.end,
-    !!res._writableState,
-    res._writableState?.constructed,
-  );
-  try {
-    const ok = res.write("Hello, ");
-    console.log("write returned", ok);
-  } catch (err) {
-    console.log("write error", err?.message);
-  }
-  try {
-    res.end("world!");
-    console.log("end returned");
-  } catch (err) {
-    console.log("end error", err?.message);
-  }
-});
+function test(handler, request_generator, response_validator) {
+  const server = http.createServer(handler);
 
-server.listen(3001, "127.0.0.1", () => {
-  console.log("listening 3001");
-});
+  let client_got_eof = false;
+  let server_response = "";
+
+  server.listen(0);
+  server.on("listening", function () {
+    console.log(this.address());
+    const c = net.createConnection(this.address().port);
+
+    c.setEncoding("utf8");
+
+    c.on("connect", function () {
+      c.write(request_generator());
+    });
+
+    c.on("data", function (chunk) {
+      server_response += chunk;
+    });
+
+    c.on("end", function () {
+      client_got_eof = true;
+      c.end();
+      server.close();
+      response_validator(server_response, client_got_eof, false);
+    });
+  });
+}
+
+{
+  function handler(req, res) {
+    assert.strictEqual(req.httpVersion, "1.0");
+    assert.strictEqual(req.httpVersionMajor, 1);
+    assert.strictEqual(req.httpVersionMinor, 0);
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(body);
+  }
+
+  function request_generator() {
+    return "GET / HTTP/1.0\r\n\r\n";
+  }
+
+  function response_validator(server_response, client_got_eof, timed_out) {
+    const m = server_response.split("\r\n\r\n");
+    assert.strictEqual(m[1], body);
+    assert.strictEqual(client_got_eof, true);
+    assert.strictEqual(timed_out, false);
+  }
+
+  test(handler, request_generator, response_validator);
+}
+
+//
+// Don't send HTTP/1.1 status lines to HTTP/1.0 clients.
+//
+// https://github.com/joyent/node/issues/1234
+//
+{
+  function handler(req, res) {
+    assert.strictEqual(req.httpVersion, "1.0");
+    assert.strictEqual(req.httpVersionMajor, 1);
+    assert.strictEqual(req.httpVersionMinor, 0);
+    res.sendDate = false;
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.write("Hello, ");
+    res._send("");
+    res.write("world!");
+    res._send("");
+    res.end();
+  }
+
+  function request_generator() {
+    return ("GET / HTTP/1.0\r\n" +
+      "User-Agent: curl/7.19.7 (x86_64-pc-linux-gnu) libcurl/7.19.7 " +
+      "OpenSSL/0.9.8k zlib/1.2.3.3 libidn/1.15\r\n" +
+      "Host: 127.0.0.1:1337\r\n" +
+      "Accept: */*\r\n" +
+      "\r\n");
+  }
+
+  function response_validator(server_response, client_got_eof, timed_out) {
+    const expected_response = "HTTP/1.1 200 OK\r\n" +
+      "Content-Type: text/plain\r\n" +
+      "Connection: close\r\n" +
+      "\r\n" +
+      "Hello, world!";
+
+    assert.strictEqual(server_response, expected_response);
+    assert.strictEqual(client_got_eof, true);
+    assert.strictEqual(timed_out, false);
+  }
+
+  test(handler, request_generator, response_validator);
+}
+
+{
+  function handler(req, res) {
+    assert.strictEqual(req.httpVersion, "1.1");
+    assert.strictEqual(req.httpVersionMajor, 1);
+    assert.strictEqual(req.httpVersionMinor, 1);
+    res.sendDate = false;
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.write("Hello, ");
+    res._send("");
+    res.write("world!");
+    res._send("");
+    res.end();
+  }
+
+  function request_generator() {
+    return "GET / HTTP/1.1\r\n" +
+      "User-Agent: curl/7.19.7 (x86_64-pc-linux-gnu) libcurl/7.19.7 " +
+      "OpenSSL/0.9.8k zlib/1.2.3.3 libidn/1.15\r\n" +
+      "Connection: close\r\n" +
+      "Host: 127.0.0.1:1337\r\n" +
+      "Accept: */*\r\n" +
+      "\r\n";
+  }
+
+  function response_validator(server_response, client_got_eof, timed_out) {
+    const expected_response = "HTTP/1.1 200 OK\r\n" +
+      "Content-Type: text/plain\r\n" +
+      "Connection: close\r\n" +
+      "Transfer-Encoding: chunked\r\n" +
+      "\r\n" +
+      "7\r\n" +
+      "Hello, \r\n" +
+      "6\r\n" +
+      "world!\r\n" +
+      "0\r\n" +
+      "\r\n";
+
+    assert.strictEqual(server_response, expected_response);
+    assert.strictEqual(client_got_eof, true);
+    assert.strictEqual(timed_out, false);
+  }
+
+  test(handler, request_generator, response_validator);
+}

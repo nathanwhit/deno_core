@@ -79,13 +79,31 @@ impl HttpServer {
   }
 
   #[fast]
-  fn listen(
+  #[reentrant]
+  fn listen<'a>(
     &self,
+    scope: &mut v8::PinScope<'a, '_>,
     #[smi] port: u16,
-    #[string] host: String,
-    scope: &mut v8::PinScope,
-    on_listen: Option<v8::Local<v8::Function>>,
+    host_or_callback: Option<v8::Local<'a, v8::Value>>,
+    on_listen_arg: Option<v8::Local<'a, v8::Function>>,
   ) {
+    let (host, on_listen) = match host_or_callback {
+      Some(value) if value.is_function() => {
+        // Second arg is callback, no host specified
+        (None, Some(value.cast::<v8::Function>()))
+      }
+      Some(value) if value.is_string() => {
+        // Second arg is host string
+        (Some(value.to_rust_string_lossy(scope)), on_listen_arg)
+      }
+      Some(value) if !value.is_null_or_undefined() => {
+        // Try to use as host string
+        (Some(value.to_rust_string_lossy(scope)), on_listen_arg)
+      }
+      _ => (None, on_listen_arg),
+    };
+
+    let host = host.unwrap_or_else(|| "0.0.0.0".to_string());
     if let Some(on_listen) = on_listen {
       self.base.inner.on_event(
         scope,
@@ -96,6 +114,25 @@ impl HttpServer {
       .base
       .inner
       .listen_inner::<HttpServerCallback>(port, host);
+  }
+
+  #[fast]
+  fn unref(&self) {
+    self.base.inner.ref_tracker.unref();
+  }
+
+  #[to_v8]
+  fn address(&self) -> Option<super::net::ServerAddress> {
+    let inner = &self.base.inner;
+    let host = inner.host.borrow();
+    let port = *inner.port.borrow();
+    match (&*host, port) {
+      (Some(host), Some(port)) => Some(super::net::ServerAddress {
+        address: host.to_string(),
+        port,
+      }),
+      _ => None,
+    }
   }
 }
 
@@ -1464,6 +1501,16 @@ impl OutgoingMessage {
     self.destroyed.set(isolate, true);
     self.writable.set(isolate, false);
   }
+
+  // Node.js _send method - marks headers as sent
+  #[fast]
+  #[rename("_send")]
+  fn send(&self, isolate: &mut v8::Isolate) -> bool {
+    if self.header.get(isolate).is_some() && !*self.header_sent.get(isolate) {
+      self.header_sent.set(isolate, true);
+    }
+    true
+  }
 }
 
 impl OutgoingMessage {
@@ -2021,6 +2068,9 @@ mod tests {
 
   /// Test that HTTP response body streams chunks as they are written,
   /// rather than buffering until the response ends.
+  ///
+  /// The server writes a chunk but never calls end(). If streaming works,
+  /// the client receives the chunk. If buffered, nothing is sent.
   #[tokio::test(flavor = "current_thread")]
   async fn http_response_streams_body() {
     let mut runtime = jsruntime();
@@ -2035,44 +2085,319 @@ mod tests {
     // Make request and get response chunks
     let mut rx = server.get();
 
-    // Run event loop while waiting for first chunk
-    let timeout = tokio::time::Duration::from_millis(500);
-    let start = std::time::Instant::now();
+    // Run event loop while waiting for first chunk (generous timeout)
+    let timeout = tokio::time::Duration::from_secs(5);
 
     let result = {
       let mut event_loop =
         pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
 
       let mut received = String::new();
+      let deadline = tokio::time::Instant::now() + timeout;
+
       loop {
         tokio::select! {
-          _ = &mut event_loop => break,
-          chunk = tokio::time::timeout(timeout, rx.recv()) => {
+          _ = &mut event_loop => {}
+          chunk = rx.recv() => {
             match chunk {
-              Ok(Some(data)) => {
+              Some(data) => {
                 received.push_str(&String::from_utf8_lossy(&data));
                 if received.contains("chunk1") {
                   break;
                 }
               }
-              _ => break,
+              None => break,
             }
+          }
+          _ = tokio::time::sleep_until(deadline) => {
+            break;
           }
         }
       }
       received
     };
 
-    let elapsed = start.elapsed();
     assert!(
       result.contains("chunk1"),
-      "Response should contain 'chunk1' (streaming), got: '{}' in {:?}",
-      result,
-      elapsed
+      "Response should contain 'chunk1' (streaming). Got: '{}'. \
+       This suggests the response body is being buffered instead of streamed.",
+      result
     );
+    println!("Response streaming test passed!");
+  }
+
+  /// Test that HTTP request body streams chunks as they arrive,
+  /// rather than buffering until the request ends.
+  ///
+  /// This test uses synchronization instead of timing to avoid flakiness:
+  /// 1. Client sends chunk1
+  /// 2. Client waits for server to confirm receipt (via channel)
+  /// 3. Only then does client send chunk2
+  ///
+  /// If streaming works, the server receives chunk1 while the client waits.
+  /// If buffered, the server wouldn't receive anything until the request ends.
+  #[tokio::test(flavor = "current_thread")]
+  async fn http_request_streams_body() {
+    use crate::checkin::runner::extensions::node::test_utils::js_callback;
+    use deno_core::v8;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut runtime = jsruntime();
+
+    // Signal from server to client: "I received chunk1, you can send chunk2"
+    let chunk1_received = Arc::new(AtomicBool::new(false));
+    let chunk1_notify = Arc::new(tokio::sync::Notify::new());
+
+    // Create server that signals when it receives chunk1
+    let server = HttpTestServer::start_with_state(
+      &mut runtime,
+      (chunk1_received.clone(), chunk1_notify.clone()),
+      |scope, state, req, res| {
+        let (chunk1_received, chunk1_notify) = state.clone();
+        let req = JsObject::new(scope, req);
+
+        // Set up 'data' event handler on request
+        let data_cb = js_callback(
+          scope,
+          (chunk1_received.clone(), chunk1_notify.clone()),
+          |scope, state, args, _| {
+            let (chunk1_received, chunk1_notify) = state;
+
+            // Get the chunk data
+            let data = args.get(0);
+            let data_str = if let Ok(str_val) = data.try_cast::<v8::String>() {
+              str_val.to_rust_string_lossy(scope)
+            } else if let Ok(arr) = data.try_cast::<v8::ArrayBufferView>() {
+              let len = arr.byte_length();
+              let mut buf = vec![0u8; len];
+              arr.copy_contents(&mut buf);
+              String::from_utf8_lossy(&buf).to_string()
+            } else {
+              "<unknown type>".to_string()
+            };
+
+            // Signal when we receive chunk1
+            if data_str.contains("chunk1") {
+              chunk1_received.store(true, Ordering::SeqCst);
+              chunk1_notify.notify_one();
+            }
+          },
+        );
+        req.call(scope, "on", ("data", data_cb));
+
+        // Set up 'end' event handler to send response
+        let res = JsObject::new(scope, res);
+        let end_cb = js_callback(scope, res, |scope, res, _, _| {
+          res.call(scope, "end", ("ok",));
+        });
+        req.call(scope, "on", ("end", end_cb));
+      },
+    )
+    .await;
+
+    let port = server.port;
+    let chunk1_received_client = chunk1_received.clone();
+    let chunk1_notify_client = chunk1_notify.clone();
+
+    // Channel to signal when client is done
+    let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel();
+
+    // Spawn client that waits for chunk1 confirmation before sending chunk2
+    tokio::task::spawn(async move {
+      let mut stream =
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+          .await
+          .expect("Failed to connect");
+
+      // Send HTTP request headers with chunked transfer encoding
+      let headers = "POST / HTTP/1.1\r\n\
+                     Host: localhost\r\n\
+                     Transfer-Encoding: chunked\r\n\
+                     Connection: close\r\n\r\n";
+      stream
+        .write_all(headers.as_bytes())
+        .await
+        .expect("Failed to write headers");
+
+      // Send first chunk
+      let chunk1 = "6\r\nchunk1\r\n";
+      stream
+        .write_all(chunk1.as_bytes())
+        .await
+        .expect("Failed to write chunk1");
+      stream.flush().await.expect("Failed to flush");
+
+      // Wait for server to confirm receipt of chunk1
+      // This is the key: if streaming works, this returns quickly
+      // If buffered, this would timeout
+      let wait_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        chunk1_notify_client.notified(),
+      )
+      .await;
+
+      let streaming_works =
+        wait_result.is_ok() && chunk1_received_client.load(Ordering::SeqCst);
+
+      // Send second chunk and finish regardless
+      let chunk2 = "6\r\nchunk2\r\n";
+      let _ = stream.write_all(chunk2.as_bytes()).await;
+      let end_chunk = "0\r\n\r\n";
+      let _ = stream.write_all(end_chunk.as_bytes()).await;
+
+      // Read response
+      let mut response = Vec::new();
+      let _ = stream.read_to_end(&mut response).await;
+
+      let _ = client_done_tx.send(streaming_works);
+    });
+
+    // Run event loop until client is done (with generous timeout)
+    let timeout = tokio::time::Duration::from_secs(10);
+    let streaming_works = {
+      let mut event_loop =
+        pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+      let client_future = async { client_done_rx.await.unwrap_or(false) };
+      let mut client_future = pin!(client_future);
+
+      let result = loop {
+        tokio::select! {
+          _ = &mut event_loop => {
+            // Event loop yielded, keep going
+          }
+          result = &mut client_future => {
+            break Some(result);
+          }
+          _ = tokio::time::sleep(timeout) => {
+            break None;
+          }
+        }
+      };
+      result.unwrap_or(false)
+    };
+
+    assert!(
+      streaming_works,
+      "Request body streaming test failed: server did not receive chunk1 \
+       before chunk2 was sent. This suggests the request body is being \
+       buffered instead of streamed."
+    );
+
+    println!("Request streaming test passed!");
+  }
+
+  /// Test that server.listen(0) chooses an available port and defaults host to 0.0.0.0.
+  /// Also verifies that server.address() returns the bound address.
+  #[tokio::test(flavor = "current_thread")]
+  async fn http_server_listen_port_zero() {
+    use crate::checkin::runner::extensions::node::test_utils::{
+      import_from, js_callback,
+    };
+    use deno_core::v8;
+
+    let mut runtime = jsruntime();
+    let create_server =
+      import_from(&mut runtime, "node:http", "createServer").unwrap();
+
+    // Channel to get address info after listening
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<(String, u16)>();
+
+    runtime.with_scope(|scope| {
+      let create_server_fn =
+        v8::Local::new(scope, &create_server).cast::<v8::Function>();
+
+      // Create a simple request handler
+      let request_handler = js_callback(scope, (), |scope, _, args, _| {
+        let res = args.get(1).cast::<v8::Object>();
+        let res = JsObject::new(scope, res);
+        res.call(scope, "end", ("ok",));
+      });
+
+      // Create server
+      let server_val = create_server_fn
+        .call(
+          scope,
+          v8::undefined(scope).into(),
+          &[request_handler.into()],
+        )
+        .unwrap();
+      let server = JsObject::new(scope, server_val.cast::<v8::Object>());
+
+      // Set up listening callback that checks address()
+      let server_for_cb = server.clone();
+      let listen_cb = js_callback(
+        scope,
+        (server_for_cb, Some(addr_tx)),
+        |scope, (server, addr_tx), _, _| {
+          // Call server.address() to get the bound address
+          let addr_result = server.call(scope, "address", ());
+
+          if addr_result.is_null_or_undefined() {
+            panic!("server.address() returned null/undefined");
+          }
+
+          let addr_obj = addr_result.cast::<v8::Object>();
+
+          // Get address property
+          let address_key = v8::String::new(scope, "address").unwrap();
+          let address_val = addr_obj.get(scope, address_key.into()).unwrap();
+          let address = address_val
+            .to_string(scope)
+            .unwrap()
+            .to_rust_string_lossy(scope);
+
+          // Get port property
+          let port_key = v8::String::new(scope, "port").unwrap();
+          let port_val = addr_obj.get(scope, port_key.into()).unwrap();
+          let port = port_val.uint32_value(scope).unwrap() as u16;
+
+          if let Some(tx) = addr_tx.take() {
+            let _ = tx.send((address, port));
+          }
+        },
+      );
+
+      // Listen with just port 0 - should default host to 0.0.0.0
+      server.call(scope, "listen", (0i32, listen_cb));
+    });
+
+    // Run event loop until we get the address
+    let timeout = tokio::time::Duration::from_secs(5);
+    let mut event_loop =
+      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+    let mut addr_rx = pin!(addr_rx);
+
+    let result = loop {
+      tokio::select! {
+        _ = &mut event_loop => {
+          // Keep going
+        }
+        result = &mut addr_rx => {
+          break result.ok();
+        }
+        _ = tokio::time::sleep(timeout) => {
+          break None;
+        }
+      }
+    };
+
+    let (address, port) = result.expect("Failed to get server address");
+
+    // Verify the address is 0.0.0.0 (default when host not specified)
+    assert_eq!(
+      address, "0.0.0.0",
+      "Default host should be 0.0.0.0, got: {}",
+      address
+    );
+
+    // Verify a port was assigned (not 0)
+    assert!(port > 0, "Port should be assigned (got {})", port);
+
     println!(
-      "Streaming test passed! First chunk received in {:?}",
-      elapsed
+      "listen(0) test passed! Server bound to {}:{}",
+      address, port
     );
   }
 }

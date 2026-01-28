@@ -232,6 +232,7 @@ deno_core::extension!(
     "node:buffer" = "internal/buffer.mjs",
     "node:http" = "http.ts",
     "node:net" = "net.ts",
+    "node:assert" = "assert.ts"
   ]
 );
 

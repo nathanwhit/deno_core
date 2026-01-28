@@ -318,6 +318,75 @@ impl HttpTestServer {
     HttpTestServer { port }
   }
 
+  /// Create an HTTP server with custom state and wait for it to start listening.
+  /// The `handler` closure receives (scope, state, req, res).
+  pub async fn start_with_state<S, F>(
+    runtime: &mut JsRuntime,
+    state: S,
+    handler: F,
+  ) -> Self
+  where
+    S: 'static,
+    F: for<'a> FnMut(
+        &mut v8::PinScope<'a, '_>,
+        &mut S,
+        v8::Local<'a, v8::Object>,
+        v8::Local<'a, v8::Object>,
+      ) + 'static,
+  {
+    use deno_core::PollEventLoopOptions;
+    use tokio::sync::oneshot;
+
+    // Find an available port
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let create_server =
+      import_from(runtime, "node:http", "createServer").unwrap();
+    let (listening_tx, listening_rx) = oneshot::channel::<()>();
+
+    runtime.with_scope(|scope| {
+      let create_server_fn =
+        v8::Local::new(scope, &create_server).cast::<v8::Function>();
+
+      // Wrap handler with state
+      let request_handler = js_callback(
+        scope,
+        (RefCell::new(state), RefCell::new(handler)),
+        |scope, (state, handler), args, _| {
+          let req = args.get(0).cast::<v8::Object>();
+          let res = args.get(1).cast::<v8::Object>();
+          (handler.borrow_mut())(scope, &mut *state.borrow_mut(), req, res);
+        },
+      );
+
+      let server_val = create_server_fn
+        .call(
+          scope,
+          v8::undefined(scope).into(),
+          &[request_handler.into()],
+        )
+        .unwrap();
+      let server = JsObject::new(scope, server_val.cast::<v8::Object>());
+
+      let listen_cb =
+        js_callback(scope, Some(listening_tx), |_scope, tx, _, _| {
+          tx.take().unwrap().send(()).unwrap();
+        });
+
+      server.call(scope, "listen", (port as i32, "127.0.0.1", listen_cb));
+    });
+
+    // Run event loop until server is listening
+    tokio::select! {
+      _ = runtime.run_event_loop(PollEventLoopOptions::default()) => {}
+      _ = listening_rx => {}
+    }
+
+    HttpTestServer { port }
+  }
+
   /// Make an HTTP GET request and return response body chunks as they arrive.
   /// Returns a receiver that yields each chunk of data received.
   pub fn get(&self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
