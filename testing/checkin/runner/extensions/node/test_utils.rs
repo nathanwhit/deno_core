@@ -45,43 +45,49 @@ pub trait ToArgs<'a>: Sized {
 }
 
 macro_rules! impl_to_args_for_tuples {
-    ($(($($name: ident),*)),+) => {
-      $(
+  ($(($($name: ident),*)),+) => {
+    $(
 
-        impl<'a, $($name),+> ToArgs<'a> for ($($name,)+)
-        where
-          $($name: ToV8<'a>,)+
-        {
-          fn to_args(
-            self,
-            scope: &mut v8::PinScope<'a, '_>,
-          ) -> Vec<v8::Local<'a, v8::Value>> {
-            #[allow(non_snake_case)]
-            let ($($name,)+) = self;
-            vec![
-              $($name.to_v8(scope).unwrap().into()),+
-            ]
-          }
+      impl<'a, $($name),+> ToArgs<'a> for ($($name,)+)
+      where
+        $($name: ToV8<'a>,)+
+      {
+        fn to_args(
+          self,
+          scope: &mut v8::PinScope<'a, '_>,
+        ) -> Vec<v8::Local<'a, v8::Value>> {
+          #[allow(non_snake_case)]
+          let ($($name,)+) = self;
+          vec![
+            $($name.to_v8(scope).unwrap().into()),+
+          ]
         }
-      )+
-    };
-  }
+      }
+    )+
+  };
+}
 
-impl<'a> ToArgs<'a> for &[v8::Local<'a, v8::Value>] {
+impl<'a, T: ToV8<'a> + Clone> ToArgs<'a> for &[T] {
   fn to_args(
     self,
-    _scope: &mut v8::PinScope<'a, '_>,
+    scope: &mut v8::PinScope<'a, '_>,
   ) -> Vec<v8::Local<'a, v8::Value>> {
-    self.to_vec()
+    self
+      .iter()
+      .map(|x| x.clone().to_v8(scope).unwrap())
+      .collect()
   }
 }
 
-impl<'a, const N: usize> ToArgs<'a> for &[v8::Local<'a, v8::Value>; N] {
+impl<'a, const N: usize, T: ToV8<'a> + Clone> ToArgs<'a> for &[T; N] {
   fn to_args(
     self,
-    _scope: &mut v8::PinScope<'a, '_>,
+    scope: &mut v8::PinScope<'a, '_>,
   ) -> Vec<v8::Local<'a, v8::Value>> {
-    self.to_vec()
+    self
+      .iter()
+      .map(|x| x.clone().to_v8(scope).unwrap())
+      .collect()
   }
 }
 
@@ -91,6 +97,15 @@ impl<'a, T: ToV8<'a>> ToArgs<'a> for Vec<T> {
     scope: &mut v8::PinScope<'a, '_>,
   ) -> Vec<v8::Local<'a, v8::Value>> {
     self.into_iter().map(|x| x.to_v8(scope).unwrap()).collect()
+  }
+}
+
+impl<'a> ToArgs<'a> for () {
+  fn to_args(
+    self,
+    _scope: &mut v8::PinScope<'a, '_>,
+  ) -> Vec<v8::Local<'a, v8::Value>> {
+    vec![]
   }
 }
 
@@ -234,5 +249,114 @@ unsafe impl<T> GarbageCollected for ExtraData<T> {
 
   fn get_name(&self) -> &'static std::ffi::CStr {
     c"ExtraData"
+  }
+}
+
+/// Helper for creating HTTP test servers from Rust
+pub struct HttpTestServer {
+  pub port: u16,
+}
+
+impl HttpTestServer {
+  /// Create an HTTP server and wait for it to start listening.
+  /// The `handler` closure receives (scope, req, res) and should handle the request.
+  pub async fn start<F>(runtime: &mut JsRuntime, handler: F) -> Self
+  where
+    F: for<'a> FnMut(
+        &mut v8::PinScope<'a, '_>,
+        v8::Local<'a, v8::Object>,
+        v8::Local<'a, v8::Object>,
+      ) + 'static,
+  {
+    use deno_core::PollEventLoopOptions;
+    use tokio::sync::oneshot;
+
+    // Find an available port
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let create_server =
+      import_from(runtime, "node:http", "createServer").unwrap();
+    let (listening_tx, listening_rx) = oneshot::channel::<()>();
+
+    runtime.with_scope(|scope| {
+      let create_server_fn =
+        v8::Local::new(scope, &create_server).cast::<v8::Function>();
+
+      // Wrap handler to extract req/res from args
+      let request_handler =
+        js_callback(scope, RefCell::new(handler), |scope, handler, args, _| {
+          let req = args.get(0).cast::<v8::Object>();
+          let res = args.get(1).cast::<v8::Object>();
+          (handler.borrow_mut())(scope, req, res);
+        });
+
+      let server_val = create_server_fn
+        .call(
+          scope,
+          v8::undefined(scope).into(),
+          &[request_handler.into()],
+        )
+        .unwrap();
+      let server = JsObject::new(scope, server_val.cast::<v8::Object>());
+
+      let listen_cb =
+        js_callback(scope, Some(listening_tx), |_scope, tx, _, _| {
+          tx.take().unwrap().send(()).unwrap();
+        });
+
+      server.call(scope, "listen", (port as i32, "127.0.0.1", listen_cb));
+    });
+
+    // Run event loop until server is listening
+    tokio::select! {
+      _ = runtime.run_event_loop(PollEventLoopOptions::default()) => {}
+      _ = listening_rx => {}
+    }
+
+    HttpTestServer { port }
+  }
+
+  /// Make an HTTP GET request and return response body chunks as they arrive.
+  /// Returns a receiver that yields each chunk of data received.
+  pub fn get(&self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let port = self.port;
+
+    tokio::task::spawn(async move {
+      let mut stream =
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+          .await
+        {
+          Ok(s) => s,
+          Err(_) => return,
+        };
+
+      let request =
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+      if stream.write_all(request.as_bytes()).await.is_err() {
+        return;
+      }
+
+      let mut buf = [0u8; 1024];
+      loop {
+        let read_timeout = tokio::time::Duration::from_millis(100);
+        match tokio::time::timeout(read_timeout, stream.read(&mut buf)).await {
+          Ok(Ok(0)) => break,
+          Ok(Ok(n)) => {
+            if tx.send(buf[..n].to_vec()).await.is_err() {
+              break;
+            }
+          }
+          Ok(Err(_)) => break,
+          Err(_) => continue, // Timeout, keep trying
+        }
+      }
+    });
+
+    rx
   }
 }

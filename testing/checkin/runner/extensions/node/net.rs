@@ -1479,7 +1479,6 @@ mod tests {
     
     await first.promise;
     await second.promise;
-    export const success = true;
   "
     .replace("${PORT}", &port.to_string());
     let result = js_test(&code);
@@ -1506,7 +1505,7 @@ mod tests {
     ) -> v8::Local<'a, v8::Function> {
       js_callback(scope, Some(closed_tx), |scope, closed_tx, args, _| {
         closed_tx.take().unwrap().send(()).unwrap();
-        JsObject::new(scope, args.this()).call(scope, "destroy", &[]);
+        JsObject::new(scope, args.this()).call(scope, "destroy", ());
       })
     }
 
@@ -1516,11 +1515,11 @@ mod tests {
     runtime.with_scope(|scope| {
       let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
 
-      let socket = JsObject::construct(scope, socket_cons, &[]);
+      let socket = JsObject::construct(scope, socket_cons, ());
       let callback = mk_callback(scope, closed_tx);
       socket.call(scope, "connect", (port, "127.0.0.1", callback));
 
-      let socket2 = JsObject::construct(scope, socket_cons, &[]);
+      let socket2 = JsObject::construct(scope, socket_cons, ());
       let callback2 = mk_callback(scope, closed_tx2);
       socket2.call(scope, "connect", (port, "127.0.0.1", callback2));
     });
@@ -1606,7 +1605,8 @@ mod tests {
 
     runtime.with_scope(|scope| {
       let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
-      let socket_local = socket_cons.new_instance(scope, &[]).unwrap();
+      let no_args: &[v8::Local<v8::Value>] = &[];
+      let socket_local = socket_cons.new_instance(scope, no_args).unwrap();
       let socket_obj = JsObject::new(scope, socket_local);
 
       // Set up 'connect' handler: write data and end
@@ -1615,7 +1615,7 @@ mod tests {
         js_callback(scope, socket, |scope, socket, _, _| {
           let write_cb =
             js_callback(scope, socket.clone(), |scope, socket, _, _| {
-              socket.call(scope, "end", &[]);
+              socket.call(scope, "end", ());
             });
           socket.call(scope, "write", ("hello", write_cb));
         })

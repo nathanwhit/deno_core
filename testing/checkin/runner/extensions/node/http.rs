@@ -1698,29 +1698,17 @@ impl ServerResponse {
     _encoding: v8::Local<v8::String>,
     #[global] cb: v8::Global<v8::Value>,
   ) -> Result<(), JsErrorBox> {
-    let header_sent = *self.base.header_sent.get(isolate);
-    let has_length = self.base.has_header(isolate, "content-length");
-    let has_te = self.base.has_header(isolate, "transfer-encoding");
-    if !header_sent && !has_length && !has_te {
-      if self.base.pending_body.get(isolate).is_none() {
-        self.base.pending_body.set(isolate, Some(data.to_vec()));
-        let scope_holder = self.scope_holder.clone();
-        let this = self.this.clone();
-        scope_holder.with_scope_immediately(move |scope| {
-          let cb = v8::Local::new(scope, &cb);
-          let this = this.get(scope).unwrap();
-          call_write_cb(scope, cb, this, None);
-        });
-        return Ok(());
-      }
-    }
-
+    // Get any pending data from a previous buffered write
     let pending = self.base.pending_body.get(isolate).clone();
     if pending.is_some() {
       self.base.pending_body.set(isolate, None);
     }
+
+    // Start the response if not already started
+    // This will use chunked encoding since Content-Length is not set
     self.ensure_response(isolate)?;
 
+    // Build the payload from pending + new data
     let mut payload = Vec::new();
     if let Some(pending) = pending {
       payload.extend_from_slice(&pending);
@@ -2007,5 +1995,84 @@ fn call_write_cb(
     let exception = scope.exception().unwrap();
     let error = JsError::from_v8_exception(scope, exception);
     eprintln!("error: {:?}", error);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::pin::pin;
+
+  use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
+
+  use crate::checkin::runner::extensions::node::test_utils::{
+    HttpTestServer, JsObject,
+  };
+
+  fn jsruntime() -> JsRuntime {
+    let (runtime, _worker_host_side) =
+      crate::checkin::runner::create_runtime_without_snapshot(
+        false,
+        None,
+        vec![],
+        RuntimeOptions::default(),
+      );
+    runtime
+  }
+
+  /// Test that HTTP response body streams chunks as they are written,
+  /// rather than buffering until the response ends.
+  #[tokio::test(flavor = "current_thread")]
+  async fn http_response_streams_body() {
+    let mut runtime = jsruntime();
+
+    // Create server that writes a chunk immediately (doesn't call end)
+    let server = HttpTestServer::start(&mut runtime, |scope, _req, res| {
+      let res = JsObject::new(scope, res);
+      res.call(scope, "write", ("chunk1",));
+    })
+    .await;
+
+    // Make request and get response chunks
+    let mut rx = server.get();
+
+    // Run event loop while waiting for first chunk
+    let timeout = tokio::time::Duration::from_millis(500);
+    let start = std::time::Instant::now();
+
+    let result = {
+      let mut event_loop =
+        pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+
+      let mut received = String::new();
+      loop {
+        tokio::select! {
+          _ = &mut event_loop => break,
+          chunk = tokio::time::timeout(timeout, rx.recv()) => {
+            match chunk {
+              Ok(Some(data)) => {
+                received.push_str(&String::from_utf8_lossy(&data));
+                if received.contains("chunk1") {
+                  break;
+                }
+              }
+              _ => break,
+            }
+          }
+        }
+      }
+      received
+    };
+
+    let elapsed = start.elapsed();
+    assert!(
+      result.contains("chunk1"),
+      "Response should contain 'chunk1' (streaming), got: '{}' in {:?}",
+      result,
+      elapsed
+    );
+    println!(
+      "Streaming test passed! First chunk received in {:?}",
+      elapsed
+    );
   }
 }
