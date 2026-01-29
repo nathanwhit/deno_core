@@ -586,6 +586,11 @@ fn upgrade_from_parts(headers: &HeaderMap) -> bool {
   headers.contains_key("upgrade")
 }
 
+/// Format the current time as an HTTP date string (RFC 7231)
+fn http_date_now() -> String {
+  httpdate::HttpDate::from(std::time::SystemTime::now()).to_string()
+}
+
 fn ensure_method(inner: &mut IncomingMessageInner) {
   if inner.method.is_some() {
     return;
@@ -891,6 +896,7 @@ impl OnAccept for HttpServerCallback {
       })
     };
     let result = http1::Builder::new()
+      .auto_date_header(false)
       .serve_connection(TokioIo::new(stream), service)
       .await;
     match result {
@@ -1029,6 +1035,7 @@ impl IncomingMessage {
   }
 
   #[getter]
+  #[rename("httpVersion")]
   #[string]
   fn http_version(&self, _isolate: &v8::Isolate) -> String {
     let mut inner = self.inner.borrow_mut();
@@ -1040,6 +1047,7 @@ impl IncomingMessage {
   }
 
   #[getter]
+  #[rename("httpVersionMajor")]
   #[smi]
   fn http_version_major(&self, _isolate: &v8::Isolate) -> u8 {
     let mut inner = self.inner.borrow_mut();
@@ -1048,6 +1056,7 @@ impl IncomingMessage {
   }
 
   #[getter]
+  #[rename("httpVersionMinor")]
   #[smi]
   fn http_version_minor(&self, _isolate: &v8::Isolate) -> u8 {
     let mut inner = self.inner.borrow_mut();
@@ -1163,19 +1172,22 @@ impl IncomingMessage {
     self.inner.borrow_mut().status_message = value;
   }
 
+  #[rename("httpVersion")]
   #[setter]
-  fn http_version(&self, _isolate: &mut v8::Isolate, #[string] value: String) {
+  fn set_http_version(&self, _isolate: &mut v8::Isolate, #[string] value: String) {
     let mut inner = self.inner.borrow_mut();
     inner.http_version = Some(value);
   }
 
+  #[rename("httpVersionMajor")]
   #[setter]
-  fn http_version_major(&self, _isolate: &mut v8::Isolate, #[smi] value: u8) {
+  fn set_http_version_major(&self, _isolate: &mut v8::Isolate, #[smi] value: u8) {
     self.inner.borrow_mut().http_version_major = value;
   }
 
+  #[rename("httpVersionMinor")]
   #[setter]
-  fn http_version_minor(&self, _isolate: &mut v8::Isolate, #[smi] value: u8) {
+  fn set_http_version_minor(&self, _isolate: &mut v8::Isolate, #[smi] value: u8) {
     self.inner.borrow_mut().http_version_minor = value;
   }
 
@@ -1319,7 +1331,7 @@ unsafe impl GarbageCollected for OutgoingMessage {
   }
 }
 
-#[op2]
+#[op2(base)]
 impl OutgoingMessage {
   #[constructor]
   #[cppgc]
@@ -1400,6 +1412,7 @@ impl OutgoingMessage {
   }
 
   #[getter]
+  #[rename("sendDate")]
   fn send_date(&self, isolate: &v8::Isolate) -> bool {
     *self.send_date.get(isolate)
   }
@@ -1475,8 +1488,9 @@ impl OutgoingMessage {
     self.destroyed.set(isolate, value);
   }
 
+  #[rename("sendDate")]
   #[setter]
-  fn send_date(&self, isolate: &mut v8::Isolate, value: bool) {
+  fn set_send_date(&self, isolate: &mut v8::Isolate, value: bool) {
     self.send_date.set(isolate, value);
   }
 
@@ -1546,10 +1560,14 @@ impl OutgoingMessage {
     self.writable.set(isolate, false);
   }
 
-  // Node.js _send method - marks headers as sent
+  // Node.js _send method - flushes headers and optionally sends data
   #[fast]
   #[rename("_send")]
-  fn send(&self, isolate: &mut v8::Isolate) -> bool {
+  fn send<'a>(
+    &self,
+    isolate: &mut v8::Isolate,
+    _data: Option<v8::Local<'a, v8::Value>>,
+  ) -> bool {
     if self.header.get(isolate).is_some() && !*self.header_sent.get(isolate) {
       self.header_sent.set(isolate, true);
     }
@@ -2046,6 +2064,15 @@ impl ServerResponse {
         .map_err(|_| JsErrorBox::type_error("Invalid header value"))?;
       header_map.append(name, value);
     }
+
+    // Add Date header if sendDate is true
+    if *self.base.send_date.get(isolate) {
+      let date_str = http_date_now();
+      if let Ok(date_value) = HeaderValue::from_str(&date_str) {
+        header_map.insert(hyper::header::DATE, date_value);
+      }
+    }
+
     *response.headers_mut() = header_map;
     Ok(response)
   }

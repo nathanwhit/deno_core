@@ -116,23 +116,16 @@ function test(handler, request_generator, response_validator) {
 {
   function handler(req, res) {
     console.log("handler 3");
-    // assert.strictEqual(req.httpVersion, "1.1");
-    // assert.strictEqual(req.httpVersionMajor, 1);
-    // assert.strictEqual(req.httpVersionMinor, 1);
-    // res.sendDate = false;
-    res.thingy();
+    assert.strictEqual(req.httpVersion, "1.1");
+    assert.strictEqual(req.httpVersionMajor, 1);
+    assert.strictEqual(req.httpVersionMinor, 1);
+    res.sendDate = false;
     res.writeHead(200, { "Content-Type": "text/plain" });
-    console.log("handler 3 wrote head");
     res.write("Hello, ");
-    console.log("handler 3 wrote Hello, ");
     res._send("");
-    console.log("handler 3 wrote empty string");
     res.write("world!");
-    console.log("handler 3 wrote world!");
     res._send("");
-    console.log("handler 3 wrote empty string second time");
     res.end();
-    console.log("handler 3 done");
   }
 
   function request_generator() {

@@ -1056,7 +1056,7 @@ impl ServerInner {
   }
 }
 
-#[op2]
+#[op2(base)]
 impl Server {
   #[constructor]
   #[cppgc]
@@ -2073,7 +2073,9 @@ mod tests {
         |scope, (data, is_string), args, _| {
           let chunk = args.get(0);
           if chunk.is_string() {
-            data.borrow_mut().push_str(&chunk.to_rust_string_lossy(scope));
+            data
+              .borrow_mut()
+              .push_str(&chunk.to_rust_string_lossy(scope));
           } else {
             is_string.set(false);
           }

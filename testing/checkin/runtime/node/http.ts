@@ -25,4 +25,10 @@ function createServer(options?: unknown, requestListener?: Function) {
   return server;
 }
 
-export { createServer, HttpServer as Server };
+export {
+  createServer,
+  HttpServer as Server,
+  IncomingMessage,
+  OutgoingMessage,
+  ServerResponse,
+};
