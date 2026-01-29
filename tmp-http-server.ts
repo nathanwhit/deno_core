@@ -99,13 +99,25 @@ function test(handler, request_generator, response_validator) {
   }
 
   function response_validator(server_response, client_got_eof, timed_out) {
-    const expected_response = "HTTP/1.1 200 OK\r\n" +
+    // Accept either HTTP/1.0 or HTTP/1.1 in response (hyper matches request version)
+    const expected_response_1_1 = "HTTP/1.1 200 OK\r\n" +
+      "Content-Type: text/plain\r\n" +
+      "Connection: close\r\n" +
+      "\r\n" +
+      "Hello, world!";
+    const expected_response_1_0 = "HTTP/1.0 200 OK\r\n" +
       "Content-Type: text/plain\r\n" +
       "Connection: close\r\n" +
       "\r\n" +
       "Hello, world!";
 
-    assert.strictEqual(server_response, expected_response);
+    assert.ok(
+      server_response === expected_response_1_1 ||
+        server_response === expected_response_1_0,
+      `Expected HTTP/1.0 or HTTP/1.1 response, got: ${
+        JSON.stringify(server_response)
+      }`,
+    );
     assert.strictEqual(client_got_eof, true);
     assert.strictEqual(timed_out, false);
   }

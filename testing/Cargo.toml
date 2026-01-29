@@ -28,6 +28,7 @@ httparse = "1.10.1"
 libc.workspace = true
 httpdate = "1.0"
 hyper = { version = "1.8.1", features = ["server", "http1"] }
+indexmap = "2"
 hyper-util = { version = "0.1.10", features = ["tokio"] }
 smallvec.workspace = true
 thiserror.workspace = true

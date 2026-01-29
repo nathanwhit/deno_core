@@ -741,6 +741,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "indexmap",
  "libc",
  "pretty_assertions",
  "prettyplease",

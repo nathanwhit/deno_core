@@ -12,6 +12,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use indexmap::IndexMap;
 use deno_core::JsBuffer;
 use deno_core::convert::Uint8Array;
 use deno_core::error::JsError;
@@ -739,9 +740,8 @@ fn init_request_objects(
         should_close,
         Some(socket_state.clone()),
       );
-      if should_close {
-        res.base.set_header_internal(scope, "Connection", "close");
-      }
+      // Note: Connection: close is added in build_response AFTER user headers
+      // to preserve expected header ordering
       let res_obj = deno_core::cppgc::wrap_object(scope, res_empty, res);
 
       let request_event = internalized(scope, "request");
@@ -897,6 +897,7 @@ impl OnAccept for HttpServerCallback {
     };
     let result = http1::Builder::new()
       .auto_date_header(false)
+      .title_case_headers(true)
       .serve_connection(TokioIo::new(stream), service)
       .await;
     match result {
@@ -1306,7 +1307,7 @@ pub struct OutgoingMessage {
   /// Trailer headers
   trailer: GcCell<String>,
   /// Headers to be sent (key -> [name, value] pairs)
-  out_headers: GcCell<HashMap<String, (String, String)>>,
+  out_headers: GcCell<IndexMap<String, (String, String)>>,
   /// Whether to strictly enforce Content-Length
   strict_content_length: GcCell<bool>,
   /// Whether to join duplicate headers
@@ -1533,7 +1534,7 @@ impl OutgoingMessage {
   fn remove_header(&self, isolate: &mut v8::Isolate, #[string] name: String) {
     let lowercase_name = name.to_lowercase();
     let mut headers = self.out_headers.get(isolate).clone();
-    headers.remove(&lowercase_name);
+    headers.shift_remove(&lowercase_name);
     self.out_headers.set(isolate, headers);
   }
 
@@ -1597,7 +1598,7 @@ impl OutgoingMessage {
       should_keep_alive: GcCell::new(true),
       last: GcCell::new(false),
       trailer: GcCell::new(String::new()),
-      out_headers: GcCell::new(HashMap::new()),
+      out_headers: GcCell::new(IndexMap::new()),
       strict_content_length: GcCell::new(false),
       join_duplicate_headers: GcCell::new(false),
       closed: GcCell::new(false),
@@ -1650,6 +1651,7 @@ impl OutgoingMessage {
     self.out_headers.get(isolate).contains_key(name)
   }
 
+  #[allow(dead_code)]
   fn set_header_internal(
     &self,
     isolate: &mut v8::Isolate,
@@ -2063,6 +2065,16 @@ impl ServerResponse {
       let value = HeaderValue::from_str(value)
         .map_err(|_| JsErrorBox::type_error("Invalid header value"))?;
       header_map.append(name, value);
+    }
+
+    // Add Connection: close AFTER user headers if needed
+    if self.close_after_response
+      && !header_map.contains_key(hyper::header::CONNECTION)
+    {
+      header_map.append(
+        hyper::header::CONNECTION,
+        HeaderValue::from_static("close"),
+      );
     }
 
     // Add Date header if sendDate is true
