@@ -429,3 +429,89 @@ impl HttpTestServer {
     rx
   }
 }
+
+/// Helper to run the event loop until a receiver gets a value or timeout.
+/// Returns Some(value) if received, None if timed out.
+pub async fn run_until<T>(
+  runtime: &mut deno_core::JsRuntime,
+  rx: tokio::sync::oneshot::Receiver<T>,
+  timeout: std::time::Duration,
+) -> Option<T> {
+  use deno_core::PollEventLoopOptions;
+  use std::pin::pin;
+
+  let mut event_loop =
+    pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+  let mut rx = pin!(rx);
+
+  loop {
+    tokio::select! {
+      _ = &mut event_loop => {}
+      result = &mut rx => {
+        return result.ok();
+      }
+      _ = tokio::time::sleep(timeout) => {
+        return None;
+      }
+    }
+  }
+}
+
+/// Creates a callback that signals a oneshot channel when called.
+pub fn signal_cb<'s>(
+  scope: &mut v8::PinScope<'s, '_>,
+  tx: tokio::sync::oneshot::Sender<()>,
+) -> v8::Local<'s, v8::Function> {
+  js_callback(scope, Some(tx), |_scope, tx, _, _| {
+    if let Some(tx) = tx.take() {
+      let _ = tx.send(());
+    }
+  })
+}
+
+/// Creates a callback that sends a value on a oneshot channel when called.
+pub fn send_cb<'s, T: Send + 'static>(
+  scope: &mut v8::PinScope<'s, '_>,
+  tx: tokio::sync::oneshot::Sender<T>,
+  f: impl FnMut(&mut v8::PinScope<'_, '_>, v8::FunctionCallbackArguments<'_>) -> T + 'static,
+) -> v8::Local<'s, v8::Function> {
+  js_callback(scope, (Some(tx), f), |scope, (tx, f), args, _| {
+    if let Some(tx) = tx.take() {
+      let _ = tx.send(f(scope, args));
+    }
+  })
+}
+
+/// Test helper for net module tests
+pub struct NetTest {
+  pub runtime: JsRuntime,
+  socket_cons: v8::Global<v8::Value>,
+}
+
+impl NetTest {
+  pub fn new() -> Self {
+    let (mut runtime, _) = crate::checkin::runner::create_runtime_without_snapshot(
+      false,
+      None,
+      vec![],
+      deno_core::RuntimeOptions::default(),
+    );
+    let socket_cons = import_from(&mut runtime, "node:net", "Socket").unwrap();
+    Self { runtime, socket_cons }
+  }
+
+  /// Create a new Socket and run setup code in a scope
+  pub fn with_socket<R>(&mut self, f: impl FnOnce(&mut v8::PinScope, JsObject) -> R) -> R {
+    let socket_cons = self.socket_cons.clone();
+    self.runtime.with_scope(|scope| {
+      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
+      let socket = JsObject::construct(scope, cons, ());
+      f(scope, socket)
+    })
+  }
+
+  /// Run event loop until receiver gets a value or timeout (5 seconds default)
+  pub async fn run_until<T>(&mut self, rx: tokio::sync::oneshot::Receiver<T>) -> Option<T> {
+    run_until(&mut self.runtime, rx, std::time::Duration::from_secs(5)).await
+  }
+}

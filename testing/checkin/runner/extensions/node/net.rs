@@ -442,45 +442,45 @@ impl Socket {
     Socket::new_inner(me, scope, op_state, options, None, None)
   }
 
-  #[async_method]
-  pub fn connect<'a, 'b>(
+  #[fast]
+  #[reentrant]
+  pub fn connect<'a>(
     &self,
-    #[global] port_or_options: Option<v8::Global<v8::Value>>,
-    #[global] host_or_connect_cb: Option<v8::Global<v8::Value>>,
-    #[global] connect_cb: Option<v8::Global<v8::Function>>,
-  ) -> impl Future<Output = Result<(), JsErrorBox>> {
+    scope: &mut v8::PinScope<'a, '_>,
+    port_or_options: Option<v8::Local<'a, v8::Value>>,
+    host_or_connect_cb: Option<v8::Local<'a, v8::Value>>,
+    connect_cb: Option<v8::Local<'a, v8::Function>>,
+  ) -> Result<(), JsErrorBox> {
     let inner = self.inner.clone();
     inner.ref_tracker.ref_();
-    let inner_for_scope = inner.clone();
-    let normalized = inner.scope_holder.with_scope_immediately(move |scope| {
-      let port_or_options =
-        port_or_options.map(|value| v8::Local::new(scope, &value));
-      let host_or_connect_cb =
-        host_or_connect_cb.map(|value| v8::Local::new(scope, &value));
-      let connect_cb = connect_cb.map(|value| v8::Local::new(scope, &value));
-      let (port, host, connect_listener, _connect_options) =
-        normalize_connect_args(
-          scope,
-          port_or_options,
-          host_or_connect_cb,
-          connect_cb,
-        )?;
-      if let Some(connect_listener) = connect_listener {
-        inner_for_scope.on_event(
-          scope,
-          &[
-            internalized(scope, "connect").into(),
-            connect_listener.into(),
-          ],
-        );
-      }
 
-      Ok::<_, JsErrorBox>((port, host))
-    });
-    async move {
-      let (port, host) = normalized?;
-      inner.connect_inner(port, host).await
+    let (port, host, connect_listener, _connect_options) =
+      normalize_connect_args(
+        scope,
+        port_or_options,
+        host_or_connect_cb,
+        connect_cb,
+      )?;
+
+    // Register connect listener if provided (like Node.js does with this.once('connect', cb))
+    if let Some(connect_listener) = connect_listener {
+      inner.on_event(
+        scope,
+        &[
+          internalized(scope, "connect").into(),
+          connect_listener.into(),
+        ],
+      );
     }
+
+    // Spawn async connection work - returns immediately like Node.js
+    deno_core::unsync::spawn(async move {
+      if let Err(e) = inner.connect_inner(port, host).await {
+        eprintln!("error in connect: {:?}", e);
+      }
+    });
+
+    Ok(())
   }
 
   #[fast]
@@ -593,7 +593,8 @@ impl Socket {
 
       let rust_str = str_val.to_rust_string_lossy(scope);
       encode_string(&rust_str, &encoding_str)
-    } else if let Ok(array_buffer_view) = data.try_cast::<v8::ArrayBufferView>() {
+    } else if let Ok(array_buffer_view) = data.try_cast::<v8::ArrayBufferView>()
+    {
       // It's a TypedArray or DataView
       let len = array_buffer_view.byte_length();
       let mut buf = vec![0u8; len];
@@ -605,9 +606,9 @@ impl Socket {
       backing_store.iter().map(|c| c.get()).collect()
     } else {
       // Fallback: try to convert to string
-      let str_val = data
-        .to_string(scope)
-        .ok_or_else(|| JsErrorBox::generic("Failed to convert data to string"))?;
+      let str_val = data.to_string(scope).ok_or_else(|| {
+        JsErrorBox::generic("Failed to convert data to string")
+      })?;
       str_val.to_rust_string_lossy(scope).into_bytes()
     };
 
@@ -685,9 +686,7 @@ fn encode_string(s: &str, encoding: &str) -> Vec<u8> {
     }
     "ucs2" | "ucs-2" | "utf16le" | "utf-16le" => {
       // UTF-16LE encoding
-      s.encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect()
+      s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
     }
     _ => s.as_bytes().to_vec(), // Default to UTF-8
   }
@@ -872,12 +871,20 @@ impl SocketInner {
             inner.scope_holder.with_scope({
               let inner = inner.clone();
               move |scope| {
+                v8::tc_scope!(let scope, scope);
                 let this = v8::Local::new(scope, &*this);
-                let _result = inner
-                  .push_func
-                  .get(scope)
-                  .call(scope, this.into(), &[v8::null(scope).into()])
-                  .unwrap();
+                let result = inner.push_func.get(scope).call(
+                  scope,
+                  this.into(),
+                  &[v8::null(scope).into()],
+                );
+                if result.is_none() {
+                  if let Some(exception) = scope.exception() {
+                    let error = JsError::from_v8_exception(scope, exception);
+                    eprintln!("error in push(null): {:?}", error);
+                  }
+                  return;
+                }
                 let zero = Smi(0u8).to_v8(scope).unwrap();
                 inner.call_method(scope, "read", &[zero]).unwrap();
               }
@@ -972,6 +979,7 @@ pub(crate) struct ServerInner {
   pub(crate) ref_tracker: RefTracker,
   emit_func: Rc<v8::Global<v8::Function>>,
   on_event_func: Rc<v8::Global<v8::Function>>,
+  cancel: Rc<CancelHandle>,
 }
 
 #[derive(deno_core::ToV8)]
@@ -1025,6 +1033,7 @@ impl Server {
         ref_tracker: RefTracker::new(ops_tracker),
         emit_func,
         on_event_func,
+        cancel: Rc::new(CancelHandle::new()),
       }),
     }
   }
@@ -1094,6 +1103,23 @@ impl Server {
       );
     }
     self.inner.listen_inner::<SocketCallback>(port, host);
+  }
+
+  #[fast]
+  #[reentrant]
+  fn close(
+    &self,
+    scope: &mut v8::PinScope,
+    cb: Option<v8::Local<v8::Function>>,
+  ) {
+    // Register callback for 'close' event if provided
+    if let Some(cb) = cb {
+      self
+        .inner
+        .on_event(scope, &[internalized(scope, "close").into(), cb.into()]);
+    }
+    // Cancel the listener loop - this will emit 'close' event
+    self.inner.close();
   }
 }
 
@@ -1168,6 +1194,7 @@ impl ServerInner {
   pub fn listen_inner<T: OnAccept>(self: &Rc<Self>, port: u16, host: String) {
     let inner = self.clone();
     inner.ref_tracker.ref_();
+    let cancel = inner.cancel.clone();
     deno_core::unsync::spawn(async move {
       let listener = tokio::net::TcpListener::bind((host, port))
         .await
@@ -1184,21 +1211,38 @@ impl ServerInner {
       });
 
       loop {
-        let (stream, addr) = match listener.accept().await {
-          Ok((stream, addr)) => (stream, addr),
-          Err(e) => {
+        let accept_result = listener.accept().or_cancel(cancel.clone()).await;
+        match accept_result {
+          Ok(Ok((stream, addr))) => {
+            let inner = inner.clone();
+            deno_core::unsync::spawn(async move {
+              if let Err(err) = T::on_accept(&inner, stream, addr).await {
+                eprintln!("error in on_accept: {:?}", err);
+              }
+            });
+          }
+          Ok(Err(e)) => {
             eprintln!("error in listener.accept: {:?}", e);
             continue;
           }
-        };
-        let inner = inner.clone();
-        deno_core::unsync::spawn(async move {
-          if let Err(err) = T::on_accept(&inner, stream, addr).await {
-            eprintln!("error in on_accept: {:?}", err);
+          Err(deno_core::Canceled) => {
+            // Server was closed
+            inner.holder.with_scope({
+              let inner = inner.clone();
+              move |scope| {
+                inner.emit_event(scope, &[internalized(scope, "close").into()]);
+              }
+            });
+            inner.ref_tracker.unref();
+            break;
           }
-        });
+        }
       }
     });
+  }
+
+  pub fn close(&self) {
+    self.cancel.cancel();
   }
 }
 
@@ -1338,6 +1382,7 @@ impl EventEmitter for ServerInner {
 
 #[cfg(test)]
 mod tests {
+  use std::cell::Cell;
   use std::sync::{OnceLock, atomic::AtomicUsize};
 
   use deno_core::{
@@ -1347,7 +1392,7 @@ mod tests {
   use tokio::sync::oneshot;
 
   use crate::checkin::runner::extensions::node::test_utils::{
-    JsObject, import_from, js_callback,
+    JsObject, NetTest, import_from, js_callback, send_cb, signal_cb,
   };
 
   use super::*;
@@ -1994,5 +2039,90 @@ mod tests {
       .expect("timed out waiting for server read")
       .expect("server read failed");
     assert_eq!(received, b"Hello".to_vec());
+  }
+
+  /// Test that setEncoding causes data events to receive strings instead of Buffers
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_set_encoding_receives_string_data() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut test = NetTest::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // Server: send data and close
+    tokio::task::spawn(async move {
+      let (mut stream, _) = listener.accept().await.unwrap();
+      stream.write_all(b"hello world").await.unwrap();
+      stream.shutdown().await.unwrap();
+    });
+
+    let (tx, rx) = oneshot::channel::<Result<String, String>>();
+
+    test.with_socket(|scope, socket| {
+      socket.call(scope, "setEncoding", ("utf8",));
+
+      // Track received data
+      let data = Rc::new(RefCell::new(String::new()));
+      let is_string = Rc::new(Cell::new(true));
+
+      let data_cb = js_callback(
+        scope,
+        (data.clone(), is_string.clone()),
+        |scope, (data, is_string), args, _| {
+          let chunk = args.get(0);
+          if chunk.is_string() {
+            data.borrow_mut().push_str(&chunk.to_rust_string_lossy(scope));
+          } else {
+            is_string.set(false);
+          }
+        },
+      );
+      socket.call(scope, "on", ("data", data_cb));
+
+      let end_cb = send_cb(scope, tx, move |_, _| {
+        if !is_string.get() {
+          Err("Expected string, got non-string".into())
+        } else {
+          Ok(data.borrow().clone())
+        }
+      });
+      socket.call(scope, "on", ("end", end_cb));
+      socket.call(scope, "connect", (port, "127.0.0.1"));
+    });
+
+    match test.run_until(rx).await {
+      Some(Ok(data)) => assert_eq!(data, "hello world"),
+      Some(Err(e)) => panic!("{}", e),
+      None => panic!("Timed out"),
+    }
+  }
+
+  /// Test that listeners registered AFTER socket.connect() still receive the event
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_connect_listener_registered_after_connect_call() {
+    let mut test = NetTest::new();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::task::spawn(async move {
+      let _ = listener.accept().await.unwrap();
+    });
+
+    let (tx, rx) = oneshot::channel::<()>();
+
+    test.with_socket(|scope, socket| {
+      // Call connect FIRST, then register listener
+      socket.call(scope, "connect", (port, "127.0.0.1"));
+      let cb = signal_cb(scope, tx);
+      socket.call(scope, "on", ("connect", cb));
+    });
+
+    assert!(
+      test.run_until(rx).await.is_some(),
+      "Connect listener registered after connect() should still receive the event"
+    );
   }
 }

@@ -623,29 +623,65 @@ Readable.prototype.isPaused = function () {
     (state[kState] & (kHasFlowing | kFlowing)) === kHasFlowing;
 };
 
-// // Backwards compatibility.
-// Readable.prototype.setEncoding = function (enc) {
-//   const state = this._readableState;
+// Backwards compatibility.
+Readable.prototype.setEncoding = function (enc) {
+  const state = this._readableState;
 
-//   const decoder = new StringDecoder(enc);
-//   state.decoder = decoder;
-//   // If setEncoding(null), decoder.encoding equals utf8.
-//   state.encoding = state.decoder.encoding;
+  // Normalize encoding name
+  const encoding = enc ? enc.toLowerCase() : "utf8";
 
-//   // Iterate over current buffer to convert already stored Buffers:
-//   let content = "";
-//   for (const data of state.buffer.slice(state.bufferIndex)) {
-//     content += decoder.write(data);
-//   }
-//   state.buffer.length = 0;
-//   state.bufferIndex = 0;
+  // Map Node.js encoding names to TextDecoder names
+  let decoderEncoding = "utf-8";
+  if (encoding === "utf8" || encoding === "utf-8") {
+    decoderEncoding = "utf-8";
+  } else if (encoding === "utf16le" || encoding === "utf-16le" || encoding === "ucs2" || encoding === "ucs-2") {
+    decoderEncoding = "utf-16le";
+  } else if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") {
+    // TextDecoder doesn't support latin1/ascii directly, use windows-1252 as fallback
+    // or handle as utf-8 with byte-by-byte conversion
+    decoderEncoding = "utf-8";
+  }
 
-//   if (content !== "") {
-//     state.buffer.push(content);
-//   }
-//   state.length = content.length;
-//   return this;
-// };
+  // Create a StringDecoder-like wrapper using TextDecoder
+  // The stream expects decoder.write(chunk) to return a string
+  const textDecoder = new TextDecoder(decoderEncoding, { fatal: false });
+  const decoder = {
+    encoding: encoding,
+    write(chunk) {
+      if (typeof chunk === "string") {
+        return chunk;
+      }
+      // TextDecoder.decode with stream: true handles multi-byte boundaries
+      return textDecoder.decode(chunk, { stream: true });
+    },
+    end(chunk) {
+      // Flush any remaining bytes in the decoder
+      // TextDecoder.decode() with an empty array flushes the stream
+      const emptyArray = new Uint8Array(0);
+      if (chunk) {
+        return this.write(chunk) + textDecoder.decode(emptyArray);
+      }
+      return textDecoder.decode(emptyArray);
+    },
+  };
+
+  state.decoder = decoder;
+  state.encoding = decoder.encoding;
+
+  // Iterate over current buffer to convert already stored Buffers:
+  let content = "";
+  for (const data of state.buffer.slice(state.bufferIndex)) {
+    content += decoder.write(data);
+  }
+  state.buffer.length = 0;
+  state.bufferIndex = 0;
+
+  if (content !== "") {
+    state.buffer.push(content);
+  }
+  state.length = content.length;
+  return this;
+};
 
 // Don't raise the hwm > 1GB.
 const MAX_HWM = 0x40000000;

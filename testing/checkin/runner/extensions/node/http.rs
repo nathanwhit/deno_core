@@ -134,6 +134,24 @@ impl HttpServer {
       _ => None,
     }
   }
+
+  #[fast]
+  #[reentrant]
+  fn close<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+    cb: Option<v8::Local<'a, v8::Function>>,
+  ) {
+    // Register the callback for the 'close' event if provided
+    if let Some(cb) = cb {
+      self
+        .base
+        .inner
+        .on_event(scope, &[internalized(scope, "close").into(), cb.into()]);
+    }
+    // Delegate to the base server's close method
+    self.base.inner.close();
+  }
 }
 
 struct HttpServerCallback;
@@ -654,15 +672,22 @@ fn ensure_upgrade(inner: &mut IncomingMessageInner) {
   inner.upgrade = Some(upgrade);
 }
 
+type ResponseTxSlot =
+  Rc<RefCell<Option<oneshot::Sender<Response<HttpResponseBody>>>>>;
+
+/// Result of init_request_objects.
+/// On success: returns handles needed for body streaming.
+/// On failure (handler threw): returns None, and caller should take response_tx
+/// from the slot to send an error response.
 fn init_request_objects(
   inner: &Rc<ServerInner>,
   parts: hyper::http::request::Parts,
   has_body: bool,
   should_read: Rc<ShouldReadState>,
-  response_tx: oneshot::Sender<Response<HttpResponseBody>>,
+  response_tx_slot: ResponseTxSlot,
   should_close: bool,
   socket_state: Rc<LazySocket>,
-) -> (Rc<v8::Global<v8::Object>>, Rc<v8::Global<v8::Function>>) {
+) -> Option<(Rc<v8::Global<v8::Object>>, Rc<v8::Global<v8::Function>>)> {
   let request_parts = RequestParts {
     method: parts.method,
     uri: parts.uri,
@@ -680,6 +705,7 @@ fn init_request_objects(
     let req_slot = req_slot.clone();
     let push_slot = push_slot.clone();
     let should_read = should_read.clone();
+    let response_tx_slot = response_tx_slot.clone();
     move |scope| {
       v8::tc_scope!(let scope, scope);
       let req_empty =
@@ -699,11 +725,11 @@ fn init_request_objects(
 
       let res_empty =
         deno_core::cppgc::make_cppgc_empty_object::<ServerResponse>(scope);
-      let res = ServerResponse::new_inner(
+      let res = ServerResponse::new_inner_with_slot(
         v8::Global::new(scope, res_empty),
         scope,
         inner.op_state(),
-        Some(response_tx),
+        response_tx_slot,
         None,
         should_close,
         Some(socket_state.clone()),
@@ -718,6 +744,11 @@ fn init_request_objects(
         scope,
         &[request_event.into(), req_obj.into(), res_obj.into()],
       );
+      if scope.has_caught() {
+        eprintln!("error in emit_event");
+        scope.throw_exception(scope.exception().unwrap());
+        return;
+      }
 
       let push = req_obj
         .get(scope, internalized(scope, "push").into())
@@ -728,10 +759,9 @@ fn init_request_objects(
     }
   });
 
-  (
-    Rc::new(req_slot.borrow_mut().take().unwrap()),
-    Rc::new(push_slot.borrow_mut().take().unwrap()),
-  )
+  let req_handle = req_slot.borrow_mut().take()?;
+  let push_handle = push_slot.borrow_mut().take()?;
+  Some((Rc::new(req_handle), Rc::new(push_handle)))
 }
 
 fn spawn_request_body_stream(
@@ -798,33 +828,47 @@ async fn handle_hyper_request(
   let should_read = Rc::new(ShouldReadState::new());
 
   let (response_tx, response_rx) = oneshot::channel();
+  let response_tx_slot: ResponseTxSlot =
+    Rc::new(RefCell::new(Some(response_tx)));
 
-  let (req_handle, push_handle) = init_request_objects(
+  let handles = init_request_objects(
     &inner,
     parts,
     has_body,
     should_read.clone(),
-    response_tx,
+    response_tx_slot.clone(),
     should_close,
     socket_state,
   );
 
-  if has_body {
-    spawn_request_body_stream(
-      inner.clone(),
-      body,
-      should_read,
-      req_handle.clone(),
-      push_handle.clone(),
-    );
+  // If init_request_objects returned None, the request handler threw an exception.
+  // Take response_tx from the slot and send 500 immediately.
+  if let Some((req_handle, push_handle)) = handles {
+    if has_body {
+      spawn_request_body_stream(
+        inner.clone(),
+        body,
+        should_read,
+        req_handle.clone(),
+        push_handle.clone(),
+      );
+    } else {
+      finish_request(
+        inner.clone(),
+        req_handle.clone(),
+        push_handle.clone(),
+        true,
+        false,
+      );
+    }
   } else {
-    finish_request(
-      inner.clone(),
-      req_handle.clone(),
-      push_handle.clone(),
-      true,
-      false,
-    );
+    // Handler threw - send 500 if response_tx is still available
+    // (handler might have already sent a response before throwing)
+    if let Some(response_tx) = response_tx_slot.borrow_mut().take() {
+      let mut response = Response::new(Either::Left(Full::new(Bytes::new())));
+      *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+      let _ = response_tx.send(response);
+    }
   }
 
   let response = await_response(response_rx).await;
@@ -1627,7 +1671,7 @@ pub struct ServerResponse {
   base: OutgoingMessage,
   status_code: GcCell<Option<u16>>,
   status_message: GcCell<Option<String>>,
-  response_tx: RefCell<Option<oneshot::Sender<Response<HttpResponseBody>>>>,
+  response_tx_slot: ResponseTxSlot,
   body_handle: RefCell<Option<ResponseBodyHandle>>,
   socket_state: RefCell<Option<Rc<LazySocket>>>,
   scope_holder: Rc<ScopeHolder>,
@@ -1823,9 +1867,9 @@ impl ServerResponse {
 
     if !*self.base.header_sent.get(isolate)
       && self.body_handle.borrow().is_none()
-      && self.response_tx.borrow().is_some()
+      && self.response_tx_slot.borrow().is_some()
     {
-      let response_tx = self.response_tx.borrow_mut().take().unwrap();
+      let response_tx = self.response_tx_slot.borrow_mut().take().unwrap();
       let payload = pending.unwrap_or_default();
       let body = Full::new(Bytes::from(payload));
       let response = match self.build_response(isolate, Either::Left(body)) {
@@ -1939,6 +1983,27 @@ impl ServerResponse {
     close_after_response: bool,
     socket_state: Option<Rc<LazySocket>>,
   ) -> ServerResponse {
+    let response_tx_slot = Rc::new(RefCell::new(response_tx));
+    Self::new_inner_with_slot(
+      me,
+      scope,
+      op_state,
+      response_tx_slot,
+      body_handle,
+      close_after_response,
+      socket_state,
+    )
+  }
+
+  fn new_inner_with_slot(
+    me: v8::Global<v8::Object>,
+    scope: &mut v8::PinScope,
+    op_state: Rc<RefCell<OpState>>,
+    response_tx_slot: ResponseTxSlot,
+    body_handle: Option<ResponseBodyHandle>,
+    close_after_response: bool,
+    socket_state: Option<Rc<LazySocket>>,
+  ) -> ServerResponse {
     let (spawner, this) = {
       let op_state = op_state.borrow();
       let spawner = op_state.borrow::<deno_core::V8TaskSpawner>().clone();
@@ -1952,7 +2017,7 @@ impl ServerResponse {
       base: OutgoingMessage::new_inner(me, scope, op_state),
       status_code: GcCell::new(None),
       status_message: GcCell::new(None),
-      response_tx: RefCell::new(response_tx),
+      response_tx_slot,
       body_handle: RefCell::new(body_handle),
       socket_state: RefCell::new(socket_state),
       scope_holder: Rc::new(ScopeHolder::new(spawner, isolate_ptr, context)),
@@ -1989,7 +2054,7 @@ impl ServerResponse {
     &self,
     isolate: &mut v8::Isolate,
   ) -> Result<(), JsErrorBox> {
-    let response_tx = self.response_tx.borrow_mut().take();
+    let response_tx = self.response_tx_slot.borrow_mut().take();
     if response_tx.is_none() {
       return Ok(());
     }
