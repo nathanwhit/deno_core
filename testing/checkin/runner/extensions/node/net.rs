@@ -3,7 +3,6 @@ use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::ExternalOpsTracker;
 use deno_core::GarbageCollected;
-use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::ToV8;
 use deno_core::convert::Smi;
@@ -338,6 +337,7 @@ struct DuplexOptions {
   allow_half_open: Option<bool>,
   emit_close: bool,
   auto_destroy: bool,
+  decode_strings: bool,
 }
 
 impl Socket {
@@ -393,6 +393,7 @@ impl Socket {
       allow_half_open: Some(options.allow_half_open.unwrap_or(false)),
       emit_close: false,
       auto_destroy: true,
+      decode_strings: false,
     };
     let duplex_options =
       deno_core::serde_v8::to_v8(scope, &duplex_options).unwrap();
@@ -569,17 +570,50 @@ impl Socket {
 
   #[reentrant]
   #[rename("_write")]
-  pub fn write(
+  pub fn write<'a>(
     &self,
-    #[buffer] data: JsBuffer,
-    _encoding: v8::Local<v8::String>,
+    scope: &mut v8::PinScope<'a, '_>,
+    data: v8::Local<'a, v8::Value>,
+    encoding: v8::Local<'a, v8::Value>,
     #[global] cb: v8::Global<v8::Value>,
   ) -> Result<(), JsErrorBox> {
     let inner = self.inner.clone();
 
+    // Convert data to bytes based on type and encoding
+    let bytes: Vec<u8> = if let Ok(str_val) = data.try_cast::<v8::String>() {
+      // It's a string - encode based on encoding parameter
+      let encoding_str = if encoding.is_string() {
+        encoding
+          .to_string(scope)
+          .map(|s| s.to_rust_string_lossy(scope))
+          .unwrap_or_else(|| "utf8".to_string())
+      } else {
+        "utf8".to_string()
+      };
+
+      let rust_str = str_val.to_rust_string_lossy(scope);
+      encode_string(&rust_str, &encoding_str)
+    } else if let Ok(array_buffer_view) = data.try_cast::<v8::ArrayBufferView>() {
+      // It's a TypedArray or DataView
+      let len = array_buffer_view.byte_length();
+      let mut buf = vec![0u8; len];
+      array_buffer_view.copy_contents(&mut buf);
+      buf
+    } else if let Ok(array_buffer) = data.try_cast::<v8::ArrayBuffer>() {
+      // It's an ArrayBuffer
+      let backing_store = array_buffer.get_backing_store();
+      backing_store.iter().map(|c| c.get()).collect()
+    } else {
+      // Fallback: try to convert to string
+      let str_val = data
+        .to_string(scope)
+        .ok_or_else(|| JsErrorBox::generic("Failed to convert data to string"))?;
+      str_val.to_rust_string_lossy(scope).into_bytes()
+    };
+
     let num_wrote = if let Some(mut write) = inner.write.try_borrow_mut() {
       let write = write.deref_mut().as_mut().unwrap();
-      let nwritten = write.try_write(&data);
+      let nwritten = write.try_write(&bytes);
       match nwritten {
         Ok(nwritten) => nwritten,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -592,7 +626,7 @@ impl Socket {
       0
     };
 
-    if num_wrote >= data.len() {
+    if num_wrote >= bytes.len() {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let local_cb = v8::Local::new(scope, &cb);
@@ -610,7 +644,7 @@ impl Socket {
         .deref_mut()
         .as_mut()
         .unwrap()
-        .write_all(&data[num_wrote..])
+        .write_all(&bytes[num_wrote..])
         .or_cancel(inner.cancel.clone())
         .await
         .unwrap()
@@ -627,6 +661,84 @@ impl Socket {
 
     Ok(())
   }
+}
+
+/// Encode a string to bytes based on the specified encoding
+fn encode_string(s: &str, encoding: &str) -> Vec<u8> {
+  match encoding.to_lowercase().as_str() {
+    "utf8" | "utf-8" => s.as_bytes().to_vec(),
+    "ascii" | "latin1" | "binary" => {
+      // ASCII/Latin1: take only the low byte of each char
+      s.chars().map(|c| c as u8).collect()
+    }
+    "hex" => {
+      // Decode hex string to bytes
+      hex_decode(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+    }
+    "base64" => {
+      // Decode base64 string to bytes
+      base64_decode(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+    }
+    "base64url" => {
+      // Decode base64url string to bytes
+      base64url_decode(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+    }
+    "ucs2" | "ucs-2" | "utf16le" | "utf-16le" => {
+      // UTF-16LE encoding
+      s.encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect()
+    }
+    _ => s.as_bytes().to_vec(), // Default to UTF-8
+  }
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
+  if s.len() % 2 != 0 {
+    return Err(());
+  }
+  (0..s.len())
+    .step_by(2)
+    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+    .collect()
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+  // Simple base64 decoder
+  const ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  let mut result = Vec::new();
+  let mut buf: u32 = 0;
+  let mut bits: u32 = 0;
+
+  for c in s.bytes() {
+    if c == b'=' {
+      break;
+    }
+    let val = ALPHABET.iter().position(|&x| x == c).ok_or(())? as u32;
+    buf = (buf << 6) | val;
+    bits += 6;
+    if bits >= 8 {
+      bits -= 8;
+      result.push((buf >> bits) as u8);
+      buf &= (1 << bits) - 1;
+    }
+  }
+  Ok(result)
+}
+
+fn base64url_decode(s: &str) -> Result<Vec<u8>, ()> {
+  // Convert base64url to standard base64 and decode
+  let standard: String = s
+    .chars()
+    .map(|c| match c {
+      '-' => '+',
+      '_' => '/',
+      c => c,
+    })
+    .collect();
+  base64_decode(&standard)
 }
 
 fn call_write_cb(
@@ -1785,5 +1897,102 @@ mod tests {
       result.is_some(),
       "Socket should have received 'end' event when server closed connection"
     );
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_write_string_with_encoding() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn(async move {
+      let (mut stream, _addr) = listener.accept().await.unwrap();
+      let mut buf = Vec::new();
+      stream.read_to_end(&mut buf).await.unwrap();
+      let _ = tx.send(buf);
+    });
+
+    let port = addr.port();
+    // Test writing a string with utf8 encoding
+    let code = "
+    import { Socket } from 'node:net';
+    const socket = new Socket();
+    const done = Promise.withResolvers();
+
+    socket.on('connect', () => {
+      socket.write('hello', 'utf8', () => {
+        socket.end();
+      });
+    });
+    socket.on('close', () => done.resolve());
+
+    socket.connect(${PORT}, '127.0.0.1');
+    await done.promise;
+  "
+    .replace("${PORT}", &port.to_string());
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(timeout, js_test(&code)).await;
+    match result {
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("Test failed: {:?}", e),
+      Err(_) => panic!("Test timed out after {:?}", timeout),
+    }
+
+    let received = tokio::time::timeout(timeout, rx)
+      .await
+      .expect("timed out waiting for server read")
+      .expect("server read failed");
+    assert_eq!(received, b"hello".to_vec());
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn socket_write_hex_encoding() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn(async move {
+      let (mut stream, _addr) = listener.accept().await.unwrap();
+      let mut buf = Vec::new();
+      stream.read_to_end(&mut buf).await.unwrap();
+      let _ = tx.send(buf);
+    });
+
+    let port = addr.port();
+    // Test writing a hex-encoded string
+    let code = "
+    import { Socket } from 'node:net';
+    const socket = new Socket();
+    const done = Promise.withResolvers();
+
+    socket.on('connect', () => {
+      // '48656c6c6f' is 'Hello' in hex
+      socket.write('48656c6c6f', 'hex', () => {
+        socket.end();
+      });
+    });
+    socket.on('close', () => done.resolve());
+
+    socket.connect(${PORT}, '127.0.0.1');
+    await done.promise;
+  "
+    .replace("${PORT}", &port.to_string());
+
+    let timeout = tokio::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(timeout, js_test(&code)).await;
+    match result {
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("Test failed: {:?}", e),
+      Err(_) => panic!("Test timed out after {:?}", timeout),
+    }
+
+    let received = tokio::time::timeout(timeout, rx)
+      .await
+      .expect("timed out waiting for server read")
+      .expect("server read failed");
+    assert_eq!(received, b"Hello".to_vec());
   }
 }

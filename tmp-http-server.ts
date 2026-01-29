@@ -17,6 +17,7 @@ function test(handler, request_generator, response_validator) {
     c.setEncoding("utf8");
 
     c.on("connect", function () {
+      console.log("connect");
       c.write(request_generator());
     });
 
@@ -35,6 +36,7 @@ function test(handler, request_generator, response_validator) {
 
 {
   function handler(req, res) {
+    console.log("handler 1");
     assert.strictEqual(req.httpVersion, "1.0");
     assert.strictEqual(req.httpVersionMajor, 1);
     assert.strictEqual(req.httpVersionMinor, 0);
@@ -53,6 +55,7 @@ function test(handler, request_generator, response_validator) {
     assert.strictEqual(timed_out, false);
   }
 
+  console.log("test 1");
   test(handler, request_generator, response_validator);
 }
 

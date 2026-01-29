@@ -30,7 +30,23 @@ export class Buffer extends Uint8Array {
   static isEncoding(encoding) {
     if (typeof encoding !== "string") return false;
     const enc = encoding.toLowerCase();
-    return enc === "utf8" || enc === "utf-8";
+    switch (enc) {
+      case "utf8":
+      case "utf-8":
+      case "ascii":
+      case "latin1":
+      case "binary":
+      case "hex":
+      case "base64":
+      case "base64url":
+      case "ucs2":
+      case "ucs-2":
+      case "utf16le":
+      case "utf-16le":
+        return true;
+      default:
+        return false;
+    }
   }
 
   static byteLength(value, encoding) {
