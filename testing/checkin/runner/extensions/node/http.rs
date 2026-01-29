@@ -587,10 +587,47 @@ fn upgrade_from_parts(headers: &HeaderMap) -> bool {
   headers.contains_key("upgrade")
 }
 
-/// Format the current time as an HTTP date string (RFC 7231)
-fn http_date_now() -> String {
-  httpdate::HttpDate::from(std::time::SystemTime::now()).to_string()
+/// Cached HTTP date HeaderValue that updates every second.
+/// HTTP dates have 1-second resolution, so caching avoids
+/// repeated syscalls, string formatting, and HeaderValue creation per request.
+mod cached_date {
+  use super::HeaderValue;
+  use std::cell::RefCell;
+  use std::time::{Duration, Instant};
+
+  struct CachedDate {
+    header_value: HeaderValue,
+    last_update: Instant,
+  }
+
+  thread_local! {
+    static CACHED: RefCell<CachedDate> = RefCell::new(CachedDate {
+      header_value: format_now(),
+      last_update: Instant::now(),
+    });
+  }
+
+  fn format_now() -> HeaderValue {
+    let date_str =
+      httpdate::HttpDate::from(std::time::SystemTime::now()).to_string();
+    // HTTP dates are always valid ASCII, so this won't fail
+    HeaderValue::from_str(&date_str).unwrap()
+  }
+
+  pub fn http_date_header_value() -> HeaderValue {
+    CACHED.with(|cached| {
+      let mut cached = cached.borrow_mut();
+      // Update if more than 1 second has passed
+      if cached.last_update.elapsed() >= Duration::from_secs(1) {
+        cached.header_value = format_now();
+        cached.last_update = Instant::now();
+      }
+      cached.header_value.clone()
+    })
+  }
 }
+
+use cached_date::http_date_header_value;
 
 fn ensure_method(inner: &mut IncomingMessageInner) {
   if inner.method.is_some() {
@@ -964,12 +1001,12 @@ struct IncomingMessageInner {
   raw_headers: V8Cached<Vec<String>>,
   /// Headers with distinct values (array for each key)
   headers_distinct: V8Cached<HashMap<String, Vec<String>>>,
-  /// Parsed trailers
-  trailers: HashMap<String, String>,
-  /// Raw trailers as alternating key/value pairs
-  raw_trailers: Vec<String>,
-  /// Trailers with distinct values
-  trailers_distinct: HashMap<String, Vec<String>>,
+  /// Parsed trailers (lazy - None until accessed)
+  trailers: Option<HashMap<String, String>>,
+  /// Raw trailers as alternating key/value pairs (lazy)
+  raw_trailers: Option<Vec<String>>,
+  /// Trailers with distinct values (lazy)
+  trailers_distinct: Option<HashMap<String, Vec<String>>>,
   /// Whether the message has been fully received
   complete: bool,
   /// Whether the request was aborted
@@ -1101,14 +1138,24 @@ impl IncomingMessage {
   #[getter]
   #[serde]
   fn trailers(&self, _isolate: &v8::Isolate) -> HashMap<String, String> {
-    self.inner.borrow().trailers.clone()
+    self
+      .inner
+      .borrow()
+      .trailers
+      .clone()
+      .unwrap_or_default()
   }
 
   #[getter]
   #[serde]
   #[rename("rawTrailers")]
   fn raw_trailers(&self, _isolate: &v8::Isolate) -> Vec<String> {
-    self.inner.borrow().raw_trailers.clone()
+    self
+      .inner
+      .borrow()
+      .raw_trailers
+      .clone()
+      .unwrap_or_default()
   }
 
   #[getter]
@@ -1118,7 +1165,12 @@ impl IncomingMessage {
     &self,
     _isolate: &v8::Isolate,
   ) -> HashMap<String, Vec<String>> {
-    self.inner.borrow().trailers_distinct.clone()
+    self
+      .inner
+      .borrow()
+      .trailers_distinct
+      .clone()
+      .unwrap_or_default()
   }
 
   #[getter]
@@ -1264,9 +1316,9 @@ impl IncomingMessage {
         headers: V8Cached::new(),
         raw_headers: V8Cached::new(),
         headers_distinct: V8Cached::new(),
-        trailers: HashMap::new(),
-        raw_trailers: Vec::new(),
-        trailers_distinct: HashMap::new(),
+        trailers: None,
+        raw_trailers: None,
+        trailers_distinct: None,
         complete: false,
         aborted: false,
         upgrade: None,
@@ -1802,22 +1854,22 @@ impl ServerResponse {
 
   #[reentrant]
   #[rename("_write")]
-  fn write(
+  fn write<'a>(
     &self,
-    isolate: &mut v8::Isolate,
+    scope: &mut v8::PinScope<'a, '_>,
     #[buffer] data: JsBuffer,
-    _encoding: v8::Local<v8::String>,
+    _encoding: v8::Local<'a, v8::String>,
     #[global] cb: v8::Global<v8::Value>,
   ) -> Result<(), JsErrorBox> {
     // Get any pending data from a previous buffered write
-    let pending = self.base.pending_body.get(isolate).clone();
+    let pending = self.base.pending_body.get(scope).clone();
     if pending.is_some() {
-      self.base.pending_body.set(isolate, None);
+      self.base.pending_body.set(scope, None);
     }
 
     // Start the response if not already started
     // This will use chunked encoding since Content-Length is not set
-    self.ensure_response(isolate)?;
+    self.ensure_response(scope)?;
 
     // Build the payload from pending + new data
     let mut payload = Vec::new();
@@ -1828,13 +1880,10 @@ impl ServerResponse {
       payload.extend_from_slice(&data);
     }
     if payload.is_empty() {
-      let scope_holder = self.scope_holder.clone();
-      let this = self.this.clone();
-      scope_holder.with_scope_immediately(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb, this, None);
-      });
+      // Call callback directly using the scope we already have
+      let cb = v8::Local::new(scope, &cb);
+      let this = self.this.get(scope).unwrap();
+      call_write_cb(scope, cb, this, None);
       return Ok(());
     }
 
@@ -1843,10 +1892,10 @@ impl ServerResponse {
       .borrow()
       .clone()
       .ok_or_else(|| JsErrorBox::generic("Response body missing"))?;
-    let scope_holder = self.scope_holder.clone();
-    let this = self.this.clone();
     let pending_bytes = handle.push_bytes(Bytes::from(payload))?;
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
+      let scope_holder = self.scope_holder.clone();
+      let this = self.this.clone();
       deno_core::unsync::spawn(async move {
         handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
         scope_holder.with_scope_immediately(move |scope| {
@@ -1856,11 +1905,9 @@ impl ServerResponse {
         });
       });
     } else {
-      scope_holder.with_scope_immediately(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb, this, None);
-      });
+      let cb = v8::Local::new(scope, &cb);
+      let this = self.this.get(scope).unwrap();
+      call_write_cb(scope, cb, this, None);
     }
 
     Ok(())
@@ -1868,97 +1915,79 @@ impl ServerResponse {
 
   #[reentrant]
   #[rename("_final")]
-  fn final_(
+  fn final_<'a>(
     &self,
-    isolate: &mut v8::Isolate,
+    scope: &mut v8::PinScope<'a, '_>,
     #[global] cb: v8::Global<v8::Function>,
   ) {
     let mut pending = None;
-    if !*self.base.header_sent.get(isolate) {
-      let has_length = self.base.has_header(isolate, "content-length");
-      let has_te = self.base.has_header(isolate, "transfer-encoding");
-      pending = self.base.pending_body.get(isolate).clone();
-      self.base.pending_body.set(isolate, None);
+    if !*self.base.header_sent.get(scope) {
+      let has_length = self.base.has_header(scope, "content-length");
+      let has_te = self.base.has_header(scope, "transfer-encoding");
+      pending = self.base.pending_body.get(scope).clone();
+      self.base.pending_body.set(scope, None);
       if !has_length && !has_te {
         let len = pending.as_ref().map(|buf| buf.len()).unwrap_or(0);
-        self.base.set_content_length(isolate, len);
+        self.base.set_content_length(scope, len);
       }
     }
 
-    if !*self.base.header_sent.get(isolate)
+    // Fast path: simple response with no prior streaming
+    if !*self.base.header_sent.get(scope)
       && self.body_handle.borrow().is_none()
       && self.response_tx_slot.borrow().is_some()
     {
       let response_tx = self.response_tx_slot.borrow_mut().take().unwrap();
       let payload = pending.unwrap_or_default();
       let body = Full::new(Bytes::from(payload));
-      let response = match self.build_response(isolate, Either::Left(body)) {
+      let response = match self.build_response(scope, Either::Left(body)) {
         Ok(response) => response,
         Err(err) => {
-          let scope_holder = self.scope_holder.clone();
-          let this = self.this.clone();
-          scope_holder.with_scope_immediately(move |scope| {
-            let cb = v8::Local::new(scope, &cb);
-            let this = this.get(scope).unwrap();
-            call_write_cb(scope, cb.into(), this, Some(err));
-          });
+          let cb = v8::Local::new(scope, &cb);
+          let this = self.this.get(scope).unwrap();
+          call_write_cb(scope, cb.into(), this, Some(err));
           return;
         }
       };
       let _ = response_tx.send(response);
-      self.base.header_sent.set(isolate, true);
-      let scope_holder = self.scope_holder.clone();
-      let this = self.this.clone();
-      scope_holder.with_scope_immediately(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, None);
-      });
+      self.base.header_sent.set(scope, true);
+      // Call callback directly using the scope we already have
+      let cb = v8::Local::new(scope, &cb);
+      let this = self.this.get(scope).unwrap();
+      call_write_cb(scope, cb.into(), this, None);
       return;
     }
 
-    if let Err(err) = self.ensure_response(isolate) {
-      let scope_holder = self.scope_holder.clone();
-      let this = self.this.clone();
-      scope_holder.with_scope_immediately(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, Some(err));
-      });
+    if let Err(err) = self.ensure_response(scope) {
+      let cb = v8::Local::new(scope, &cb);
+      let this = self.this.get(scope).unwrap();
+      call_write_cb(scope, cb.into(), this, Some(err));
       return;
     }
 
     let handle = match self.body_handle.borrow().clone() {
       Some(handle) => handle,
       None => {
-        let scope_holder = self.scope_holder.clone();
-        let this = self.this.clone();
-        scope_holder.with_scope_immediately(move |scope| {
-          let cb = v8::Local::new(scope, &cb);
-          let this = this.get(scope).unwrap();
-          call_write_cb(
-            scope,
-            cb.into(),
-            this,
-            Some(JsErrorBox::generic("Response body missing")),
-          );
-        });
+        let cb = v8::Local::new(scope, &cb);
+        let this = self.this.get(scope).unwrap();
+        call_write_cb(
+          scope,
+          cb.into(),
+          this,
+          Some(JsErrorBox::generic("Response body missing")),
+        );
         return;
       }
     };
 
-    let scope_holder = self.scope_holder.clone();
-    let this = self.this.clone();
     let pending_bytes =
       if let Some(pending) = pending.filter(|buf| !buf.is_empty()) {
         match handle.push_bytes(Bytes::from(pending)) {
           Ok(pending) => pending,
           Err(err) => {
-            scope_holder.with_scope_immediately(move |scope| {
-              let cb = v8::Local::new(scope, &cb);
-              let this = this.get(scope).unwrap();
-              call_write_cb(scope, cb.into(), this, Some(err));
-            });
+            let cb = v8::Local::new(scope, &cb);
+            let this = self.this.get(scope).unwrap();
+            call_write_cb(scope, cb.into(), this, Some(err));
             return;
           }
         }
@@ -1967,6 +1996,8 @@ impl ServerResponse {
       };
     handle.close();
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
+      let scope_holder = self.scope_holder.clone();
+      let this = self.this.clone();
       deno_core::unsync::spawn(async move {
         handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
         scope_holder.with_scope_immediately(move |scope| {
@@ -1976,11 +2007,9 @@ impl ServerResponse {
         });
       });
     } else {
-      scope_holder.with_scope_immediately(move |scope| {
-        let cb = v8::Local::new(scope, &cb);
-        let this = this.get(scope).unwrap();
-        call_write_cb(scope, cb.into(), this, None);
-      });
+      let cb = v8::Local::new(scope, &cb);
+      let this = self.this.get(scope).unwrap();
+      call_write_cb(scope, cb.into(), this, None);
     }
   }
 
@@ -2057,8 +2086,9 @@ impl ServerResponse {
     let mut response = Response::new(body);
     *response.status_mut() = status;
 
-    let mut header_map = HeaderMap::new();
     let headers = self.base.out_headers.get(isolate).clone();
+    // Pre-allocate: user headers + Connection + Date
+    let mut header_map = HeaderMap::with_capacity(headers.len() + 2);
     for (_, (name, value)) in headers.iter() {
       let name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| JsErrorBox::type_error("Invalid header name"))?;
@@ -2079,10 +2109,7 @@ impl ServerResponse {
 
     // Add Date header if sendDate is true
     if *self.base.send_date.get(isolate) {
-      let date_str = http_date_now();
-      if let Ok(date_value) = HeaderValue::from_str(&date_str) {
-        header_map.insert(hyper::header::DATE, date_value);
-      }
+      header_map.insert(hyper::header::DATE, http_date_header_value());
     }
 
     *response.headers_mut() = header_map;
