@@ -107,9 +107,10 @@ impl ServerResponse {
         let first = args.get(0);
         if first.is_int32()
           && let Some(value) = first.int32_value(scope)
-            && value as u16 == status_code {
-              start = 1;
-            }
+          && value as u16 == status_code
+        {
+          start = 1;
+        }
       }
       if args_len > start {
         let value = args.get(start);
@@ -377,7 +378,8 @@ impl ServerResponse {
       (spawner, this)
     };
     let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
-    let context = GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
+    let context =
+      GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
     ServerResponse {
       base: OutgoingMessage::new_inner(me, scope, op_state),
       status_code: GcCell::new(None),

@@ -199,7 +199,9 @@ impl JsObject {
     scope: &v8::PinScope<'s, '_>,
     name: &str,
   ) -> v8::Local<'s, v8::Value> {
-    self.obj.get(scope)
+    self
+      .obj
+      .get(scope)
       .get(scope, internalized(scope, name).into())
       .unwrap()
   }

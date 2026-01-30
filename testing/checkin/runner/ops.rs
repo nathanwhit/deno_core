@@ -753,17 +753,15 @@ fn validate_args<'a>(
 
   let bar_key = strings.bar(scope);
   let bar = obj.get(scope, bar_key.into()).unwrap();
-  if !bar.is_null_or_undefined()
-    && !bar.is_boolean() {
-      return Err(ValidationError::BarMustBeBoolean.into());
-    }
+  if !bar.is_null_or_undefined() && !bar.is_boolean() {
+    return Err(ValidationError::BarMustBeBoolean.into());
+  }
 
   let baz_key = strings.baz(scope);
   let baz = obj.get(scope, baz_key.into()).unwrap();
-  if !baz.is_null_or_undefined()
-    && !baz.is_number() {
-      return Err(ValidationError::BazMustBeNumber.into());
-    }
+  if !baz.is_null_or_undefined() && !baz.is_number() {
+    return Err(ValidationError::BazMustBeNumber.into());
+  }
 
   let required_key = strings.required(scope);
   if !obj.has(scope, required_key.into()).unwrap() {
@@ -776,10 +774,9 @@ fn validate_args<'a>(
 
   let foo_key = strings.foo(scope);
   let foo = obj.get(scope, foo_key.into()).unwrap();
-  if !foo.is_null_or_undefined()
-    && !foo.is_string() {
-      return Err(ValidationError::FooMustBeString.into());
-    }
+  if !foo.is_null_or_undefined() && !foo.is_string() {
+    return Err(ValidationError::FooMustBeString.into());
+  }
 
   Ok(())
 }

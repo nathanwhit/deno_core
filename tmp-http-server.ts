@@ -12,45 +12,34 @@ function test(handler, request_generator, response_validator) {
 
   server.listen(0);
   server.on("listening", function () {
-    console.log(this.address());
-    const c = net.createConnection(this.address().port);
+    const c = net.createConnection(server.address().port);
 
-    console.log("created connection");
     c.setEncoding("utf8");
-    console.log("set encoding");
 
     c.on("connect", function () {
-      console.log("connect");
       c.write(request_generator());
     });
 
     c.on("data", function (chunk) {
-      console.log("data", chunk);
       server_response += chunk;
     });
 
     c.on("end", function () {
-      console.log("end");
       client_got_eof = true;
       c.end();
       server.close();
-      console.log("calling response validator");
       response_validator(server_response, client_got_eof, false);
-      console.log("response validator called");
     });
   });
 }
 
 {
   function handler(req, res) {
-    console.log("handler 1");
     assert.strictEqual(req.httpVersion, "1.0");
     assert.strictEqual(req.httpVersionMajor, 1);
     assert.strictEqual(req.httpVersionMinor, 0);
     res.writeHead(200, { "Content-Type": "text/plain" });
-    console.log("wrote head");
     res.end(body);
-    console.log("ended");
   }
 
   function request_generator() {
@@ -59,14 +48,11 @@ function test(handler, request_generator, response_validator) {
 
   function response_validator(server_response, client_got_eof, timed_out) {
     const m = server_response.split("\r\n\r\n");
-    console.log("response validator 1", m[1], body);
     assert.strictEqual(m[1], body);
     assert.strictEqual(client_got_eof, true);
     assert.strictEqual(timed_out, false);
-    console.log("response validator 1 done");
   }
 
-  console.log("test 1");
   test(handler, request_generator, response_validator);
 }
 
@@ -77,7 +63,6 @@ function test(handler, request_generator, response_validator) {
 //
 {
   function handler(req, res) {
-    console.log("handler 2");
     assert.strictEqual(req.httpVersion, "1.0");
     assert.strictEqual(req.httpVersionMajor, 1);
     assert.strictEqual(req.httpVersionMinor, 0);
@@ -128,7 +113,6 @@ function test(handler, request_generator, response_validator) {
 
 {
   function handler(req, res) {
-    console.log("handler 3");
     assert.strictEqual(req.httpVersion, "1.1");
     assert.strictEqual(req.httpVersionMajor, 1);
     assert.strictEqual(req.httpVersionMinor, 1);
@@ -152,7 +136,6 @@ function test(handler, request_generator, response_validator) {
   }
 
   function response_validator(server_response, client_got_eof, timed_out) {
-    console.log("response validator 3", server_response);
     const expected_response = "HTTP/1.1 200 OK\r\n" +
       "Content-Type: text/plain\r\n" +
       "Connection: close\r\n" +
@@ -165,7 +148,6 @@ function test(handler, request_generator, response_validator) {
       "0\r\n" +
       "\r\n";
 
-    console.log("response validator 3", server_response, expected_response);
     assert.strictEqual(server_response, expected_response);
     assert.strictEqual(client_got_eof, true);
     assert.strictEqual(timed_out, false);

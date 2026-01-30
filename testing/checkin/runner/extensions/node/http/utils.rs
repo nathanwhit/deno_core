@@ -198,15 +198,16 @@ impl LazySocket {
 /// Determine if connection should close based on headers and HTTP version.
 pub fn should_close_from_parts(headers: &HeaderMap, version: Version) -> bool {
   if let Some(value) = headers.get("connection")
-    && let Ok(value) = value.to_str() {
-      let value = value.to_ascii_lowercase();
-      if value.contains("close") {
-        return true;
-      }
-      if value.contains("keep-alive") {
-        return false;
-      }
+    && let Ok(value) = value.to_str()
+  {
+    let value = value.to_ascii_lowercase();
+    if value.contains("close") {
+      return true;
     }
+    if value.contains("keep-alive") {
+      return false;
+    }
+  }
   matches!(version, Version::HTTP_10)
 }
 
@@ -214,9 +215,10 @@ pub fn should_close_from_parts(headers: &HeaderMap, version: Version) -> bool {
 pub fn upgrade_from_parts(headers: &HeaderMap) -> bool {
   if let Some(value) = headers.get("connection")
     && let Ok(value) = value.to_str()
-      && value.to_ascii_lowercase().contains("upgrade") {
-        return true;
-      }
+    && value.to_ascii_lowercase().contains("upgrade")
+  {
+    return true;
+  }
   headers.contains_key("upgrade")
 }
 
