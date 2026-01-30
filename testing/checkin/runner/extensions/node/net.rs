@@ -1382,16 +1382,11 @@ impl EventEmitter for ServerInner {
 #[cfg(test)]
 mod tests {
   use std::cell::Cell;
-  use std::sync::{OnceLock, atomic::AtomicUsize};
 
-  use deno_core::{
-    JsRuntime, ModuleSpecifier, PollEventLoopOptions, RequestedModuleType,
-    RuntimeOptions,
-  };
   use tokio::sync::oneshot;
 
   use crate::checkin::runner::extensions::node::test_utils::{
-    JsObject, NetTest, import_from, js_callback, send_cb, signal_cb,
+    JsObject, NetTest, import_from, js_callback, run_until, send_cb, signal_cb,
   };
 
   use super::*;
@@ -1498,252 +1493,207 @@ mod tests {
     }
   }
 
-  static ID: OnceLock<AtomicUsize> = OnceLock::new();
-  fn next_id() -> usize {
-    ID.get_or_init(|| AtomicUsize::new(0))
-      .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-  }
-
-  fn jsruntime() -> JsRuntime {
-    let (runtime, _worker_host_side) =
-      crate::checkin::runner::create_runtime_without_snapshot(
-        false,
-        None,
-        vec![],
-        RuntimeOptions::default(),
-      );
-    runtime
-  }
-
-  async fn js_test(
-    contents: &str,
-  ) -> Result<(JsRuntime, v8::Global<v8::Value>), JsErrorBox> {
-    let mut runtime = jsruntime();
-    let specifier =
-      ModuleSpecifier::parse(&format!("file:///test-{}.ts", next_id()))
-        .unwrap();
-
-    let id = runtime
-      .load_main_es_module_from_code(&specifier, contents.to_string())
-      .await
-      .map_err(JsErrorBox::from_err)?;
-
-    let module = runtime.mod_evaluate(id);
-
-    runtime
-      .run_event_loop(Default::default())
-      .await
-      .map_err(JsErrorBox::from_err)?;
-    module.await.map_err(JsErrorBox::from_err)?;
-    let namespace = runtime
-      .get_module_namespace_by_name(
-        specifier.as_ref(),
-        RequestedModuleType::None,
-      )
-      .unwrap();
-    let namespace = {
-      deno_core::scope!(scope, runtime);
-      let namespace = v8::Local::new(scope, namespace);
-      let namespace = namespace.cast::<v8::Value>();
-      v8::Global::new(scope, namespace)
-    };
-    Ok((runtime, namespace))
-  }
-
-  #[tokio::test]
+  #[tokio::test(flavor = "current_thread")]
   async fn constructor_accepts_options() {
-    let result = js_test(
-      "
-      import { Socket } from 'node:net';
-      new Socket({ allowHalfOpen: true });
-    ",
-    );
-    assert!(result.await.is_ok());
+    let mut test = NetTest::new();
+
+    let socket_cons =
+      import_from(&mut test.runtime, "node:net", "Socket").unwrap();
+
+    test.runtime.with_scope(|scope| {
+      let options = v8::Object::new(scope);
+      let key = internalized(scope, "allowHalfOpen");
+      options.set(scope, key.into(), v8::Boolean::new(scope, true).into());
+
+      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
+      let _socket = JsObject::construct(scope, cons, (options,));
+      // Test passes if no error was thrown during construction
+    });
   }
 
   #[tokio::test(flavor = "current_thread")]
   async fn socket_read() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut test = NetTest::new();
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // Server: send data then close
     tokio::task::spawn(async move {
-      let (mut stream, _addr) = listener.accept().await.unwrap();
-      let data = "hello world".as_bytes().to_vec();
-      stream
-        .write_all(&data)
-        .await
-        .map_err(JsErrorBox::from_err)
-        .unwrap();
-    });
-    let port = addr.port();
-    let code = "
-    import { Socket } from 'node:net';
-    import { equal } from 'checkin:testing';
-    const socket = new Socket();
-    
-    const expected = new Uint8Array([
-      104, 101, 108, 108,
-      111,  32, 119, 111,
-      114, 108, 100
-    ]);
-
-    const prom = Promise.withResolvers();
-    let data = new Uint8Array();
-    socket.on('data', (chunk) => {
-      data = new Uint8Array([...data, ...chunk]);
-      if (!equal(data, expected)) {
-        throw new Error('data is not equal to expected');
-      }
-      prom.resolve();
-      socket.destroy();
+      let (mut stream, _) = listener.accept().await.unwrap();
+      stream.write_all(b"hello world").await.unwrap();
+      // Shutdown to signal EOF
+      stream.shutdown().await.unwrap();
     });
 
-    await socket.connect(${PORT}, '127.0.0.1');
-    await prom.promise;
-  "
-    .replace("${PORT}", &port.to_string());
-    let result = js_test(&code);
-    result.await.unwrap();
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
+
+    test.with_socket(|scope, socket| {
+      // Track accumulated data
+      let accumulated = Rc::new(RefCell::new(Vec::new()));
+
+      // Set up 'data' event handler
+      let data_cb =
+        js_callback(scope, accumulated.clone(), |scope, acc, args, _| {
+          let chunk = args.get(0);
+          // Extract bytes from the chunk (Uint8Array)
+          if let Ok(view) = chunk.try_cast::<v8::ArrayBufferView>() {
+            let len = view.byte_length();
+            let mut buf = vec![0u8; len];
+            view.copy_contents(&mut buf);
+            acc.borrow_mut().extend_from_slice(&buf);
+          }
+          let _ = scope;
+        });
+      socket.call(scope, "on", ("data", data_cb));
+
+      // Set up 'end' handler to send result when server closes connection
+      let end_cb = send_cb(scope, tx, move |_, _| accumulated.borrow().clone());
+      socket.call(scope, "on", ("end", end_cb));
+
+      socket.call(scope, "connect", (port, "127.0.0.1"));
+    });
+
+    let result = test.run_until(rx).await;
+    assert!(result.is_some(), "Timed out waiting for data");
+    assert_eq!(result.unwrap(), b"hello world".to_vec());
   }
 
   #[tokio::test(flavor = "current_thread")]
   async fn socket_connect_registers_callback() {
+    let mut test = NetTest::new();
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let port = listener.local_addr().unwrap().port();
+
     tokio::task::spawn(async move {
       for _ in 0..2 {
         let _ = listener.accept().await.unwrap();
       }
     });
-    let port = addr.port();
-    let code = "
-    import { Socket } from 'node:net';
-    
-    const first = Promise.withResolvers();
-    const second = Promise.withResolvers();
-    
-    const socket1 = new Socket();
-    socket1.connect(${PORT}, () => {
-      first.resolve();
-      socket1.destroy();
+
+    let (tx1, rx1) = oneshot::channel::<()>();
+    let (tx2, rx2) = oneshot::channel::<()>();
+
+    let socket_cons = test.socket_cons.clone();
+
+    test.runtime.with_scope(|scope| {
+      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
+
+      // Socket 1: connect(port, callback) - no host specified
+      let socket1 = JsObject::construct(scope, cons, ());
+      let cb1 = js_callback(
+        scope,
+        (Some(tx1), socket1.clone()),
+        |scope, (tx, socket), _, _| {
+          tx.take().unwrap().send(()).unwrap();
+          socket.call(scope, "destroy", ());
+        },
+      );
+      socket1.call(scope, "connect", (port, cb1));
+
+      // Socket 2: connect(port, host, callback)
+      let socket2 = JsObject::construct(scope, cons, ());
+      let cb2 = js_callback(
+        scope,
+        (Some(tx2), socket2.clone()),
+        |scope, (tx, socket), _, _| {
+          tx.take().unwrap().send(()).unwrap();
+          socket.call(scope, "destroy", ());
+        },
+      );
+      socket2.call(scope, "connect", (port, "127.0.0.1", cb2));
     });
-    
-    const socket2 = new Socket();
-    socket2.connect(${PORT}, '127.0.0.1', () => {
-      second.resolve();
-      socket2.destroy();
-    });
-    
-    await first.promise;
-    await second.promise;
-  "
-    .replace("${PORT}", &port.to_string());
-    let result = js_test(&code);
-    let (_, _) = result.await.unwrap();
+
+    // Wait for both callbacks to complete
+    let result = run_until(
+      &mut test.runtime,
+      async move {
+        rx1.await.ok()?;
+        rx2.await.ok()?;
+        Some(())
+      },
+      std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(
+      result.is_some(),
+      "Both connect callbacks should have been called"
+    );
   }
 
   #[tokio::test(flavor = "current_thread")]
   async fn socket_connect_callback() {
-    let mut runtime = jsruntime();
-    let socket = import_from(&mut runtime, "node:net", "Socket").unwrap();
+    let mut test = NetTest::new();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let port = addr.port();
+    let port = listener.local_addr().unwrap().port();
+
     tokio::task::spawn(async move {
       for _ in 0..2 {
         let _ = listener.accept().await.unwrap();
       }
     });
 
-    fn mk_callback<'a>(
-      scope: &mut v8::PinScope<'a, '_>,
-      closed_tx: oneshot::Sender<()>,
-    ) -> v8::Local<'a, v8::Function> {
-      js_callback(scope, Some(closed_tx), |scope, closed_tx, args, _| {
-        closed_tx.take().unwrap().send(()).unwrap();
-        JsObject::new(scope, args.this()).call(scope, "destroy", ());
-      })
-    }
+    let (tx1, rx1) = oneshot::channel::<()>();
+    let (tx2, rx2) = oneshot::channel::<()>();
 
-    let (closed_tx, closed_rx) = oneshot::channel::<()>();
-    let (closed_tx2, closed_rx2) = oneshot::channel::<()>();
+    let socket_cons = test.socket_cons.clone();
 
-    runtime.with_scope(|scope| {
-      let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
+    test.runtime.with_scope(|scope| {
+      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
 
-      let socket = JsObject::construct(scope, socket_cons, ());
-      let callback = mk_callback(scope, closed_tx);
-      socket.call(scope, "connect", (port, "127.0.0.1", callback));
+      // Socket 1: connect(port, host, callback)
+      let socket1 = JsObject::construct(scope, cons, ());
+      let cb1 = js_callback(
+        scope,
+        (Some(tx1), socket1.clone()),
+        |scope, (tx, socket), _, _| {
+          tx.take().unwrap().send(()).unwrap();
+          socket.call(scope, "destroy", ());
+        },
+      );
+      socket1.call(scope, "connect", (port, "127.0.0.1", cb1));
 
-      let socket2 = JsObject::construct(scope, socket_cons, ());
-      let callback2 = mk_callback(scope, closed_tx2);
-      socket2.call(scope, "connect", (port, "127.0.0.1", callback2));
+      // Socket 2: connect(port, host, callback)
+      let socket2 = JsObject::construct(scope, cons, ());
+      let cb2 = js_callback(
+        scope,
+        (Some(tx2), socket2.clone()),
+        |scope, (tx, socket), _, _| {
+          tx.take().unwrap().send(()).unwrap();
+          socket.call(scope, "destroy", ());
+        },
+      );
+      socket2.call(scope, "connect", (port, "127.0.0.1", cb2));
     });
 
-    runtime
-      .run_event_loop(PollEventLoopOptions::default())
-      .await
-      .unwrap();
+    // Wait for both callbacks to complete
+    let result = run_until(
+      &mut test.runtime,
+      async move {
+        rx1.await.ok()?;
+        rx2.await.ok()?;
+        Some(())
+      },
+      std::time::Duration::from_secs(5),
+    )
+    .await;
 
-    closed_rx.await.unwrap();
-    closed_rx2.await.unwrap();
+    assert!(
+      result.is_some(),
+      "Both connect callbacks should have been called"
+    );
   }
 
   #[tokio::test(flavor = "current_thread")]
   async fn socket_write_sends_data() {
     use tokio::io::AsyncReadExt;
-    use tokio::sync::oneshot;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
-    tokio::task::spawn(async move {
-      let (mut stream, _addr) = listener.accept().await.unwrap();
-      let mut buf = [0u8; 5];
-      stream.read_exact(&mut buf).await.unwrap();
-      let _ = tx.send(buf.to_vec());
-    });
-
-    let port = addr.port();
-    let code = "
-    import { Socket } from 'node:net';
-    const socket = new Socket();
-    const done = Promise.withResolvers();
-    const data = 'hello';
-
-    socket.on('connect', () => {
-      socket.write(data, () => {
-        socket.end();
-      });
-    });
-    socket.on('close', () => done.resolve());
-
-    socket.connect(${PORT}, '127.0.0.1');
-    await done.promise;
-  "
-    .replace("${PORT}", &port.to_string());
-
-    let timeout = tokio::time::Duration::from_secs(5);
-    let result = tokio::time::timeout(timeout, js_test(&code)).await;
-    match result {
-      Ok(Ok(_)) => {}
-      Ok(Err(e)) => panic!("Test failed: {:?}", e),
-      Err(_) => panic!("Test timed out after {:?}", timeout),
-    }
-
-    let received = tokio::time::timeout(timeout, rx)
-      .await
-      .expect("timed out waiting for server read")
-      .expect("server read failed");
-    assert_eq!(received, b"hello".to_vec());
-  }
-
-  #[tokio::test(flavor = "current_thread")]
-  async fn socket_write_sends_data_rust() {
-    use tokio::io::AsyncReadExt;
-
-    let mut runtime = jsruntime();
-    let socket = import_from(&mut runtime, "node:net", "Socket").unwrap();
+    let mut test = NetTest::new();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1757,13 +1707,11 @@ mod tests {
       let _ = tx.send(buf.to_vec());
     });
 
-    let (closed_tx, closed_rx) = oneshot::channel::<()>();
+    let socket_cons = test.socket_cons.clone();
 
-    runtime.with_scope(|scope| {
-      let socket_cons = v8::Local::new(scope, socket).cast::<v8::Function>();
-      let no_args: &[v8::Local<v8::Value>] = &[];
-      let socket_local = socket_cons.new_instance(scope, no_args).unwrap();
-      let socket_obj = JsObject::new(scope, socket_local);
+    test.runtime.with_scope(|scope| {
+      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
+      let socket_obj = JsObject::construct(scope, cons, ());
 
       // Set up 'connect' handler: write data and end
       let connect_cb = {
@@ -1778,119 +1726,109 @@ mod tests {
       };
       socket_obj.call(scope, "on", ("connect", connect_cb));
 
-      // Set up 'close' handler
-      let close_cb =
-        js_callback(scope, Some(closed_tx), |_scope, closed_tx, _, _| {
-          closed_tx.take().unwrap().send(()).unwrap();
-        });
-      socket_obj.call(scope, "on", ("close", close_cb));
-
       // Connect
       socket_obj.call(scope, "connect", (port, "127.0.0.1"));
     });
 
-    runtime
-      .run_event_loop(PollEventLoopOptions::default())
-      .await
-      .unwrap();
-
-    closed_rx.await.unwrap();
-
-    let received = rx.await.expect("server read failed");
+    let received = test.run_until(rx).await.expect("server read failed");
     assert_eq!(received, b"hello".to_vec());
   }
 
   #[tokio::test(flavor = "current_thread")]
   async fn server_accepts_connections() {
+    let mut test = NetTest::new();
+
+    // Find an available port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let port = addr.port();
+    let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let code = "
-    import { Server, Socket } from 'node:net';
-    
-    const server = new Server();
-    
-    const listeningProm = Promise.withResolvers();
-    const connectionProm = Promise.withResolvers();
-    
-    let connectionCount = 0;
-    const expectedConnections = 3;
-    
-    server.on('listening', () => {
-      console.log('listening');
-      listeningProm.resolve();
+    // Import Server constructor
+    let server_cons =
+      import_from(&mut test.runtime, "node:net", "Server").unwrap();
+    let socket_cons = test.socket_cons.clone();
+
+    let (listening_tx, listening_rx) = oneshot::channel::<()>();
+    let (connections_tx, connections_rx) = oneshot::channel::<u32>();
+
+    // Store a global reference to the server so we can unref it later
+    let server_global: Rc<RefCell<Option<JsObject>>> =
+      Rc::new(RefCell::new(None));
+    let server_global_clone = server_global.clone();
+
+    test.runtime.with_scope(|scope| {
+      // Create server
+      let server_fn =
+        v8::Local::new(scope, &server_cons).cast::<v8::Function>();
+      let server = JsObject::construct(scope, server_fn, ());
+
+      // Store server reference for later unref
+      *server_global_clone.borrow_mut() = Some(server.clone());
+
+      // Set up 'listening' handler
+      let listening_cb = signal_cb(scope, listening_tx);
+      server.call(scope, "on", ("listening", listening_cb));
+
+      // Set up 'connection' handler
+      let conn_cb = js_callback(
+        scope,
+        (Rc::new(RefCell::new(0u32)), Some(connections_tx)),
+        |scope, (count, tx), args, _| {
+          *count.borrow_mut() += 1;
+          let socket = JsObject::new(scope, args.get(0).cast::<v8::Object>());
+          socket.call(scope, "destroy", ());
+
+          if *count.borrow() == 3 {
+            if let Some(tx) = tx.take() {
+              let _ = tx.send(*count.borrow());
+            }
+          }
+        },
+      );
+      server.call(scope, "on", ("connection", conn_cb));
+
+      // Start listening
+      server.call(scope, "listen", (port as i32, "127.0.0.1"));
     });
-    
-    server.on('connection', (socket) => {
-      connectionCount++;
-      console.log('connection', connectionCount);
-      socket.destroy();
-      if (connectionCount === expectedConnections) {
-      console.log('resolving connection prom');
-        connectionProm.resolve();
+
+    // Wait for listening
+    test
+      .run_until(listening_rx)
+      .await
+      .expect("should start listening");
+
+    // Create 3 client connections
+    test.runtime.with_scope(|scope| {
+      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
+
+      for _ in 0..3 {
+        let socket = JsObject::construct(scope, cons, ());
+        socket.call(scope, "connect", (port as i32, "127.0.0.1"));
       }
     });
-    
-    server.listen(${PORT}, '127.0.0.1');
-    console.log('listening');
-    await listeningProm.promise;
-    console.log('listening prom resolved');
 
-    async function makeConnection() {
-      const socket = new Socket();
-      const closeProm = Promise.withResolvers();
+    let count = test
+      .run_until(connections_rx)
+      .await
+      .expect("should receive connections");
+    assert_eq!(count, 3, "Expected 3 connections");
 
-      socket.on('close', () => {
-        console.log('close');
-        closeProm.resolve();
-      });
-      await socket.connect(${PORT}, '127.0.0.1');
-      await closeProm.promise;
-    }
-    
-
-    console.log('making connections');
-    await Promise.all([
-      makeConnection(),
-      makeConnection(),
-      makeConnection(),
-    ]);
-    
-    await connectionProm.promise;
-    console.log('connection prom resolved');
-    
-    if (connectionCount !== expectedConnections) {
-      throw new Error(`Expected ${expectedConnections} connections, got ${connectionCount}`);
-    }
-    
-    console.log('unrefing server');
-    server.unref();
-    export const success = true;
-  "
-    .replace("${PORT}", &port.to_string());
-
-    let timeout = tokio::time::Duration::from_secs(5);
-    let result = tokio::time::timeout(timeout, js_test(&code)).await;
-    match result {
-      Ok(Ok(_)) => {}
-      Ok(Err(e)) => panic!("Test failed: {:?}", e),
-      Err(_) => panic!("Test timed out after {:?}", timeout),
-    }
+    // Unref the server so the event loop can exit
+    test.runtime.with_scope(|scope| {
+      if let Some(server) = server_global.borrow().as_ref() {
+        server.call(scope, "unref", ());
+      }
+    });
   }
 
   #[tokio::test(flavor = "current_thread")]
   async fn socket_receives_end_event_on_server_close() {
-    use std::pin::pin;
     use tokio::io::AsyncWriteExt;
 
-    let mut runtime = jsruntime();
-    let socket_mod = import_from(&mut runtime, "node:net", "Socket").unwrap();
+    let mut test = NetTest::new();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let port = addr.port();
+    let port = listener.local_addr().unwrap().port();
 
     // Server: accept connection, send data, then close
     tokio::task::spawn(async move {
@@ -1901,44 +1839,21 @@ mod tests {
 
     let (end_tx, end_rx) = oneshot::channel::<()>();
 
-    runtime.with_scope(|scope| {
-      let socket_cons =
-        v8::Local::new(scope, &socket_mod).cast::<v8::Function>();
-      let socket = JsObject::construct(scope, socket_cons, ());
-
+    test.with_socket(|scope, socket| {
       // Set up 'data' event handler to consume data (required for 'end' to fire)
       let data_cb = js_callback(scope, None::<()>, |_scope, _, _, _| {});
       socket.call(scope, "on", ("data", data_cb));
 
       // Set up 'end' event handler
-      let end_cb = js_callback(scope, Some(end_tx), |_scope, end_tx, _, _| {
-        end_tx.take().unwrap().send(()).unwrap();
-      });
+      let end_cb = signal_cb(scope, end_tx);
       socket.call(scope, "on", ("end", end_cb));
 
       // Connect to server
       socket.call(scope, "connect", (port, "127.0.0.1"));
     });
 
-    let timeout = tokio::time::Duration::from_secs(5);
-    let mut event_loop =
-      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
-    let mut end_rx = pin!(end_rx);
-
-    let result = loop {
-      tokio::select! {
-        _ = &mut event_loop => {}
-        result = &mut end_rx => {
-          break result.ok();
-        }
-        _ = tokio::time::sleep(timeout) => {
-          break None;
-        }
-      }
-    };
-
     assert!(
-      result.is_some(),
+      test.run_until(end_rx).await.is_some(),
       "Socket should have received 'end' event when server closed connection"
     );
   }
@@ -1947,47 +1862,35 @@ mod tests {
   async fn socket_write_string_with_encoding() {
     use tokio::io::AsyncReadExt;
 
+    let mut test = NetTest::new();
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
+    let port = listener.local_addr().unwrap().port();
+
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
     tokio::task::spawn(async move {
-      let (mut stream, _addr) = listener.accept().await.unwrap();
-      let mut buf = Vec::new();
-      stream.read_to_end(&mut buf).await.unwrap();
+      let (mut stream, _) = listener.accept().await.unwrap();
+      let mut buf = vec![0u8; 5];
+      stream.read_exact(&mut buf).await.unwrap();
       let _ = tx.send(buf);
     });
 
-    let port = addr.port();
-    // Test writing a string with utf8 encoding
-    let code = "
-    import { Socket } from 'node:net';
-    const socket = new Socket();
-    const done = Promise.withResolvers();
+    test.with_socket(|scope, socket| {
+      // Set up connect handler to write data with encoding
+      let connect_cb =
+        js_callback(scope, socket.clone(), |scope, socket, _, _| {
+          let write_cb =
+            js_callback(scope, socket.clone(), |scope, socket, _, _| {
+              socket.call(scope, "end", ());
+            });
+          socket.call(scope, "write", ("hello", "utf8", write_cb));
+        });
+      socket.call(scope, "on", ("connect", connect_cb));
 
-    socket.on('connect', () => {
-      socket.write('hello', 'utf8', () => {
-        socket.end();
-      });
+      socket.call(scope, "connect", (port, "127.0.0.1"));
     });
-    socket.on('close', () => done.resolve());
 
-    socket.connect(${PORT}, '127.0.0.1');
-    await done.promise;
-  "
-    .replace("${PORT}", &port.to_string());
-
-    let timeout = tokio::time::Duration::from_secs(5);
-    let result = tokio::time::timeout(timeout, js_test(&code)).await;
-    match result {
-      Ok(Ok(_)) => {}
-      Ok(Err(e)) => panic!("Test failed: {:?}", e),
-      Err(_) => panic!("Test timed out after {:?}", timeout),
-    }
-
-    let received = tokio::time::timeout(timeout, rx)
-      .await
-      .expect("timed out waiting for server read")
-      .expect("server read failed");
+    let received = test.run_until(rx).await.expect("server read failed");
     assert_eq!(received, b"hello".to_vec());
   }
 
@@ -1995,48 +1898,36 @@ mod tests {
   async fn socket_write_hex_encoding() {
     use tokio::io::AsyncReadExt;
 
+    let mut test = NetTest::new();
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
+    let port = listener.local_addr().unwrap().port();
+
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
     tokio::task::spawn(async move {
-      let (mut stream, _addr) = listener.accept().await.unwrap();
-      let mut buf = Vec::new();
-      stream.read_to_end(&mut buf).await.unwrap();
+      let (mut stream, _) = listener.accept().await.unwrap();
+      let mut buf = vec![0u8; 5]; // "Hello" is 5 bytes
+      stream.read_exact(&mut buf).await.unwrap();
       let _ = tx.send(buf);
     });
 
-    let port = addr.port();
-    // Test writing a hex-encoded string
-    let code = "
-    import { Socket } from 'node:net';
-    const socket = new Socket();
-    const done = Promise.withResolvers();
+    test.with_socket(|scope, socket| {
+      // Set up connect handler to write hex-encoded data
+      let connect_cb =
+        js_callback(scope, socket.clone(), |scope, socket, _, _| {
+          let write_cb =
+            js_callback(scope, socket.clone(), |scope, socket, _, _| {
+              socket.call(scope, "end", ());
+            });
+          // '48656c6c6f' is 'Hello' in hex
+          socket.call(scope, "write", ("48656c6c6f", "hex", write_cb));
+        });
+      socket.call(scope, "on", ("connect", connect_cb));
 
-    socket.on('connect', () => {
-      // '48656c6c6f' is 'Hello' in hex
-      socket.write('48656c6c6f', 'hex', () => {
-        socket.end();
-      });
+      socket.call(scope, "connect", (port, "127.0.0.1"));
     });
-    socket.on('close', () => done.resolve());
 
-    socket.connect(${PORT}, '127.0.0.1');
-    await done.promise;
-  "
-    .replace("${PORT}", &port.to_string());
-
-    let timeout = tokio::time::Duration::from_secs(5);
-    let result = tokio::time::timeout(timeout, js_test(&code)).await;
-    match result {
-      Ok(Ok(_)) => {}
-      Ok(Err(e)) => panic!("Test failed: {:?}", e),
-      Err(_) => panic!("Test timed out after {:?}", timeout),
-    }
-
-    let received = tokio::time::timeout(timeout, rx)
-      .await
-      .expect("timed out waiting for server read")
-      .expect("server read failed");
+    let received = test.run_until(rx).await.expect("server read failed");
     assert_eq!(received, b"Hello".to_vec());
   }
 

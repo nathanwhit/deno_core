@@ -434,31 +434,38 @@ impl HttpTestServer {
   }
 }
 
-/// Helper to run the event loop until a receiver gets a value or timeout.
-/// Returns Some(value) if received, None if timed out.
 pub async fn run_until<T>(
   runtime: &mut deno_core::JsRuntime,
-  rx: tokio::sync::oneshot::Receiver<T>,
+  fut: impl IntoFuture<Output = Option<T>>,
   timeout: std::time::Duration,
 ) -> Option<T> {
-  use deno_core::PollEventLoopOptions;
   use std::pin::pin;
 
   let mut event_loop =
-    pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
-  let mut rx = pin!(rx);
+    pin!(runtime.run_event_loop(deno_core::PollEventLoopOptions::default()));
+  let mut fut = pin!(fut.into_future());
 
   loop {
     tokio::select! {
       _ = &mut event_loop => {}
-      result = &mut rx => {
-        return result.ok();
+      result = &mut fut => {
+        return result;
       }
       _ = tokio::time::sleep(timeout) => {
         return None;
       }
     }
   }
+}
+
+/// Helper to run the event loop until a receiver gets a value or timeout.
+/// Returns Some(value) if received, None if timed out.
+pub async fn run_until_recv<T>(
+  runtime: &mut deno_core::JsRuntime,
+  rx: tokio::sync::oneshot::Receiver<T>,
+  timeout: std::time::Duration,
+) -> Option<T> {
+  run_until(runtime, async move { rx.await.ok() }, timeout).await
 }
 
 /// Creates a callback that signals a oneshot channel when called.
@@ -490,7 +497,7 @@ pub fn send_cb<'s, T: Send + 'static>(
 /// Test helper for net module tests
 pub struct NetTest {
   pub runtime: JsRuntime,
-  socket_cons: v8::Global<v8::Value>,
+  pub socket_cons: v8::Global<v8::Value>,
 }
 
 impl NetTest {
@@ -527,6 +534,7 @@ impl NetTest {
     &mut self,
     rx: tokio::sync::oneshot::Receiver<T>,
   ) -> Option<T> {
-    run_until(&mut self.runtime, rx, std::time::Duration::from_secs(5)).await
+    run_until_recv(&mut self.runtime, rx, std::time::Duration::from_secs(5))
+      .await
   }
 }
