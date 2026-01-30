@@ -912,7 +912,6 @@ impl SocketInner {
             }
             let result = result.unwrap().cast::<v8::Boolean>();
             if result.is_false() {
-              eprintln!("push returned false");
               inner2.should_read.clear_should_read();
             }
           });
