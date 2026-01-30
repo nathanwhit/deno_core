@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 export class ERR_ILLEGAL_CONSTRUCTOR extends Error {
   constructor(message: string) {
     super(message);

@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 use std::{
   cell::RefCell,
   rc::Rc,
@@ -145,7 +146,7 @@ impl LazySocket {
       #[cfg(unix)]
       raw_fd: stream.as_raw_fd(),
       host: Some(addr.ip().to_string()),
-      port: Some(addr.port() as u16),
+      port: Some(addr.port()),
       socket_obj: RefCell::new(None),
     }
   }
@@ -196,8 +197,8 @@ impl LazySocket {
 
 /// Determine if connection should close based on headers and HTTP version.
 pub fn should_close_from_parts(headers: &HeaderMap, version: Version) -> bool {
-  if let Some(value) = headers.get("connection") {
-    if let Ok(value) = value.to_str() {
+  if let Some(value) = headers.get("connection")
+    && let Ok(value) = value.to_str() {
       let value = value.to_ascii_lowercase();
       if value.contains("close") {
         return true;
@@ -206,19 +207,16 @@ pub fn should_close_from_parts(headers: &HeaderMap, version: Version) -> bool {
         return false;
       }
     }
-  }
   matches!(version, Version::HTTP_10)
 }
 
 /// Check if request is an upgrade request.
 pub fn upgrade_from_parts(headers: &HeaderMap) -> bool {
-  if let Some(value) = headers.get("connection") {
-    if let Ok(value) = value.to_str() {
-      if value.to_ascii_lowercase().contains("upgrade") {
+  if let Some(value) = headers.get("connection")
+    && let Ok(value) = value.to_str()
+      && value.to_ascii_lowercase().contains("upgrade") {
         return true;
       }
-    }
-  }
   headers.contains_key("upgrade")
 }
 

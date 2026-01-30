@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { bench } from "checkin:bench";
 import { nop, propAccessLazy, propAccessStatic } from "checkin:object";
 

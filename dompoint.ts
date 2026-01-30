@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { DOMPoint, DOMPointReadOnly } from "checkin:object";
 
 const p1 = new DOMPoint(100, 200, 300, 400);

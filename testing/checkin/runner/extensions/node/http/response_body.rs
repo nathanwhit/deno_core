@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 use std::{
   collections::VecDeque,
   pin::Pin,
@@ -127,13 +128,11 @@ impl Body for ResponseBody {
         let pending_bytes = state.pending_bytes;
         let frame = Frame::data(bytes);
         (Some(Ok(frame)), state.closed, pending_bytes)
+      } else if state.closed {
+        (None, true, state.pending_bytes)
       } else {
-        if state.closed {
-          (None, true, state.pending_bytes)
-        } else {
-          state.waker = Some(cx.waker().clone());
-          return Poll::Pending;
-        }
+        state.waker = Some(cx.waker().clone());
+        return Poll::Pending;
       }
     };
 

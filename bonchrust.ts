@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { thingIsStringRust } from "checkin:object";
 await new Promise((resolve) => setTimeout(resolve, 10000));
 const start = Date.now();

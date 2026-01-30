@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { createServer } from "node:http";
 
 const body = new Uint8Array([

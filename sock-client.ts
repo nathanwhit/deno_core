@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import * as net from "node:net";
 
 // 1. Define the payload

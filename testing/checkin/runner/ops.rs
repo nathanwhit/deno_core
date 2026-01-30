@@ -124,9 +124,9 @@ pub fn op_map<'a>(
   let len = array.length();
   let out = v8::Array::new(scope, len as i32);
   for i in 0..len {
-    let value = array.get_index(scope, i as u32).unwrap();
+    let value = array.get_index(scope, i).unwrap();
     let result = func.call(scope, func.into(), &[value]).unwrap();
-    out.set_index(scope, i as u32, result).unwrap();
+    out.set_index(scope, i, result).unwrap();
   }
   out.into()
 }
@@ -186,7 +186,7 @@ pub fn op_map2<'a>(
   let len = array.length();
   let mut out = smallvec::SmallVec::<[_; 16]>::with_capacity(len as usize);
   for i in 0..len {
-    let value = array.get_index(scope, i as u32).unwrap();
+    let value = array.get_index(scope, i).unwrap();
     out.push(func.call(scope, func.into(), &[value]).unwrap());
   }
   v8::Array::new_with_elements(scope, &out).into()
@@ -753,19 +753,17 @@ fn validate_args<'a>(
 
   let bar_key = strings.bar(scope);
   let bar = obj.get(scope, bar_key.into()).unwrap();
-  if !bar.is_null_or_undefined() {
-    if !bar.is_boolean() {
+  if !bar.is_null_or_undefined()
+    && !bar.is_boolean() {
       return Err(ValidationError::BarMustBeBoolean.into());
     }
-  }
 
   let baz_key = strings.baz(scope);
   let baz = obj.get(scope, baz_key.into()).unwrap();
-  if !baz.is_null_or_undefined() {
-    if !baz.is_number() {
+  if !baz.is_null_or_undefined()
+    && !baz.is_number() {
       return Err(ValidationError::BazMustBeNumber.into());
     }
-  }
 
   let required_key = strings.required(scope);
   if !obj.has(scope, required_key.into()).unwrap() {
@@ -778,11 +776,10 @@ fn validate_args<'a>(
 
   let foo_key = strings.foo(scope);
   let foo = obj.get(scope, foo_key.into()).unwrap();
-  if !foo.is_null_or_undefined() {
-    if !foo.is_string() {
+  if !foo.is_null_or_undefined()
+    && !foo.is_string() {
       return Err(ValidationError::FooMustBeString.into());
     }
-  }
 
   Ok(())
 }

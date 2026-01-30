@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { Server, Socket } from "checkin:net";
 // import { Server , Socket } from "node:net";
 

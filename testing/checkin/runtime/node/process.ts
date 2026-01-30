@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { nextTick } from "ext:checkin_node/next_tick.ts";
 import { op_exit } from "ext:core/ops";
 

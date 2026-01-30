@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use bytes::Bytes;
@@ -103,13 +104,11 @@ impl ServerResponse {
       let args_len = args.length();
       if args_len > 0 {
         let first = args.get(0);
-        if first.is_int32() {
-          if let Some(value) = first.int32_value(scope) {
-            if value as u16 == status_code {
+        if first.is_int32()
+          && let Some(value) = first.int32_value(scope)
+            && value as u16 == status_code {
               start = 1;
             }
-          }
-        }
       }
       if args_len > start {
         let value = args.get(start);

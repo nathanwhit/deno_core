@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { nop } from "checkin:object";
 // deno-lint-ignore no-explicit-any
 export function do_not_optimize(v: any) {

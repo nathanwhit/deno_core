@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 use deno_core::AsyncRefCell;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
@@ -322,11 +323,10 @@ fn normalize_connect_args<'s>(
     }
   }
 
-  if connect_listener.is_none() {
-    if let Some(connect_cb) = connect_cb {
+  if connect_listener.is_none()
+    && let Some(connect_cb) = connect_cb {
       connect_listener = Some(connect_cb);
     }
-  }
 
   Ok((port, host, connect_listener, connect_options))
 }
@@ -385,7 +385,7 @@ impl Socket {
       )
     };
 
-    let local_me = v8::Local::new(&scope, &me);
+    let local_me = v8::Local::new(scope, &me);
     let cons = v8::Local::new(scope, &*super_cons.duplex);
     let this = Rc::new(v8::Global::new(scope, local_me));
 
@@ -542,13 +542,11 @@ impl Socket {
         drop(write);
         #[cfg(unix)]
         {
-          if let (Some(read_half), Some(write_half)) = (read_half, write_half) {
-            if let Ok(stream) = read_half.reunite(write_half) {
-              if let Ok(std_stream) = stream.into_std() {
+          if let (Some(read_half), Some(write_half)) = (read_half, write_half)
+            && let Ok(stream) = read_half.reunite(write_half)
+              && let Ok(std_stream) = stream.into_std() {
                 let _ = std_stream.shutdown(std::net::Shutdown::Both);
               }
-            }
-          }
         }
         #[cfg(not(unix))]
         {
@@ -693,7 +691,7 @@ fn encode_string(s: &str, encoding: &str) -> Vec<u8> {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
-  if s.len() % 2 != 0 {
+  if !s.len().is_multiple_of(2) {
     return Err(());
   }
   (0..s.len())
@@ -779,49 +777,47 @@ impl SocketInner {
             inner.emit_func.get(scope).into(),
             v8::Local::new(scope, &*inner.this).into(),
             internalized(scope, "error").into(),
-            error.into(),
+            error,
           ],
         )
         .unwrap();
     });
   }
-  fn connect_inner(
+  async fn connect_inner(
     self: Rc<Self>,
     port: Option<u16>,
     host: Option<String>,
-  ) -> impl Future<Output = Result<(), JsErrorBox>> {
-    async move {
-      *self.host.borrow_mut() =
-        Some(host.unwrap_or_else(|| "localhost".to_string()));
-      *self.port.borrow_mut() = Some(port.unwrap_or(0));
-      let stream = tokio::net::TcpStream::connect((
-        self.host.borrow().as_deref().unwrap(),
-        self.port.borrow().unwrap(),
-      ))
-      .await
-      .map_err(JsErrorBox::from_err);
-      let stream = match stream {
-        Ok(stream) => stream,
-        Err(e) => {
-          self.emit_error_next_tick(e);
-          return Ok(());
-        }
-      };
-      let (read, write) = stream.into_split();
-      *self.write.borrow_mut().await = Some(write);
-      *self.read.borrow_mut().await = Some(read);
-      self.connected.set_connected(true);
-      self.start_read();
-      self.scope_holder.with_scope({
-        let inner = self.clone();
-        move |scope| {
-          let zero = Smi(0u8).to_v8(scope).unwrap();
-          inner.call_method(scope, "read", &[zero]).unwrap();
-          inner.emit_event(scope, &[internalized(scope, "connect").into()]);
-        }
-      });
-      Ok(())
-    }
+  ) -> Result<(), JsErrorBox> {
+    *self.host.borrow_mut() =
+      Some(host.unwrap_or_else(|| "localhost".to_string()));
+    *self.port.borrow_mut() = Some(port.unwrap_or(0));
+    let stream = tokio::net::TcpStream::connect((
+      self.host.borrow().as_deref().unwrap(),
+      self.port.borrow().unwrap(),
+    ))
+    .await
+    .map_err(JsErrorBox::from_err);
+    let stream = match stream {
+      Ok(stream) => stream,
+      Err(e) => {
+        self.emit_error_next_tick(e);
+        return Ok(());
+      }
+    };
+    let (read, write) = stream.into_split();
+    *self.write.borrow_mut().await = Some(write);
+    *self.read.borrow_mut().await = Some(read);
+    self.connected.set_connected(true);
+    self.start_read();
+    self.scope_holder.with_scope({
+      let inner = self.clone();
+      move |scope| {
+        let zero = Smi(0u8).to_v8(scope).unwrap();
+        inner.call_method(scope, "read", &[zero]).unwrap();
+        inner.emit_event(scope, &[internalized(scope, "connect").into()]);
+      }
+    });
+    Ok(())
   }
 
   fn start_read(self: &Rc<Self>) {
@@ -854,7 +850,7 @@ impl SocketInner {
                 let error = JsErrorBox::from_err(e).to_v8(scope).unwrap();
                 inner2.emit_event(
                   scope,
-                  &[internalized(scope, "error").into(), error.into()],
+                  &[internalized(scope, "error").into(), error],
                 );
               });
 
@@ -1151,7 +1147,7 @@ impl OnAccept for SocketCallback {
             allow_half_open: None,
           },
           Some(addr.ip().to_string()),
-          Some(addr.port() as u16),
+          Some(addr.port()),
         );
         match socket {
           Ok(socket) => {
@@ -1535,10 +1531,10 @@ mod tests {
       .run_event_loop(Default::default())
       .await
       .map_err(JsErrorBox::from_err)?;
-    let _ = module.await.map_err(JsErrorBox::from_err)?;
+    module.await.map_err(JsErrorBox::from_err)?;
     let namespace = runtime
       .get_module_namespace_by_name(
-        &specifier.to_string(),
+        specifier.as_ref(),
         RequestedModuleType::None,
       )
       .unwrap();
@@ -1686,8 +1682,8 @@ mod tests {
       .await
       .unwrap();
 
-    let _ = closed_rx.await.unwrap();
-    let _ = closed_rx2.await.unwrap();
+    closed_rx.await.unwrap();
+    closed_rx2.await.unwrap();
   }
 
   #[tokio::test(flavor = "current_thread")]
@@ -1795,7 +1791,7 @@ mod tests {
       .await
       .unwrap();
 
-    let _ = closed_rx.await.unwrap();
+    closed_rx.await.unwrap();
 
     let received = rx.await.expect("server read failed");
     assert_eq!(received, b"hello".to_vec());

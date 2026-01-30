@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { op_set_constructors, op_set_next_tick_func } from "ext:core/ops";
 import {
   processTicksAndRejections,

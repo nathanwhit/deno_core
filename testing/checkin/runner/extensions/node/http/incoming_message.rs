@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use deno_core::{GarbageCollected, OpState, op2, v8};

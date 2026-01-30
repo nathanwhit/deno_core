@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { Server } from "node:net";
 
 const server = new Server();

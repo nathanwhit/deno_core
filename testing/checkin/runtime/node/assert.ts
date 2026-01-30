@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 // Basic assert module implementation
 
 class AssertionError extends Error {

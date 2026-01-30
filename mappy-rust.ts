@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { map2Rust, nop } from "checkin:object";
 
 const start = Date.now();

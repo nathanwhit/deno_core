@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { thingIsString } from "checkin:object";
 const start = performance.now();
 

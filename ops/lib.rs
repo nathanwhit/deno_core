@@ -20,12 +20,12 @@ pub fn op2(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[proc_macro_derive(CppgcInherits, attributes(cppgc_base))]
 pub fn cppgc_inherits(item: TokenStream) -> TokenStream {
-  cppgc::derives_inherits(item.into()).into()
+  cppgc::derives_inherits(item)
 }
 
 #[proc_macro_derive(CppgcBase, attributes(cppgc_inheritors))]
 pub fn cppgc_base(item: TokenStream) -> TokenStream {
-  cppgc::derives_base(item.into()).into()
+  cppgc::derives_base(item)
 }
 
 fn op2_macro(attr: TokenStream, item: TokenStream) -> TokenStream {

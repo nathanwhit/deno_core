@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 use std::{cell::RefCell, rc::Rc};
 
 use deno_core::v8::cppgc::GcCell;

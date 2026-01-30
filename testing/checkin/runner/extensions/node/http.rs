@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 mod incoming_message;
 mod outgoing_message;
 mod response_body;
@@ -474,11 +475,9 @@ impl OnAccept for HttpServerCallback {
         if let Some(io_err) = err
           .source()
           .and_then(|source| source.downcast_ref::<std::io::Error>())
-        {
-          if is_connection_closed(io_err) {
+          && is_connection_closed(io_err) {
             return Ok(());
           }
-        }
         Err(JsErrorBox::generic(format!("hyper error: {err}")))
       }
     }

@@ -100,10 +100,10 @@ fn main() -> Result<(), Error> {
       .unwrap();
 
     deno_core::scope!(scope, &mut js_runtime);
-    let local = v8::Local::new(&scope, object);
+    let local = v8::Local::new(scope, object);
     let func = local
       .get(
-        &scope,
+        scope,
         deno_core::ascii_str!("init")
           .v8_string(scope)
           .unwrap()

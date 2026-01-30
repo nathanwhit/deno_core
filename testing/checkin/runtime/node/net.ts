@@ -1,3 +1,4 @@
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { op_net_connect, Server, Socket } from "ext:core/ops";
 import { Duplex } from "node:stream";
 import { EventEmitter } from "node:events";

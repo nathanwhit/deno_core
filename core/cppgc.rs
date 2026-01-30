@@ -459,9 +459,9 @@ mod tests {
   const fn check<A: Inherits<B>, B: Base>() {}
 
   const _: () = {
-    let _ = check::<Derived, BaseType>();
-    let _ = check::<Derived2, BaseType>();
-    let _ = check::<Derived2, Derived>();
+    check::<Derived, BaseType>();
+    check::<Derived2, BaseType>();
+    check::<Derived2, Derived>();
   };
 
   #[test]
