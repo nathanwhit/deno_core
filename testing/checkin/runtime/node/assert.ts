@@ -11,8 +11,7 @@ class AssertionError extends Error {
     expected?: unknown;
     operator?: string;
   }) {
-    const message =
-      options.message ||
+    const message = options.message ||
       `${options.actual} ${options.operator} ${options.expected}`;
     super(message);
     this.name = "AssertionError";
@@ -36,12 +35,12 @@ function ok(value: unknown, message?: string): asserts value {
 function strictEqual<T>(
   actual: unknown,
   expected: T,
-  message?: string
+  message?: string,
 ): asserts actual is T {
   if (!Object.is(actual, expected)) {
     throw new AssertionError({
-      message:
-        message || `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+      message: message ||
+        `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
       actual,
       expected,
       operator: "===",
@@ -52,7 +51,7 @@ function strictEqual<T>(
 function notStrictEqual(
   actual: unknown,
   expected: unknown,
-  message?: string
+  message?: string,
 ): void {
   if (Object.is(actual, expected)) {
     throw new AssertionError({
@@ -67,7 +66,7 @@ function notStrictEqual(
 function deepStrictEqual(
   actual: unknown,
   expected: unknown,
-  message?: string
+  message?: string,
 ): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new AssertionError({
@@ -89,7 +88,7 @@ function fail(message?: string): never {
 function throws(
   fn: () => void,
   errorOrMessage?: RegExp | Function | string,
-  message?: string
+  message?: string,
 ): void {
   let threw = false;
   try {
@@ -99,7 +98,8 @@ function throws(
     if (typeof errorOrMessage === "function") {
       if (!(e instanceof errorOrMessage)) {
         throw new AssertionError({
-          message: message || `Expected error to be instance of ${errorOrMessage.name}`,
+          message: message ||
+            `Expected error to be instance of ${errorOrMessage.name}`,
           actual: e,
           expected: errorOrMessage,
           operator: "throws",
@@ -136,11 +136,11 @@ const assert = Object.assign(ok, {
 
 export default assert;
 export {
-  ok,
-  strictEqual,
-  notStrictEqual,
+  AssertionError,
   deepStrictEqual,
   fail,
+  notStrictEqual,
+  ok,
+  strictEqual,
   throws,
-  AssertionError,
 };

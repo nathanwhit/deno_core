@@ -1,7 +1,7 @@
 import { op_set_constructors, op_set_next_tick_func } from "ext:core/ops";
 import {
   processTicksAndRejections,
-runNextTicks,
+  runNextTicks,
 } from "ext:checkin_node/next_tick.ts";
 import process from "node:process";
 import { core } from "ext:core/mod.js";

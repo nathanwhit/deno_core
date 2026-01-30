@@ -473,7 +473,8 @@ pub fn signal_cb<'s>(
 pub fn send_cb<'s, T: Send + 'static>(
   scope: &mut v8::PinScope<'s, '_>,
   tx: tokio::sync::oneshot::Sender<T>,
-  f: impl FnMut(&mut v8::PinScope<'_, '_>, v8::FunctionCallbackArguments<'_>) -> T + 'static,
+  f: impl FnMut(&mut v8::PinScope<'_, '_>, v8::FunctionCallbackArguments<'_>) -> T
+  + 'static,
 ) -> v8::Local<'s, v8::Function> {
   js_callback(scope, (Some(tx), f), |scope, (tx, f), args, _| {
     if let Some(tx) = tx.take() {
@@ -490,18 +491,25 @@ pub struct NetTest {
 
 impl NetTest {
   pub fn new() -> Self {
-    let (mut runtime, _) = crate::checkin::runner::create_runtime_without_snapshot(
-      false,
-      None,
-      vec![],
-      deno_core::RuntimeOptions::default(),
-    );
+    let (mut runtime, _) =
+      crate::checkin::runner::create_runtime_without_snapshot(
+        false,
+        None,
+        vec![],
+        deno_core::RuntimeOptions::default(),
+      );
     let socket_cons = import_from(&mut runtime, "node:net", "Socket").unwrap();
-    Self { runtime, socket_cons }
+    Self {
+      runtime,
+      socket_cons,
+    }
   }
 
   /// Create a new Socket and run setup code in a scope
-  pub fn with_socket<R>(&mut self, f: impl FnOnce(&mut v8::PinScope, JsObject) -> R) -> R {
+  pub fn with_socket<R>(
+    &mut self,
+    f: impl FnOnce(&mut v8::PinScope, JsObject) -> R,
+  ) -> R {
     let socket_cons = self.socket_cons.clone();
     self.runtime.with_scope(|scope| {
       let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
@@ -511,7 +519,10 @@ impl NetTest {
   }
 
   /// Run event loop until receiver gets a value or timeout (5 seconds default)
-  pub async fn run_until<T>(&mut self, rx: tokio::sync::oneshot::Receiver<T>) -> Option<T> {
+  pub async fn run_until<T>(
+    &mut self,
+    rx: tokio::sync::oneshot::Receiver<T>,
+  ) -> Option<T> {
     run_until(&mut self.runtime, rx, std::time::Duration::from_secs(5)).await
   }
 }

@@ -634,9 +634,14 @@ Readable.prototype.setEncoding = function (enc) {
   let decoderEncoding = "utf-8";
   if (encoding === "utf8" || encoding === "utf-8") {
     decoderEncoding = "utf-8";
-  } else if (encoding === "utf16le" || encoding === "utf-16le" || encoding === "ucs2" || encoding === "ucs-2") {
+  } else if (
+    encoding === "utf16le" || encoding === "utf-16le" || encoding === "ucs2" ||
+    encoding === "ucs-2"
+  ) {
     decoderEncoding = "utf-16le";
-  } else if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") {
+  } else if (
+    encoding === "latin1" || encoding === "binary" || encoding === "ascii"
+  ) {
     // TextDecoder doesn't support latin1/ascii directly, use windows-1252 as fallback
     // or handle as utf-8 with byte-by-byte conversion
     decoderEncoding = "utf-8";
