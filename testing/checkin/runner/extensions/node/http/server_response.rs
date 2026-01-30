@@ -15,6 +15,7 @@ use hyper::Response;
 use hyper::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use tokio::sync::oneshot;
 
+use crate::checkin::runner::extensions::node::GlobalHandle;
 use crate::checkin::runner::extensions::node::ScopeHolder;
 
 use super::outgoing_message::OutgoingMessage;
@@ -376,7 +377,7 @@ impl ServerResponse {
       (spawner, this)
     };
     let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
-    let context = Rc::new(v8::Global::new(scope, scope.get_current_context()));
+    let context = GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
     ServerResponse {
       base: OutgoingMessage::new_inner(me, scope, op_state),
       status_code: GcCell::new(None),

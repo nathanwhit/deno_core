@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::checkin::runner::extensions::node::GlobalHandle;
 use crate::checkin::runner::extensions::node::JsMethod;
 use crate::checkin::runner::extensions::node::NextTickFunc;
 use crate::checkin::runner::extensions::node::ScopeHolder;
@@ -201,7 +202,7 @@ struct SocketInner {
   scope_holder: ScopeHolder,
   should_read: Rc<ShouldReadState>,
 
-  this: Rc<v8::Global<v8::Object>>,
+  this: GlobalHandle<v8::Object>,
 
   push_func: JsMethod,
   emit_func: JsMethod,
@@ -324,9 +325,10 @@ fn normalize_connect_args<'s>(
   }
 
   if connect_listener.is_none()
-    && let Some(connect_cb) = connect_cb {
-      connect_listener = Some(connect_cb);
-    }
+    && let Some(connect_cb) = connect_cb
+  {
+    connect_listener = Some(connect_cb);
+  }
 
   Ok((port, host, connect_listener, connect_options))
 }
@@ -386,8 +388,8 @@ impl Socket {
     };
 
     let local_me = v8::Local::new(scope, &me);
-    let cons = v8::Local::new(scope, &*super_cons.duplex);
-    let this = Rc::new(v8::Global::new(scope, local_me));
+    let cons = super_cons.duplex.get(scope);
+    let this = GlobalHandle::new(v8::Global::new(scope, local_me));
 
     let duplex_options = DuplexOptions {
       allow_half_open: Some(options.allow_half_open.unwrap_or(false)),
@@ -514,7 +516,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
-        let this = v8::Local::new(scope, &*inner2.this);
+        let this = inner2.this.get(scope);
         call_write_cb(scope, cb.into(), this, result);
       });
     });
@@ -544,9 +546,10 @@ impl Socket {
         {
           if let (Some(read_half), Some(write_half)) = (read_half, write_half)
             && let Ok(stream) = read_half.reunite(write_half)
-              && let Ok(std_stream) = stream.into_std() {
-                let _ = std_stream.shutdown(std::net::Shutdown::Both);
-              }
+            && let Ok(std_stream) = stream.into_std()
+          {
+            let _ = std_stream.shutdown(std::net::Shutdown::Both);
+          }
         }
         #[cfg(not(unix))]
         {
@@ -557,7 +560,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
-        let this = v8::Local::new(scope, &*inner2.this);
+        let this = inner2.this.get(scope);
         let error = v8::Local::new(scope, &error);
         cb.call(scope, this.into(), &[error]).unwrap();
         inner2.emit_event(scope, &[internalized(scope, "close").into()]);
@@ -629,7 +632,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let local_cb = v8::Local::new(scope, &cb);
-        let this = v8::Local::new(scope, &*inner2.this);
+        let this = inner2.this.get(scope);
         call_write_cb(scope, local_cb, this, None);
       });
       return Ok(());
@@ -653,7 +656,7 @@ impl Socket {
       let inner2 = inner.clone();
       inner.scope_holder.with_scope(move |scope| {
         let cb = v8::Local::new(scope, &cb);
-        let this = v8::Local::new(scope, &*inner2.this);
+        let this = inner2.this.get(scope);
         call_write_cb(scope, cb, this, result);
       });
     });
@@ -775,7 +778,7 @@ impl SocketInner {
           v8::null(scope).into(),
           &[
             inner.emit_func.get(scope).into(),
-            v8::Local::new(scope, &*inner.this).into(),
+            inner.this.get(scope).into(),
             internalized(scope, "error").into(),
             error,
           ],
@@ -868,7 +871,7 @@ impl SocketInner {
               let inner = inner.clone();
               move |scope| {
                 v8::tc_scope!(let scope, scope);
-                let this = v8::Local::new(scope, &*this);
+                let this = this.get(scope);
                 let result = inner.push_func.get(scope).call(
                   scope,
                   this.into(),
@@ -896,7 +899,7 @@ impl SocketInner {
           let inner2 = inner.clone();
           inner.scope_holder.with_scope(move |scope| {
             v8::tc_scope!(let scope, scope);
-            let this = v8::Local::new(scope, &*this);
+            let this = this.get(scope);
             let data = Uint8Array(buf);
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
             let result =
@@ -927,7 +930,7 @@ impl GetThis for SocketInner {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Object> {
-    v8::Local::new(scope, &*self.this)
+    self.this.get(scope)
   }
 }
 
@@ -971,10 +974,10 @@ pub(crate) struct ServerInner {
   on_listening: Option<v8::TracedReference<v8::Function>>,
   pub(crate) holder: Rc<ScopeHolder>,
   op_state: Rc<RefCell<OpState>>,
-  this: Rc<v8::Global<v8::Object>>,
+  this: GlobalHandle<v8::Object>,
   pub(crate) ref_tracker: RefTracker,
-  emit_func: Rc<v8::Global<v8::Function>>,
-  on_event_func: Rc<v8::Global<v8::Function>>,
+  emit_func: GlobalHandle<v8::Function>,
+  on_event_func: GlobalHandle<v8::Function>,
   cancel: Rc<CancelHandle>,
 }
 
@@ -1005,19 +1008,20 @@ impl Server {
       .call(scope, v8::Local::new(scope, &me).into(), &[])
       .unwrap();
 
-    let this = Rc::new(v8::Global::new(scope, local_me));
+    let this = GlobalHandle::new(v8::Global::new(scope, local_me));
     let emit = internalized(scope, "emit");
     let emit_func = local_me
       .get(scope, emit.into())
       .unwrap()
       .cast::<v8::Function>();
-    let emit_func = Rc::new(v8::Global::new(scope, emit_func));
+    let emit_func = GlobalHandle::new(v8::Global::new(scope, emit_func));
     let on_event = internalized(scope, "on");
     let on_event_func = local_me
       .get(scope, on_event.into())
       .unwrap()
       .cast::<v8::Function>();
-    let on_event_func = Rc::new(v8::Global::new(scope, on_event_func));
+    let on_event_func =
+      GlobalHandle::new(v8::Global::new(scope, on_event_func));
     Server {
       inner: Rc::new(ServerInner {
         host: RefCell::new(None),
@@ -1357,7 +1361,7 @@ impl GetThis for ServerInner {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Object> {
-    v8::Local::new(scope, &*self.this)
+    self.this.get(scope)
   }
 }
 
@@ -1366,13 +1370,13 @@ impl EventEmitter for ServerInner {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.emit_func)
+    self.emit_func.get(scope)
   }
   fn cached_on_event_func<'s>(
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.on_event_func)
+    self.on_event_func.get(scope)
   }
 }
 

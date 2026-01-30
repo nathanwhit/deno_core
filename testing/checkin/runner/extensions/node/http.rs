@@ -32,6 +32,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::sync::oneshot;
 
+use super::GlobalHandle;
 use super::net::Server;
 use super::net::{EventEmitter, OnAccept, ServerInner};
 
@@ -160,8 +161,8 @@ fn is_connection_closed(err: &std::io::Error) -> bool {
 
 async fn push_chunk_with_backpressure(
   inner: &Rc<ServerInner>,
-  req_handle: &Rc<v8::Global<v8::Object>>,
-  push_handle: &Rc<v8::Global<v8::Function>>,
+  req_handle: &GlobalHandle<v8::Object>,
+  push_handle: &GlobalHandle<v8::Function>,
   data: Vec<u8>,
 ) -> bool {
   if data.is_empty() {
@@ -173,8 +174,8 @@ async fn push_chunk_with_backpressure(
   let push_handle = push_handle.clone();
   inner.with_scope(move |scope| {
     v8::tc_scope!(let scope, scope);
-    let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
-    let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
+    let req_obj = req_handle.get(scope);
+    let push = push_handle.get(scope);
     let data = Uint8Array(data);
     let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
     let result = push.call(scope, req_obj.into(), &[arg]);
@@ -201,15 +202,15 @@ fn internalized<'a>(
 
 fn finish_request(
   inner: Rc<ServerInner>,
-  req_handle: Rc<v8::Global<v8::Object>>,
-  push_handle: Rc<v8::Global<v8::Function>>,
+  req_handle: GlobalHandle<v8::Object>,
+  push_handle: GlobalHandle<v8::Function>,
   mark_complete: bool,
   aborted: bool,
 ) {
   inner.with_scope(move |scope| {
     v8::tc_scope!(let scope, scope);
-    let req_obj = v8::Local::<v8::Object>::new(scope, &*req_handle);
-    let push = v8::Local::<v8::Function>::new(scope, &*push_handle);
+    let req_obj = req_handle.get(scope);
+    let push = push_handle.get(scope);
 
     if mark_complete || aborted {
       if let Some(req_obj) = deno_core::cppgc::try_unwrap_cppgc_object::<
@@ -255,7 +256,7 @@ fn init_request_objects(
   response_tx_slot: ResponseTxSlot,
   should_close: bool,
   socket_state: Rc<LazySocket>,
-) -> Option<(Rc<v8::Global<v8::Object>>, Rc<v8::Global<v8::Function>>)> {
+) -> Option<(GlobalHandle<v8::Object>, GlobalHandle<v8::Function>)> {
   let request_parts = RequestParts {
     method: parts.method,
     uri: parts.uri,
@@ -328,15 +329,18 @@ fn init_request_objects(
 
   let req_handle = req_slot.borrow_mut().take()?;
   let push_handle = push_slot.borrow_mut().take()?;
-  Some((Rc::new(req_handle), Rc::new(push_handle)))
+  Some((
+    GlobalHandle::new(req_handle),
+    GlobalHandle::new(push_handle),
+  ))
 }
 
 fn spawn_request_body_stream(
   inner: Rc<ServerInner>,
   body: hyper::body::Incoming,
   should_read: Rc<ShouldReadState>,
-  req_handle: Rc<v8::Global<v8::Object>>,
-  push_handle: Rc<v8::Global<v8::Function>>,
+  req_handle: GlobalHandle<v8::Object>,
+  push_handle: GlobalHandle<v8::Function>,
 ) {
   deno_core::unsync::spawn(async move {
     let mut body_stream = BodyDataStream::new(body);
@@ -475,9 +479,10 @@ impl OnAccept for HttpServerCallback {
         if let Some(io_err) = err
           .source()
           .and_then(|source| source.downcast_ref::<std::io::Error>())
-          && is_connection_closed(io_err) {
-            return Ok(());
-          }
+          && is_connection_closed(io_err)
+        {
+          return Ok(());
+        }
         Err(JsErrorBox::generic(format!("hyper error: {err}")))
       }
     }

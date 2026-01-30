@@ -2,6 +2,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use super::GlobalHandle;
 use super::internalized;
 use deno_core::GarbageCollected;
 use deno_core::JsRuntime;
@@ -173,7 +174,7 @@ pub fn js_callback<
 
 #[derive(Clone)]
 pub struct JsObject {
-  obj: Rc<v8::Global<v8::Object>>,
+  obj: GlobalHandle<v8::Object>,
 }
 
 impl JsObject {
@@ -188,7 +189,7 @@ impl JsObject {
 
   pub fn new(scope: &v8::PinScope, obj: v8::Local<v8::Object>) -> Self {
     Self {
-      obj: Rc::new(v8::Global::new(scope, obj)),
+      obj: GlobalHandle::new(v8::Global::new(scope, obj)),
     }
   }
 
@@ -198,7 +199,7 @@ impl JsObject {
     scope: &v8::PinScope<'s, '_>,
     name: &str,
   ) -> v8::Local<'s, v8::Value> {
-    v8::Local::new(scope, &*self.obj)
+    self.obj.get(scope)
       .get(scope, internalized(scope, name).into())
       .unwrap()
   }
@@ -209,7 +210,7 @@ impl JsObject {
     name: &str,
     args: impl ToArgs<'s>,
   ) -> v8::Local<'s, v8::Value> {
-    let local_obj = v8::Local::new(scope, &*self.obj);
+    let local_obj = self.obj.get(scope);
     let args = args.to_args(scope);
     local_obj
       .get(scope, internalized(scope, name).into())

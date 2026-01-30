@@ -11,10 +11,10 @@ use std::rc::Rc;
 
 #[derive(Clone)]
 pub struct Constructors {
-  duplex: Rc<v8::Global<v8::Function>>,
-  event_emitter: Rc<v8::Global<v8::Function>>,
-  readable: Rc<v8::Global<v8::Function>>,
-  writable: Rc<v8::Global<v8::Function>>,
+  duplex: GlobalHandle<v8::Function>,
+  event_emitter: GlobalHandle<v8::Function>,
+  readable: GlobalHandle<v8::Function>,
+  writable: GlobalHandle<v8::Function>,
 }
 
 impl Constructors {
@@ -22,7 +22,7 @@ impl Constructors {
     &self,
     scope: &v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.event_emitter)
+    self.event_emitter.get(scope)
   }
 
   // fn duplex<'s>(
@@ -36,14 +36,14 @@ impl Constructors {
     &self,
     scope: &v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.readable)
+    self.readable.get(scope)
   }
 
   fn writable<'s>(
     &self,
     scope: &v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.writable)
+    self.writable.get(scope)
   }
 }
 
@@ -56,10 +56,10 @@ pub fn op_set_constructors(
   #[global] writable_constructor: v8::Global<v8::Function>,
 ) {
   op_state.put(Constructors {
-    duplex: Rc::new(duplex_constructor),
-    event_emitter: Rc::new(event_emitter_constructor),
-    readable: Rc::new(readable_constructor),
-    writable: Rc::new(writable_constructor),
+    duplex: GlobalHandle::new(duplex_constructor),
+    event_emitter: GlobalHandle::new(event_emitter_constructor),
+    readable: GlobalHandle::new(readable_constructor),
+    writable: GlobalHandle::new(writable_constructor),
   });
 }
 
@@ -69,13 +69,13 @@ pub fn op_set_next_tick_func(
   #[global] func: v8::Global<v8::Function>,
 ) {
   op_state.put(NextTickFunc {
-    func: Rc::new(func),
+    func: GlobalHandle::new(func),
   });
 }
 
 #[derive(Clone)]
 pub struct NextTickFunc {
-  func: Rc<v8::Global<v8::Function>>,
+  func: GlobalHandle<v8::Function>,
 }
 
 impl NextTickFunc {
@@ -83,21 +83,21 @@ impl NextTickFunc {
     &self,
     scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.func)
+    self.func.get(scope)
   }
 }
 
 pub struct ScopeHolder {
   spawner: deno_core::V8TaskSpawner,
   isolate_ptr: v8::UnsafeRawIsolatePtr,
-  context: Rc<v8::Global<v8::Context>>,
+  context: GlobalHandle<v8::Context>,
 }
 
 impl ScopeHolder {
   pub fn new(
     spawner: deno_core::V8TaskSpawner,
     isolate_ptr: v8::UnsafeRawIsolatePtr,
-    context: Rc<v8::Global<v8::Context>>,
+    context: GlobalHandle<v8::Context>,
   ) -> Self {
     ScopeHolder {
       spawner,
@@ -111,7 +111,8 @@ impl ScopeHolder {
     scope: &mut v8::PinScope,
   ) -> Self {
     let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
-    let context = Rc::new(v8::Global::new(scope, scope.get_current_context()));
+    let context =
+      GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
     Self::new(spawner, isolate_ptr, context)
   }
 
@@ -129,21 +130,21 @@ impl ScopeHolder {
     let mut isolate =
       unsafe { v8::Isolate::from_raw_isolate_ptr(self.isolate_ptr) };
     v8::scope!(let scope, &mut isolate);
-    let context = v8::Local::new(scope, &*self.context);
+    let context = self.context.get(scope);
     let scope = &mut v8::ContextScope::new(scope, context);
     f(scope)
   }
 }
 
 pub struct JsMethod {
-  function: Rc<v8::Global<v8::Function>>,
+  function: GlobalHandle<v8::Function>,
 }
 
 impl JsMethod {
   #[allow(unused)]
   pub fn new(function: v8::Global<v8::Function>) -> Self {
     JsMethod {
-      function: Rc::new(function),
+      function: GlobalHandle::new(function),
     }
   }
 
@@ -153,7 +154,7 @@ impl JsMethod {
     name: &str,
   ) -> Self {
     JsMethod {
-      function: Rc::new(v8::Global::new(
+      function: GlobalHandle::new(v8::Global::new(
         scope,
         object
           .get(scope, internalized(scope, name).into())
@@ -167,7 +168,7 @@ impl JsMethod {
     &self,
     scope: &v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Function> {
-    v8::Local::new(scope, &*self.function)
+    self.function.get(scope)
   }
 }
 
@@ -181,6 +182,41 @@ pub fn internalized<'a>(
     v8::NewStringType::Internalized,
   )
   .unwrap()
+}
+
+pub struct GlobalHandle<T> {
+  handle: Rc<v8::Global<T>>,
+}
+
+impl<T> Clone for GlobalHandle<T> {
+  fn clone(&self) -> Self {
+    Self {
+      handle: self.handle.clone(),
+    }
+  }
+}
+
+impl<T> GlobalHandle<T> {
+  pub fn new(handle: v8::Global<T>) -> Self {
+    GlobalHandle {
+      handle: Rc::new(handle),
+    }
+  }
+}
+
+impl<T> From<v8::Global<T>> for GlobalHandle<T> {
+  fn from(handle: v8::Global<T>) -> Self {
+    GlobalHandle::new(handle)
+  }
+}
+
+impl<T> GlobalHandle<T>
+where
+  v8::Global<T>: v8::Handle<Data = T>,
+{
+  pub fn get<'s>(&self, scope: &v8::PinScope<'s, '_, ()>) -> v8::Local<'s, T> {
+    v8::Local::new(scope, &*self.handle)
+  }
 }
 
 deno_core::extension!(
