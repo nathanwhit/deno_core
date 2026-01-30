@@ -1383,6 +1383,7 @@ impl EventEmitter for ServerInner {
 mod tests {
   use std::cell::Cell;
 
+  use deno_core::{serde_json::json, serde_v8};
   use tokio::sync::oneshot;
 
   use crate::checkin::runner::extensions::node::test_utils::{
@@ -1501,12 +1502,17 @@ mod tests {
       import_from(&mut test.runtime, "node:net", "Socket").unwrap();
 
     test.runtime.with_scope(|scope| {
-      let options = v8::Object::new(scope);
-      let key = internalized(scope, "allowHalfOpen");
-      options.set(scope, key.into(), v8::Boolean::new(scope, true).into());
-
-      let cons = v8::Local::new(scope, &socket_cons).cast::<v8::Function>();
-      let _socket = JsObject::construct(scope, cons, (options,));
+      v8::tc_scope!(let tc, scope);
+      let options = serde_v8::to_v8(
+        tc,
+        json!({
+          "allowHalfOpen": true,
+        }),
+      )
+      .unwrap();
+      let cons = v8::Local::new(tc, &socket_cons).cast::<v8::Function>();
+      let _socket = JsObject::construct(tc, cons, (options,));
+      assert!(!tc.has_caught());
       // Test passes if no error was thrown during construction
     });
   }

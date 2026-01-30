@@ -1,5 +1,6 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 use std::cell::RefCell;
+use std::pin::pin;
 use std::rc::Rc;
 
 use super::GlobalHandle;
@@ -313,9 +314,11 @@ impl HttpTestServer {
       server.call(scope, "listen", (port as i32, "127.0.0.1", listen_cb));
     });
 
+    let mut run_event_loop =
+      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
     // Run event loop until server is listening
     tokio::select! {
-      _ = runtime.run_event_loop(PollEventLoopOptions::default()) => {}
+      _ = &mut run_event_loop => {}
       _ = listening_rx => {}
     }
 
@@ -382,9 +385,11 @@ impl HttpTestServer {
       server.call(scope, "listen", (port as i32, "127.0.0.1", listen_cb));
     });
 
+    let mut run_event_loop =
+      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
     // Run event loop until server is listening
     tokio::select! {
-      _ = runtime.run_event_loop(PollEventLoopOptions::default()) => {}
+      _ = &mut run_event_loop => {}
       _ = listening_rx => {}
     }
 
@@ -439,8 +444,6 @@ pub async fn run_until<T>(
   fut: impl IntoFuture<Output = Option<T>>,
   timeout: std::time::Duration,
 ) -> Option<T> {
-  use std::pin::pin;
-
   let mut event_loop =
     pin!(runtime.run_event_loop(deno_core::PollEventLoopOptions::default()));
   let mut fut = pin!(fut.into_future());
