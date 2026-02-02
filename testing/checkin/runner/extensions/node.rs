@@ -7,6 +7,7 @@ mod test_utils;
 use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -184,8 +185,24 @@ pub fn internalized<'a>(
   .unwrap()
 }
 
+pub enum MaybeWeak<T> {
+  Weak(v8::Weak<T>),
+  Strong(v8::Global<T>),
+}
+impl<T> MaybeWeak<T> {
+  pub fn get<'s>(
+    &self,
+    scope: &v8::PinScope<'s, '_, ()>,
+  ) -> Option<v8::Local<'s, T>> {
+    match self {
+      MaybeWeak::Weak(weak) => weak.to_local(scope),
+      MaybeWeak::Strong(strong) => Some(v8::Local::new(scope, &*strong)),
+    }
+  }
+}
+
 pub struct GlobalHandle<T> {
-  handle: Rc<v8::Global<T>>,
+  handle: Rc<RefCell<MaybeWeak<T>>>,
 }
 
 impl<T> Clone for GlobalHandle<T> {
@@ -199,7 +216,7 @@ impl<T> Clone for GlobalHandle<T> {
 impl<T> GlobalHandle<T> {
   pub fn new(handle: v8::Global<T>) -> Self {
     GlobalHandle {
-      handle: Rc::new(handle),
+      handle: Rc::new(RefCell::new(MaybeWeak::Strong(handle))),
     }
   }
 }
@@ -215,7 +232,21 @@ where
   v8::Global<T>: v8::Handle<Data = T>,
 {
   pub fn get<'s>(&self, scope: &v8::PinScope<'s, '_, ()>) -> v8::Local<'s, T> {
-    v8::Local::new(scope, &*self.handle)
+    self.handle.borrow().get(scope).unwrap()
+  }
+
+  pub fn maybe_get<'s>(
+    &self,
+    scope: &v8::PinScope<'s, '_, ()>,
+  ) -> Option<v8::Local<'s, T>> {
+    self.handle.borrow().get(scope)
+  }
+
+  pub fn make_weak(&self, scope: &mut v8::PinScope) {
+    let Some(local) = self.maybe_get(scope) else {
+      return;
+    };
+    *self.handle.borrow_mut() = MaybeWeak::Weak(v8::Weak::new(scope, local));
   }
 }
 

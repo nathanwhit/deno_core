@@ -564,6 +564,7 @@ impl Socket {
         let error = v8::Local::new(scope, &error);
         cb.call(scope, this.into(), &[error]).unwrap();
         inner2.emit_event(scope, &[internalized(scope, "close").into()]);
+        inner2.this.make_weak(scope);
       });
       inner.ref_tracker.unref();
     });
@@ -828,11 +829,9 @@ impl SocketInner {
       return;
     }
     let inner = self.clone();
-    let this = inner.this.clone();
     deno_core::unsync::spawn(async move {
       inner.connected.wait_for_connected().await;
 
-      let this = this.clone();
       let mut read = inner.read.borrow_mut().await;
       let read = read.deref_mut().as_mut().unwrap();
 
@@ -866,12 +865,11 @@ impl SocketInner {
         if nread == 0 {
           // Push EOF (null)
           {
-            let this = this.clone();
             inner.scope_holder.with_scope({
               let inner = inner.clone();
               move |scope| {
                 v8::tc_scope!(let scope, scope);
-                let this = this.get(scope);
+                let this = inner.this.get(scope);
                 let result = inner.push_func.get(scope).call(
                   scope,
                   this.into(),
@@ -894,12 +892,11 @@ impl SocketInner {
         }
 
         if nread > 0 {
-          let this = this.clone();
           let buf = buf[..nread].to_vec();
           let inner2 = inner.clone();
           inner.scope_holder.with_scope(move |scope| {
             v8::tc_scope!(let scope, scope);
-            let this = this.get(scope);
+            let this = inner2.this.get(scope);
             let data = Uint8Array(buf);
             let arg = data.to_v8(scope).map_err(JsErrorBox::from_err).unwrap();
             let result =
