@@ -370,12 +370,10 @@ impl ServerResponse {
     close_after_response: bool,
     socket_state: Option<Rc<LazySocket>>,
   ) -> ServerResponse {
-    let (spawner, this) = {
-      let op_state = op_state.borrow();
-      let spawner = op_state.borrow::<deno_core::V8TaskSpawner>().clone();
+    let this = {
       let local_me = v8::Local::new(scope, &me);
       let this = Rc::new(v8::TracedReference::new(scope, local_me));
-      (spawner, this)
+      this
     };
     let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
     let context =
@@ -387,7 +385,7 @@ impl ServerResponse {
       response_tx_slot,
       body_handle: RefCell::new(body_handle),
       socket_state: RefCell::new(socket_state),
-      scope_holder: Rc::new(ScopeHolder::new(spawner, isolate_ptr, context)),
+      scope_holder: Rc::new(ScopeHolder::new(isolate_ptr, context)),
       this,
       close_after_response,
     }

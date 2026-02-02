@@ -89,39 +89,26 @@ impl NextTickFunc {
 }
 
 pub struct ScopeHolder {
-  spawner: deno_core::V8TaskSpawner,
   isolate_ptr: v8::UnsafeRawIsolatePtr,
   context: GlobalHandle<v8::Context>,
 }
 
 impl ScopeHolder {
   pub fn new(
-    spawner: deno_core::V8TaskSpawner,
     isolate_ptr: v8::UnsafeRawIsolatePtr,
     context: GlobalHandle<v8::Context>,
   ) -> Self {
     ScopeHolder {
-      spawner,
       isolate_ptr,
       context,
     }
   }
 
-  pub fn new_from_scope(
-    spawner: deno_core::V8TaskSpawner,
-    scope: &mut v8::PinScope,
-  ) -> Self {
+  pub fn new_from_scope(scope: &mut v8::PinScope) -> Self {
     let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
     let context =
       GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
-    Self::new(spawner, isolate_ptr, context)
-  }
-
-  pub fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
-    self.spawner.spawn(move |scope| {
-      v8::tc_scope!(let scope, scope);
-      f(scope);
-    })
+    Self::new(isolate_ptr, context)
   }
 
   pub fn with_scope_immediately<R>(

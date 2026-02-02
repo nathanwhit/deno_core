@@ -172,7 +172,7 @@ async fn push_chunk_with_backpressure(
   let inner = inner.clone();
   let req_handle = req_handle.clone();
   let push_handle = push_handle.clone();
-  inner.with_scope(move |scope| {
+  inner.with_scope_immediately(move |scope| {
     v8::tc_scope!(let scope, scope);
     let req_obj = req_handle.get(scope);
     let push = push_handle.get(scope);
@@ -207,7 +207,7 @@ fn finish_request(
   mark_complete: bool,
   aborted: bool,
 ) {
-  inner.with_scope(move |scope| {
+  inner.with_scope_immediately(move |scope| {
     v8::tc_scope!(let scope, scope);
     let req_obj = req_handle.get(scope);
     let push = push_handle.get(scope);

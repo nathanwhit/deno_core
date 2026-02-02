@@ -378,12 +378,11 @@ impl Socket {
     host: Option<String>,
     port: Option<u16>,
   ) -> Result<Socket, JsErrorBox> {
-    let (ops_tracker, super_cons, spawner, next_tick_func) = {
+    let (ops_tracker, super_cons, next_tick_func) = {
       let op_state = op_state.borrow();
       (
         op_state.external_ops_tracker.clone(),
         op_state.borrow::<Constructors>().clone(),
-        op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
         op_state.borrow::<NextTickFunc>().clone(),
       )
     };
@@ -406,7 +405,7 @@ impl Socket {
     let push_func = JsMethod::capture(scope, local_me, "push");
     let emit_func = JsMethod::capture(scope, local_me, "emit");
     let on_event_func = JsMethod::capture(scope, local_me, "on");
-    let scope_holder = ScopeHolder::new_from_scope(spawner, scope);
+    let scope_holder = ScopeHolder::new_from_scope(scope);
 
     let cb = Socket {
       inner: Rc::new(SocketInner {
@@ -515,7 +514,7 @@ impl Socket {
       let write = write.deref_mut().as_mut().unwrap();
       let result = write.shutdown().await.map_err(JsErrorBox::from_err).err();
       let inner2 = inner.clone();
-      inner.scope_holder.with_scope(move |scope| {
+      inner.scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = inner2.this.get(scope);
         call_write_cb(scope, cb.into(), this, result);
@@ -559,7 +558,7 @@ impl Socket {
         }
       }
       let inner2 = inner.clone();
-      inner.scope_holder.with_scope(move |scope| {
+      inner.scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = inner2.this.get(scope);
         let error = v8::Local::new(scope, &error);
@@ -643,7 +642,7 @@ impl Socket {
 
     if num_wrote >= bytes.len() {
       let inner2 = inner.clone();
-      inner.scope_holder.with_scope(move |scope| {
+      inner.scope_holder.with_scope_immediately(move |scope| {
         let local_cb = v8::Local::new(scope, &cb);
         let this = inner2.this.get(scope);
         call_write_cb(scope, local_cb, this, None);
@@ -667,7 +666,7 @@ impl Socket {
         .err();
 
       let inner2 = inner.clone();
-      inner.scope_holder.with_scope(move |scope| {
+      inner.scope_holder.with_scope_immediately(move |scope| {
         let cb = v8::Local::new(scope, &cb);
         let this = inner2.this.get(scope);
         call_write_cb(scope, cb, this, result);
@@ -796,7 +795,7 @@ fn call_write_cb(
 impl SocketInner {
   fn emit_error_next_tick(self: &Rc<Self>, error: JsErrorBox) {
     let inner = self.clone();
-    self.scope_holder.with_scope(move |scope| {
+    self.scope_holder.with_scope_immediately(move |scope| {
       let error = error.to_v8(scope).unwrap();
       let next_tick_func = inner.next_tick_func.clone();
       next_tick_func
@@ -840,7 +839,7 @@ impl SocketInner {
     *self.read.borrow_mut().await = Some(read);
     self.connected.set_connected(true);
     self.start_read();
-    self.scope_holder.with_scope({
+    self.scope_holder.with_scope_immediately({
       let inner = self.clone();
       move |scope| {
         let zero = Smi(0u8).to_v8(scope).unwrap();
@@ -875,7 +874,7 @@ impl SocketInner {
             Ok(Err(e)) => {
               eprintln!("error reading: {:?}", e);
               let inner2 = inner.clone();
-              inner.scope_holder.with_scope(move |scope| {
+              inner.scope_holder.with_scope_immediately(move |scope| {
                 let error = JsErrorBox::from_err(e).to_v8(scope).unwrap();
                 inner2.emit_event(
                   scope,
@@ -892,7 +891,7 @@ impl SocketInner {
         if nread == 0 {
           // Push EOF (null)
           {
-            inner.scope_holder.with_scope({
+            inner.scope_holder.with_scope_immediately({
               let inner = inner.clone();
               move |scope| {
                 v8::tc_scope!(let scope, scope);
@@ -921,7 +920,7 @@ impl SocketInner {
         if nread > 0 {
           let buf = buf[..nread].to_vec();
           let inner2 = inner.clone();
-          inner.scope_holder.with_scope(move |scope| {
+          inner.scope_holder.with_scope_immediately(move |scope| {
             v8::tc_scope!(let scope, scope);
             let this = inner2.this.get(scope);
             let data = Uint8Array(buf);
@@ -1016,16 +1015,15 @@ impl Server {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> Server {
-    let (ops_tracker, super_cons, spawner) = {
+    let (ops_tracker, super_cons) = {
       let op_state = op_state.borrow();
       (
         op_state.external_ops_tracker.clone(),
         op_state.borrow::<Constructors>().clone(),
-        op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
       )
     };
     let local_me = v8::Local::new(scope, &me);
-    let holder = ScopeHolder::new_from_scope(spawner, scope);
+    let holder = ScopeHolder::new_from_scope(scope);
     super_cons
       .event_emitter(scope)
       .call(scope, v8::Local::new(scope, &me).into(), &[])
@@ -1063,10 +1061,6 @@ impl Server {
 }
 
 impl ServerInner {
-  pub(crate) fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
-    self.holder.with_scope(f);
-  }
-
   pub(crate) fn with_scope_immediately(
     &self,
     f: impl FnOnce(&mut v8::PinScope),
@@ -1162,7 +1156,7 @@ impl OnAccept for SocketCallback {
     stream: tokio::net::TcpStream,
     addr: std::net::SocketAddr,
   ) -> Result<(), JsErrorBox> {
-    inner.holder.with_scope({
+    inner.holder.with_scope_immediately({
       let inner = inner.clone();
       move |scope| {
         let empty = deno_core::cppgc::make_cppgc_empty_object::<Socket>(scope);
@@ -1189,7 +1183,7 @@ impl OnAccept for SocketCallback {
             let zero = Smi(0u8).to_v8(scope).unwrap();
             socket_inner.call_method(scope, "read", &[zero]).unwrap();
             socket_inner.start_read();
-            inner.holder.with_scope({
+            inner.holder.with_scope_immediately({
               let inner = inner.clone();
               move |scope| {
                 let socket_obj = v8::Local::new(scope, socket_obj);
@@ -1226,7 +1220,7 @@ impl ServerInner {
       let addr = listener.local_addr().unwrap();
       *inner.port.borrow_mut() = Some(addr.port());
       *inner.host.borrow_mut() = Some(addr.ip().to_string());
-      inner.holder.with_scope({
+      inner.holder.with_scope_immediately({
         let inner = inner.clone();
         move |scope| {
           inner.emit_event(scope, &[internalized(scope, "listening").into()]);
@@ -1250,7 +1244,7 @@ impl ServerInner {
           }
           Err(deno_core::Canceled) => {
             // Server was closed
-            inner.holder.with_scope({
+            inner.holder.with_scope_immediately({
               let inner = inner.clone();
               move |scope| {
                 inner.emit_event(scope, &[internalized(scope, "close").into()]);
