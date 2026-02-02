@@ -11,6 +11,7 @@ use deno_core::convert::Uint8Array;
 use deno_core::error::JsError;
 use deno_core::op2;
 use deno_core::serde;
+use deno_core::serde_v8::V8Slice;
 use deno_core::v8;
 use deno_core::v8::cppgc::Traced;
 use deno_error::JsErrorBox;
@@ -582,7 +583,7 @@ impl Socket {
     let inner = self.inner.clone();
 
     // Convert data to bytes based on type and encoding
-    let bytes: Vec<u8> = if let Ok(str_val) = data.try_cast::<v8::String>() {
+    let bytes: JsBytes = if let Ok(str_val) = data.try_cast::<v8::String>() {
       // It's a string - encode based on encoding parameter
       let encoding_str = if encoding.is_string() {
         encoding
@@ -594,24 +595,35 @@ impl Socket {
       };
 
       let rust_str = str_val.to_rust_string_lossy(scope);
-      encode_string(&rust_str, &encoding_str)
+      JsBytes::Vec(encode_string(&rust_str, &encoding_str))
     } else if let Ok(array_buffer_view) = data.try_cast::<v8::ArrayBufferView>()
     {
+      let store = array_buffer_view.get_backing_store().unwrap();
+      let offset = array_buffer_view.byte_offset();
+      let length = array_buffer_view.byte_length();
+      let slice = unsafe {
+        deno_core::serde_v8::V8Slice::from_parts(
+          store,
+          offset..(offset + length),
+        )
+      };
       // It's a TypedArray or DataView
-      let len = array_buffer_view.byte_length();
-      let mut buf = vec![0u8; len];
-      array_buffer_view.copy_contents(&mut buf);
-      buf
+      JsBytes::Ref(slice)
     } else if let Ok(array_buffer) = data.try_cast::<v8::ArrayBuffer>() {
       // It's an ArrayBuffer
       let backing_store = array_buffer.get_backing_store();
-      backing_store.iter().map(|c| c.get()).collect()
+      unsafe {
+        JsBytes::Ref(V8Slice::from_parts(
+          backing_store,
+          0..array_buffer.byte_length(),
+        ))
+      }
     } else {
       // Fallback: try to convert to string
       let str_val = data.to_string(scope).ok_or_else(|| {
         JsErrorBox::generic("Failed to convert data to string")
       })?;
-      str_val.to_rust_string_lossy(scope).into_bytes()
+      JsBytes::Vec(str_val.to_rust_string_lossy(scope).into_bytes())
     };
 
     let num_wrote = if let Some(mut write) = inner.write.try_borrow_mut() {
@@ -663,6 +675,21 @@ impl Socket {
     });
 
     Ok(())
+  }
+}
+
+enum JsBytes {
+  Vec(Vec<u8>),
+  Ref(V8Slice<u8>),
+}
+
+impl std::ops::Deref for JsBytes {
+  type Target = [u8];
+  fn deref(&self) -> &[u8] {
+    match self {
+      JsBytes::Vec(v) => v,
+      JsBytes::Ref(v) => &*v,
+    }
   }
 }
 
