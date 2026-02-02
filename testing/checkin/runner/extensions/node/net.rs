@@ -378,12 +378,13 @@ impl Socket {
     host: Option<String>,
     port: Option<u16>,
   ) -> Result<Socket, JsErrorBox> {
-    let (ops_tracker, super_cons, next_tick_func) = {
+    let (ops_tracker, super_cons, next_tick_func, spawner) = {
       let op_state = op_state.borrow();
       (
         op_state.external_ops_tracker.clone(),
         op_state.borrow::<Constructors>().clone(),
         op_state.borrow::<NextTickFunc>().clone(),
+        op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
       )
     };
 
@@ -405,7 +406,7 @@ impl Socket {
     let push_func = JsMethod::capture(scope, local_me, "push");
     let emit_func = JsMethod::capture(scope, local_me, "emit");
     let on_event_func = JsMethod::capture(scope, local_me, "on");
-    let scope_holder = ScopeHolder::new_from_scope(scope);
+    let scope_holder = ScopeHolder::new_from_scope(scope, spawner);
 
     let cb = Socket {
       inner: Rc::new(SocketInner {
@@ -1000,7 +1001,7 @@ pub(crate) struct ServerInner {
   pub(crate) ref_tracker: RefTracker,
   emit_func: GlobalHandle<v8::Function>,
   on_event_func: GlobalHandle<v8::Function>,
-  cancel: Rc<CancelHandle>,
+  pub(crate) cancel: Rc<CancelHandle>,
 }
 
 #[derive(deno_core::ToV8)]
@@ -1015,15 +1016,16 @@ impl Server {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> Server {
-    let (ops_tracker, super_cons) = {
+    let (ops_tracker, super_cons, spawner) = {
       let op_state = op_state.borrow();
       (
         op_state.external_ops_tracker.clone(),
         op_state.borrow::<Constructors>().clone(),
+        op_state.borrow::<deno_core::V8TaskSpawner>().clone(),
       )
     };
     let local_me = v8::Local::new(scope, &me);
-    let holder = ScopeHolder::new_from_scope(scope);
+    let holder = ScopeHolder::new_from_scope(scope, spawner);
     super_cons
       .event_emitter(scope)
       .call(scope, v8::Local::new(scope, &me).into(), &[])
@@ -1061,6 +1063,10 @@ impl Server {
 }
 
 impl ServerInner {
+  pub(crate) fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
+    self.holder.with_scope(f);
+  }
+
   pub(crate) fn with_scope_immediately(
     &self,
     f: impl FnOnce(&mut v8::PinScope),

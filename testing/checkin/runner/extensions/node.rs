@@ -91,24 +91,34 @@ impl NextTickFunc {
 pub struct ScopeHolder {
   isolate_ptr: v8::UnsafeRawIsolatePtr,
   context: GlobalHandle<v8::Context>,
+  spawner: deno_core::V8TaskSpawner,
 }
 
 impl ScopeHolder {
   pub fn new(
     isolate_ptr: v8::UnsafeRawIsolatePtr,
     context: GlobalHandle<v8::Context>,
+    spawner: deno_core::V8TaskSpawner,
   ) -> Self {
     ScopeHolder {
       isolate_ptr,
       context,
+      spawner,
     }
   }
 
-  pub fn new_from_scope(scope: &mut v8::PinScope) -> Self {
+  pub fn new_from_scope(
+    scope: &mut v8::PinScope,
+    spawner: deno_core::V8TaskSpawner,
+  ) -> Self {
     let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
     let context =
       GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
-    Self::new(isolate_ptr, context)
+    Self::new(isolate_ptr, context, spawner)
+  }
+
+  pub fn with_scope(&self, f: impl FnOnce(&mut v8::PinScope) + 'static) {
+    self.spawner.spawn(f);
   }
 
   pub fn with_scope_immediately<R>(
@@ -206,6 +216,12 @@ impl<T> GlobalHandle<T> {
       handle: Rc::new(RefCell::new(MaybeWeak::Strong(handle))),
     }
   }
+
+  pub fn new_weak(handle: v8::Weak<T>) -> Self {
+    GlobalHandle {
+      handle: Rc::new(RefCell::new(MaybeWeak::Weak(handle))),
+    }
+  }
 }
 
 impl<T> From<v8::Global<T>> for GlobalHandle<T> {
@@ -233,7 +249,22 @@ where
     let Some(local) = self.maybe_get(scope) else {
       return;
     };
-    *self.handle.borrow_mut() = MaybeWeak::Weak(v8::Weak::new(scope, local));
+    let mut handle = self.handle.borrow_mut();
+    if matches!(*handle, MaybeWeak::Strong(_)) {
+      return;
+    }
+    *handle = MaybeWeak::Weak(v8::Weak::new(scope, local));
+  }
+
+  pub fn make_strong(&self, scope: &mut v8::PinScope) {
+    let Some(local) = self.maybe_get(scope) else {
+      return;
+    };
+    let mut handle = self.handle.borrow_mut();
+    if matches!(*handle, MaybeWeak::Weak(_)) {
+      return;
+    }
+    *handle = MaybeWeak::Strong(v8::Global::new(scope, local));
   }
 }
 

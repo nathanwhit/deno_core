@@ -375,9 +375,10 @@ impl ServerResponse {
       let this = Rc::new(v8::TracedReference::new(scope, local_me));
       this
     };
-    let isolate_ptr = unsafe { scope.as_raw_isolate_ptr() };
-    let context =
-      GlobalHandle::new(v8::Global::new(scope, scope.get_current_context()));
+    let spawner = op_state
+      .borrow()
+      .borrow::<deno_core::V8TaskSpawner>()
+      .clone();
     ServerResponse {
       base: OutgoingMessage::new_inner(me, scope, op_state),
       status_code: GcCell::new(None),
@@ -385,7 +386,7 @@ impl ServerResponse {
       response_tx_slot,
       body_handle: RefCell::new(body_handle),
       socket_state: RefCell::new(socket_state),
-      scope_holder: Rc::new(ScopeHolder::new(isolate_ptr, context)),
+      scope_holder: Rc::new(ScopeHolder::new_from_scope(scope, spawner)),
       this,
       close_after_response,
     }

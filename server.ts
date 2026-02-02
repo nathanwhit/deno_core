@@ -11,7 +11,12 @@ server.on("listening", () => {
 
 server.on("connection", (socket) => {
   socket.on("data", (data) => {
-    socket.write(data);
+    if (!socket.write(data)) {
+      socket.pause();
+    }
+  });
+  socket.on("drain", () => {
+    socket.resume();
   });
 });
 
