@@ -32,6 +32,8 @@ pub mod snapshot;
 pub mod testing;
 mod ts_module_loader;
 
+mod mem_info;
+
 #[derive(Clone, Default)]
 pub struct Output {
   pub lines: Arc<Mutex<Vec<String>>>,
@@ -165,6 +167,10 @@ pub fn create_runtime_from_snapshot_with_options(
     shared_array_buffer_store: Some(CrossIsolateStore::default()),
     inspector,
     import_assertions_support: ImportAssertionsSupport::Warning,
+    create_params: mem_info::mem_info().map(|mem_info| {
+      deno_core::v8::CreateParams::default()
+        .heap_limits_from_system_memory(mem_info.total, 0)
+    }),
     ..options
   });
 
