@@ -96,6 +96,10 @@ impl V8TaskSpawnerFactory {
     self.has_tasks.store(true, Ordering::Release);
     self.waker.wake();
   }
+
+  pub fn wake(&self) {
+    self.waker.wake();
+  }
 }
 
 /// Allows for submission of v8 tasks on the same thread.
@@ -133,6 +137,11 @@ impl V8TaskSpawner {
     let task: Box<dyn FnOnce(&mut v8::PinScope<'_, '_>) + Send> =
       unsafe { std::mem::transmute(task) };
     self.tasks.spawn(task)
+  }
+
+  // HACK
+  pub fn wake(&self) {
+    self.tasks.wake();
   }
 }
 

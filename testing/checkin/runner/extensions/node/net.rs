@@ -642,11 +642,13 @@ impl Socket {
     };
 
     if num_wrote >= bytes.len() {
-      let inner2 = inner.clone();
-      inner.scope_holder.with_scope_immediately(move |scope| {
-        let local_cb = v8::Local::new(scope, &cb);
-        let this = inner2.this.get(scope);
-        call_write_cb(scope, local_cb, this, None);
+      inner.scope_holder.with_scope_immediately({
+        let inner = inner.clone();
+        move |scope| {
+          let local_cb = v8::Local::new(scope, &cb);
+          let this = inner.this.get(scope);
+          call_write_cb(scope, local_cb, this, None);
+        }
       });
       return Ok(());
     }
@@ -891,31 +893,29 @@ impl SocketInner {
           };
         if nread == 0 {
           // Push EOF (null)
-          {
-            inner.scope_holder.with_scope_immediately({
-              let inner = inner.clone();
-              move |scope| {
-                v8::tc_scope!(let scope, scope);
-                let this = inner.this.get(scope);
-                let result = inner.push_func.get(scope).call(
-                  scope,
-                  this.into(),
-                  &[v8::null(scope).into()],
-                );
-                if result.is_none() {
-                  if let Some(exception) = scope.exception() {
-                    let error = JsError::from_v8_exception(scope, exception);
-                    eprintln!("error in push(null): {:?}", error);
-                  }
-                  return;
+          inner.scope_holder.with_scope_immediately({
+            let inner = inner.clone();
+            move |scope| {
+              v8::tc_scope!(let scope, scope);
+              let this = inner.this.get(scope);
+              let result = inner.push_func.get(scope).call(
+                scope,
+                this.into(),
+                &[v8::null(scope).into()],
+              );
+              if result.is_none() {
+                if let Some(exception) = scope.exception() {
+                  let error = JsError::from_v8_exception(scope, exception);
+                  eprintln!("error in push(null): {:?}", error);
                 }
-                let zero = Smi(0u8).to_v8(scope).unwrap();
-                inner.call_method(scope, "read", &[zero]).unwrap();
+                return;
               }
-            });
-            // if allowHalfOpen is true, we need to call _final
-            break;
-          }
+              let zero = Smi(0u8).to_v8(scope).unwrap();
+              inner.call_method(scope, "read", &[zero]).unwrap();
+            }
+          });
+          // if allowHalfOpen is true, we need to call _final
+          break;
         }
 
         if nread > 0 {

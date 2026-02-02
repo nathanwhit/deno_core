@@ -2,11 +2,11 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use bytes::Bytes;
+use deno_core::CancelHandle;
 use deno_core::JsBuffer;
 use deno_core::ToV8;
 use deno_core::error::JsError;
 use deno_core::v8::cppgc::GcCell;
-use deno_core::v8::cppgc::Traced;
 use deno_core::{GarbageCollected, OpState, op2, v8};
 use deno_error::JsErrorBox;
 use http_body_util::Either;
@@ -39,14 +39,14 @@ pub struct ServerResponse {
   pub(crate) body_handle: RefCell<Option<ResponseBodyHandle>>,
   socket_state: RefCell<Option<Rc<LazySocket>>>,
   scope_holder: Rc<ScopeHolder>,
-  this: Rc<v8::TracedReference<v8::Object>>,
+  this: GlobalHandle<v8::Object>,
   close_after_response: bool,
+  conn_cancel: Option<Rc<CancelHandle>>,
 }
 
 unsafe impl GarbageCollected for ServerResponse {
   fn trace(&self, visitor: &mut v8::cppgc::Visitor) {
     self.base.trace(visitor);
-    self.this.trace(visitor);
   }
 
   fn get_name(&self) -> &'static std::ffi::CStr {
@@ -87,7 +87,9 @@ impl ServerResponse {
     scope: &mut v8::PinScope,
     op_state: Rc<RefCell<OpState>>,
   ) -> ServerResponse {
-    ServerResponse::new_inner(me, scope, op_state, None, None, false, None)
+    ServerResponse::new_inner(
+      me, scope, op_state, None, None, false, None, None,
+    )
   }
 
   #[fast]
@@ -197,7 +199,7 @@ impl ServerResponse {
     if payload.is_empty() {
       // Call callback directly using the scope we already have
       let cb = v8::Local::new(scope, &cb);
-      let this = self.this.get(scope).unwrap();
+      let this = self.this.get(scope);
       call_write_cb(scope, cb, this, None);
       return Ok(());
     }
@@ -209,19 +211,21 @@ impl ServerResponse {
       .ok_or_else(|| JsErrorBox::generic("Response body missing"))?;
     let pending_bytes = handle.push_bytes(Bytes::from(payload))?;
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
+      self.this.make_strong(scope);
       let scope_holder = self.scope_holder.clone();
       let this = self.this.clone();
       deno_core::unsync::spawn(async move {
         handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
         scope_holder.with_scope_immediately(move |scope| {
           let cb = v8::Local::new(scope, &cb);
-          let this = this.get(scope).unwrap();
-          call_write_cb(scope, cb, this, None);
+          let this_local = this.get(scope);
+          call_write_cb(scope, cb, this_local, None);
+          this.make_weak(scope);
         });
       });
     } else {
       let cb = v8::Local::new(scope, &cb);
-      let this = self.this.get(scope).unwrap();
+      let this = self.this.get(scope);
       call_write_cb(scope, cb, this, None);
     }
 
@@ -259,23 +263,24 @@ impl ServerResponse {
         Ok(response) => response,
         Err(err) => {
           let cb = v8::Local::new(scope, &cb);
-          let this = self.this.get(scope).unwrap();
+          let this = self.this.get(scope);
           call_write_cb(scope, cb.into(), this, Some(err));
           return;
         }
       };
       let _ = response_tx.send(response);
       self.base.set_header_sent(scope, true);
+      self.signal_connection_close();
       // Call callback directly using the scope we already have
       let cb = v8::Local::new(scope, &cb);
-      let this = self.this.get(scope).unwrap();
+      let this = self.this.get(scope);
       call_write_cb(scope, cb.into(), this, None);
       return;
     }
 
     if let Err(err) = self.ensure_response(scope) {
       let cb = v8::Local::new(scope, &cb);
-      let this = self.this.get(scope).unwrap();
+      let this = self.this.get(scope);
       call_write_cb(scope, cb.into(), this, Some(err));
       return;
     }
@@ -284,7 +289,7 @@ impl ServerResponse {
       Some(handle) => handle,
       None => {
         let cb = v8::Local::new(scope, &cb);
-        let this = self.this.get(scope).unwrap();
+        let this = self.this.get(scope);
         call_write_cb(
           scope,
           cb.into(),
@@ -301,7 +306,7 @@ impl ServerResponse {
           Ok(pending) => pending,
           Err(err) => {
             let cb = v8::Local::new(scope, &cb);
-            let this = self.this.get(scope).unwrap();
+            let this = self.this.get(scope);
             call_write_cb(scope, cb.into(), this, Some(err));
             return;
           }
@@ -311,19 +316,29 @@ impl ServerResponse {
       };
     handle.close();
     if pending_bytes > RESPONSE_BODY_HIGH_WATER {
+      self.this.make_strong(scope);
       let scope_holder = self.scope_holder.clone();
       let this = self.this.clone();
+      let conn_cancel = self.conn_cancel.clone();
+      let close_after_response = self.close_after_response;
       deno_core::unsync::spawn(async move {
         handle.wait_for_drain(RESPONSE_BODY_HIGH_WATER).await;
+        if close_after_response {
+          if let Some(cancel) = &conn_cancel {
+            cancel.cancel();
+          }
+        }
         scope_holder.with_scope_immediately(move |scope| {
           let cb = v8::Local::new(scope, &cb);
-          let this = this.get(scope).unwrap();
-          call_write_cb(scope, cb.into(), this, None);
+          let this_local = this.get(scope);
+          call_write_cb(scope, cb.into(), this_local, None);
+          this.make_weak(scope);
         });
       });
     } else {
+      self.signal_connection_close();
       let cb = v8::Local::new(scope, &cb);
-      let this = self.this.get(scope).unwrap();
+      let this = self.this.get(scope);
       call_write_cb(scope, cb.into(), this, None);
     }
   }
@@ -348,6 +363,7 @@ impl ServerResponse {
     body_handle: Option<ResponseBodyHandle>,
     close_after_response: bool,
     socket_state: Option<Rc<LazySocket>>,
+    conn_cancel: Option<Rc<CancelHandle>>,
   ) -> ServerResponse {
     let response_tx_slot = Rc::new(RefCell::new(response_tx));
     Self::new_inner_with_slot(
@@ -358,6 +374,7 @@ impl ServerResponse {
       body_handle,
       close_after_response,
       socket_state,
+      conn_cancel,
     )
   }
 
@@ -369,18 +386,19 @@ impl ServerResponse {
     body_handle: Option<ResponseBodyHandle>,
     close_after_response: bool,
     socket_state: Option<Rc<LazySocket>>,
+    conn_cancel: Option<Rc<CancelHandle>>,
   ) -> ServerResponse {
-    let this = {
-      let local_me = v8::Local::new(scope, &me);
-      let this = Rc::new(v8::TracedReference::new(scope, local_me));
-      this
-    };
+    let this = GlobalHandle::new_weak(v8::Weak::new(scope, me));
     let spawner = op_state
       .borrow()
       .borrow::<deno_core::V8TaskSpawner>()
       .clone();
     ServerResponse {
-      base: OutgoingMessage::new_inner(me, scope, op_state),
+      base: OutgoingMessage::new_inner(
+        v8::Global::new(scope, this.get(scope)),
+        scope,
+        op_state,
+      ),
       status_code: GcCell::new(None),
       status_message: GcCell::new(None),
       response_tx_slot,
@@ -389,6 +407,7 @@ impl ServerResponse {
       scope_holder: Rc::new(ScopeHolder::new_from_scope(scope, spawner)),
       this,
       close_after_response,
+      conn_cancel,
     }
   }
 
@@ -445,6 +464,16 @@ impl ServerResponse {
     let _ = response_tx.unwrap().send(response);
     self.base.set_header_sent(isolate, true);
     Ok(())
+  }
+
+  /// Signal the connection to close after the response is sent.
+  /// Called when close_after_response is true and response is finalized.
+  fn signal_connection_close(&self) {
+    if self.close_after_response {
+      if let Some(cancel) = &self.conn_cancel {
+        cancel.cancel();
+      }
+    }
   }
 
   fn status_line(

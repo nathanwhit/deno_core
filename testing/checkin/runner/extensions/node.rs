@@ -130,7 +130,10 @@ impl ScopeHolder {
     v8::scope!(let scope, &mut isolate);
     let context = self.context.get(scope);
     let scope = &mut v8::ContextScope::new(scope, context);
-    f(scope)
+    let result = f(scope);
+    // wake the event loop so any scheduled nextTick/microtask work gets processed
+    self.spawner.wake();
+    result
   }
 }
 

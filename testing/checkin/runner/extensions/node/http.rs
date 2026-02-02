@@ -16,6 +16,8 @@ use utils::should_close_from_parts;
 use std::{cell::RefCell, error::Error as _, io::ErrorKind, rc::Rc};
 
 use bytes::Bytes;
+use deno_core::CancelFuture;
+use deno_core::CancelHandle;
 use deno_core::convert::Uint8Array;
 use deno_core::{GarbageCollected, OpState, ToV8, op2, v8};
 use deno_error::JsErrorBox;
@@ -256,6 +258,7 @@ fn init_request_objects(
   response_tx_slot: ResponseTxSlot,
   should_close: bool,
   socket_state: Rc<LazySocket>,
+  conn_cancel: Option<Rc<CancelHandle>>,
 ) -> Option<(GlobalHandle<v8::Object>, GlobalHandle<v8::Function>)> {
   let request_parts = RequestParts {
     method: parts.method,
@@ -275,6 +278,7 @@ fn init_request_objects(
     let push_slot = push_slot.clone();
     let should_read = should_read.clone();
     let response_tx_slot = response_tx_slot.clone();
+    let conn_cancel = conn_cancel.clone();
     move |scope| {
       v8::tc_scope!(let scope, scope);
       let req_empty =
@@ -302,6 +306,7 @@ fn init_request_objects(
         None,
         should_close,
         Some(socket_state.clone()),
+        conn_cancel.clone(),
       );
       // Note: Connection: close is added in build_response AFTER user headers
       // to preserve expected header ordering
@@ -391,6 +396,7 @@ async fn await_response(
 async fn handle_hyper_request(
   inner: Rc<ServerInner>,
   socket_state: Rc<LazySocket>,
+  conn_cancel: Rc<CancelHandle>,
   req: Request<hyper::body::Incoming>,
 ) -> Result<Response<HttpResponseBody>, hyper::Error> {
   let (parts, body) = req.into_parts();
@@ -410,6 +416,11 @@ async fn handle_hyper_request(
     response_tx_slot.clone(),
     should_close,
     socket_state,
+    if should_close {
+      Some(conn_cancel)
+    } else {
+      None
+    },
   );
 
   // If init_request_objects returned None, the request handler threw an exception.
@@ -453,19 +464,37 @@ impl OnAccept for HttpServerCallback {
     stream: tokio::net::TcpStream,
     _addr: std::net::SocketAddr,
   ) -> Result<(), JsErrorBox> {
+    use std::pin::Pin;
     let socket_state = Rc::new(LazySocket::new(inner.clone(), &stream, _addr));
+    let conn_cancel = Rc::new(CancelHandle::new());
     let service = {
       let inner = inner.clone();
       let socket_state = socket_state.clone();
+      let conn_cancel = conn_cancel.clone();
       service_fn(move |req| {
-        handle_hyper_request(inner.clone(), socket_state.clone(), req)
+        handle_hyper_request(
+          inner.clone(),
+          socket_state.clone(),
+          conn_cancel.clone(),
+          req,
+        )
       })
     };
-    let result = http1::Builder::new()
-      .auto_date_header(false)
-      .title_case_headers(true)
-      .serve_connection(TokioIo::new(stream), service)
-      .await;
+    let conn = Box::new(
+      http1::Builder::new()
+        .auto_date_header(false)
+        .title_case_headers(true)
+        .serve_connection(TokioIo::new(stream), service),
+    );
+
+    let result = match conn.or_abort(&conn_cancel).await {
+      Ok(result) => result,
+      Err(mut conn) => {
+        Pin::new(&mut *conn).graceful_shutdown();
+        conn.await
+      }
+    };
+
     match result {
       Ok(()) => Ok(()),
       Err(err) => {

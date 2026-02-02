@@ -11,6 +11,7 @@ use deno_core::RequestedModuleType;
 use deno_core::ToV8;
 use deno_core::v8;
 use deno_error::JsErrorBox;
+use futures::FutureExt;
 
 pub fn import_from(
   runtime: &mut JsRuntime,
@@ -314,8 +315,11 @@ impl HttpTestServer {
       server.call(scope, "listen", (port as i32, "127.0.0.1", listen_cb));
     });
 
-    let mut run_event_loop =
-      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+    let mut run_event_loop = pin!(
+      runtime
+        .run_event_loop(PollEventLoopOptions::default())
+        .fuse()
+    );
     // Run event loop until server is listening
     tokio::select! {
       _ = &mut run_event_loop => {}
@@ -385,8 +389,11 @@ impl HttpTestServer {
       server.call(scope, "listen", (port as i32, "127.0.0.1", listen_cb));
     });
 
-    let mut run_event_loop =
-      pin!(runtime.run_event_loop(PollEventLoopOptions::default()));
+    let mut run_event_loop = pin!(
+      runtime
+        .run_event_loop(PollEventLoopOptions::default())
+        .fuse()
+    );
     // Run event loop until server is listening
     tokio::select! {
       _ = &mut run_event_loop => {}
@@ -444,8 +451,11 @@ pub async fn run_until<T>(
   fut: impl IntoFuture<Output = Option<T>>,
   timeout: std::time::Duration,
 ) -> Option<T> {
-  let mut event_loop =
-    pin!(runtime.run_event_loop(deno_core::PollEventLoopOptions::default()));
+  let mut event_loop = pin!(
+    runtime
+      .run_event_loop(deno_core::PollEventLoopOptions::default())
+      .fuse()
+  );
   let mut fut = pin!(fut.into_future());
 
   loop {
