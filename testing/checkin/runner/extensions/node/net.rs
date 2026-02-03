@@ -245,6 +245,16 @@ struct ConnectOptions {
   allow_half_open: Option<bool>,
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", crate = "serde")]
+struct ListenOptions {
+  host: Option<String>,
+  port: Option<u16>,
+  #[serde(default)]
+  backlog: Option<u32>,
+  path: Option<String>,
+}
+
 fn normalize_connect_args<'s>(
   scope: &mut v8::PinScope<'s, '_>,
   port_or_options: Option<v8::Local<'s, v8::Value>>,
@@ -332,6 +342,205 @@ fn normalize_connect_args<'s>(
   }
 
   Ok((port, host, connect_listener, connect_options))
+}
+
+/// Normalize arguments for server.listen() supporting these signatures:
+/// - server.listen([port[, host[, backlog]]][, callback])
+/// - server.listen(options[, callback])
+fn normalize_listen_args<'s>(
+  scope: &mut v8::PinScope<'s, '_>,
+  args: &[v8::Local<'s, v8::Value>],
+) -> Result<
+  (
+    Option<u16>,
+    Option<String>,
+    Option<u32>,
+    Option<v8::Local<'s, v8::Function>>,
+  ),
+  JsErrorBox,
+> {
+  let mut port: Option<u16> = None;
+  let mut host: Option<String> = None;
+  let mut backlog: Option<u32> = None;
+  let mut callback: Option<v8::Local<v8::Function>> = None;
+
+  let invalid_args = || JsErrorBox::type_error("Invalid listen arguments");
+
+  // Handle different argument patterns
+  match args.len() {
+    0 => {
+      // listen() with no args - use defaults
+    }
+    1 => {
+      let arg0 = args[0];
+      if arg0.is_function() {
+        // listen(callback)
+        callback = Some(arg0.cast::<v8::Function>());
+      } else if arg0.is_number() {
+        // listen(port)
+        port = Some(
+          arg0
+            .integer_value(scope)
+            .ok_or_else(invalid_args)?
+            .try_into()
+            .map_err(|_| invalid_args())?,
+        );
+      } else if arg0.is_object() && !arg0.is_null() {
+        // listen(options)
+        let options: ListenOptions = deno_core::serde_v8::from_v8(scope, arg0)
+          .map_err(JsErrorBox::from_err)?;
+        if options.path.is_some() {
+          return Err(JsErrorBox::type_error("IPC servers are not supported"));
+        }
+        port = options.port;
+        host = options.host;
+        backlog = options.backlog;
+      } else if !arg0.is_null_or_undefined() {
+        return Err(invalid_args());
+      }
+    }
+    2 => {
+      let arg0 = args[0];
+      let arg1 = args[1];
+
+      if arg0.is_object() && !arg0.is_null() && !arg0.is_function() {
+        // listen(options, callback)
+        let options: ListenOptions = deno_core::serde_v8::from_v8(scope, arg0)
+          .map_err(JsErrorBox::from_err)?;
+        if options.path.is_some() {
+          return Err(JsErrorBox::type_error("IPC servers are not supported"));
+        }
+        port = options.port;
+        host = options.host;
+        backlog = options.backlog;
+        if arg1.is_function() {
+          callback = Some(arg1.cast::<v8::Function>());
+        }
+      } else if arg0.is_number() {
+        // listen(port, host) or listen(port, callback)
+        port = Some(
+          arg0
+            .integer_value(scope)
+            .ok_or_else(invalid_args)?
+            .try_into()
+            .map_err(|_| invalid_args())?,
+        );
+        if arg1.is_function() {
+          callback = Some(arg1.cast::<v8::Function>());
+        } else if arg1.is_string() {
+          host = Some(arg1.to_rust_string_lossy(scope));
+        } else if arg1.is_number() {
+          // listen(port, backlog) - backlog as second arg
+          backlog = Some(
+            arg1
+              .integer_value(scope)
+              .ok_or_else(invalid_args)?
+              .try_into()
+              .map_err(|_| invalid_args())?,
+          );
+        } else if !arg1.is_null_or_undefined() {
+          return Err(invalid_args());
+        }
+      } else {
+        return Err(invalid_args());
+      }
+    }
+    3 => {
+      let arg0 = args[0];
+      let arg1 = args[1];
+      let arg2 = args[2];
+
+      if !arg0.is_number() {
+        return Err(invalid_args());
+      }
+      port = Some(
+        arg0
+          .integer_value(scope)
+          .ok_or_else(invalid_args)?
+          .try_into()
+          .map_err(|_| invalid_args())?,
+      );
+
+      if arg1.is_string() {
+        // listen(port, host, callback) or listen(port, host, backlog)
+        host = Some(arg1.to_rust_string_lossy(scope));
+        if arg2.is_function() {
+          callback = Some(arg2.cast::<v8::Function>());
+        } else if arg2.is_number() {
+          backlog = Some(
+            arg2
+              .integer_value(scope)
+              .ok_or_else(invalid_args)?
+              .try_into()
+              .map_err(|_| invalid_args())?,
+          );
+        } else if !arg2.is_null_or_undefined() {
+          return Err(invalid_args());
+        }
+      } else if arg1.is_number() {
+        // listen(port, backlog, callback)
+        backlog = Some(
+          arg1
+            .integer_value(scope)
+            .ok_or_else(invalid_args)?
+            .try_into()
+            .map_err(|_| invalid_args())?,
+        );
+        if arg2.is_function() {
+          callback = Some(arg2.cast::<v8::Function>());
+        } else if !arg2.is_null_or_undefined() {
+          return Err(invalid_args());
+        }
+      } else if arg1.is_function() {
+        // listen(port, callback, ?) - unusual but handle callback in position 1
+        callback = Some(arg1.cast::<v8::Function>());
+      } else if !arg1.is_null_or_undefined() {
+        return Err(invalid_args());
+      }
+    }
+    _ => {
+      // 4+ args: listen(port, host, backlog, callback)
+      let arg0 = args[0];
+      let arg1 = args[1];
+      let arg2 = args[2];
+      let arg3 = args[3];
+
+      if !arg0.is_number() {
+        return Err(invalid_args());
+      }
+      port = Some(
+        arg0
+          .integer_value(scope)
+          .ok_or_else(invalid_args)?
+          .try_into()
+          .map_err(|_| invalid_args())?,
+      );
+
+      if arg1.is_string() {
+        host = Some(arg1.to_rust_string_lossy(scope));
+      } else if !arg1.is_null_or_undefined() {
+        return Err(invalid_args());
+      }
+
+      if arg2.is_number() {
+        backlog = Some(
+          arg2
+            .integer_value(scope)
+            .ok_or_else(invalid_args)?
+            .try_into()
+            .map_err(|_| invalid_args())?,
+        );
+      } else if !arg2.is_null_or_undefined() {
+        return Err(invalid_args());
+      }
+
+      if arg3.is_function() {
+        callback = Some(arg3.cast::<v8::Function>());
+      }
+    }
+  }
+
+  Ok((port, host, backlog, callback))
 }
 
 #[derive(serde::Serialize, Default)]
@@ -560,11 +769,16 @@ impl Socket {
       }
       let inner2 = inner.clone();
       inner.scope_holder.with_scope_immediately(move |scope| {
+        v8::tc_scope!(let scope, scope);
         let cb = v8::Local::new(scope, &cb);
         let this = inner2.this.get(scope);
         let error = v8::Local::new(scope, &error);
         cb.call(scope, this.into(), &[error]).unwrap();
-        inner2.emit_event(scope, &[internalized(scope, "close").into()]);
+        let close = internalized(scope, "close");
+        inner2.emit_event(scope, &[close.into()]);
+        if let Some(error) = scope.exception() {
+          scope.throw_exception(error);
+        }
         inner2.this.make_weak(scope);
       });
       inner.ref_tracker.unref();
@@ -1112,20 +1326,42 @@ impl Server {
 
   #[fast]
   #[reentrant]
-  fn listen(
+  fn listen<'a>(
     &self,
-    scope: &mut v8::PinScope,
-    #[smi] port: u16,
-    #[string] host: String,
-    on_listen: Option<v8::Local<v8::Function>>,
-  ) {
-    if let Some(on_listen) = on_listen {
+    scope: &mut v8::PinScope<'a, '_>,
+    arg0: Option<v8::Local<'a, v8::Value>>,
+    arg1: Option<v8::Local<'a, v8::Value>>,
+    arg2: Option<v8::Local<'a, v8::Value>>,
+    arg3: Option<v8::Local<'a, v8::Value>>,
+  ) -> Result<(), JsErrorBox> {
+    // Collect non-None arguments
+    let mut args = Vec::new();
+    if let Some(a) = arg0 {
+      args.push(a);
+    }
+    if let Some(a) = arg1 {
+      args.push(a);
+    }
+    if let Some(a) = arg2 {
+      args.push(a);
+    }
+    if let Some(a) = arg3 {
+      args.push(a);
+    }
+
+    let (port, host, _backlog, callback) = normalize_listen_args(scope, &args)?;
+
+    let port = port.unwrap_or(0);
+    let host = host.unwrap_or_default();
+
+    if let Some(on_listen) = callback {
       self.inner.on_event(
         scope,
         &[internalized(scope, "listening").into(), on_listen.into()],
       );
     }
     self.inner.listen_inner::<SocketCallback>(port, host);
+    Ok(())
   }
 
   #[fast]
@@ -1219,6 +1455,7 @@ impl ServerInner {
     inner.ref_tracker.ref_();
     let cancel = inner.cancel.clone();
     deno_core::unsync::spawn(async move {
+      let host = if host.is_empty() { "0.0.0.0" } else { &host };
       let listener = tokio::net::TcpListener::bind((host, port))
         .await
         .map_err(JsErrorBox::from_err)
@@ -1253,7 +1490,13 @@ impl ServerInner {
             inner.holder.with_scope_immediately({
               let inner = inner.clone();
               move |scope| {
-                inner.emit_event(scope, &[internalized(scope, "close").into()]);
+                v8::tc_scope!(let scope, scope);
+                let close = internalized(scope, "close");
+                inner.emit_event(scope, &[close.into()]);
+                if let Some(error) = scope.exception() {
+                  scope.throw_exception(error);
+                  return;
+                }
               }
             });
             inner.ref_tracker.unref();
@@ -2046,5 +2289,200 @@ mod tests {
       test.run_until(rx).await.is_some(),
       "Connect listener registered after connect() should still receive the event"
     );
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn server_listen_port_only() {
+    let mut test = NetTest::new();
+
+    // Import Server constructor
+    let server_cons =
+      import_from(&mut test.runtime, "node:net", "Server").unwrap();
+
+    let (listening_tx, listening_rx) = oneshot::channel::<u16>();
+
+    let server_global: Rc<RefCell<Option<JsObject>>> =
+      Rc::new(RefCell::new(None));
+    let server_global_clone = server_global.clone();
+
+    test.runtime.with_scope(|scope| {
+      let server_fn =
+        v8::Local::new(scope, &server_cons).cast::<v8::Function>();
+      let server = JsObject::construct(scope, server_fn, ());
+      *server_global_clone.borrow_mut() = Some(server.clone());
+
+      // Set up 'listening' handler that reports the port
+      let server_for_cb = server.clone();
+      let listening_cb = send_cb(scope, listening_tx, move |scope, _| {
+        let addr = server_for_cb
+          .call(scope, "address", ())
+          .cast::<v8::Object>();
+        let port = addr.get(scope, internalized(scope, "port").into()).unwrap();
+        port.uint32_value(scope).unwrap() as u16
+      });
+      server.call(scope, "on", ("listening", listening_cb));
+
+      // listen(port) - just port, no host
+      server.call(scope, "listen", (0i32,));
+    });
+
+    let port = test
+      .run_until(listening_rx)
+      .await
+      .expect("should start listening");
+    assert!(port > 0, "Server should have been assigned a port");
+
+    // Clean up
+    test.runtime.with_scope(|scope| {
+      if let Some(server) = server_global.borrow().as_ref() {
+        server.call(scope, "close", ());
+      }
+    });
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn server_listen_port_callback() {
+    let mut test = NetTest::new();
+
+    let server_cons =
+      import_from(&mut test.runtime, "node:net", "Server").unwrap();
+
+    let (listening_tx, listening_rx) = oneshot::channel::<()>();
+
+    let server_global: Rc<RefCell<Option<JsObject>>> =
+      Rc::new(RefCell::new(None));
+    let server_global_clone = server_global.clone();
+
+    test.runtime.with_scope(|scope| {
+      let server_fn =
+        v8::Local::new(scope, &server_cons).cast::<v8::Function>();
+      let server = JsObject::construct(scope, server_fn, ());
+      *server_global_clone.borrow_mut() = Some(server.clone());
+
+      let cb = signal_cb(scope, listening_tx);
+      // listen(port, callback)
+      server.call(scope, "listen", (0i32, cb));
+    });
+
+    assert!(
+      test.run_until(listening_rx).await.is_some(),
+      "Callback passed to listen(port, callback) should be called"
+    );
+
+    // Clean up
+    test.runtime.with_scope(|scope| {
+      if let Some(server) = server_global.borrow().as_ref() {
+        server.call(scope, "close", ());
+      }
+    });
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn server_listen_options_object() {
+    let mut test = NetTest::new();
+
+    let server_cons =
+      import_from(&mut test.runtime, "node:net", "Server").unwrap();
+
+    let (listening_tx, listening_rx) = oneshot::channel::<(String, u16)>();
+
+    let server_global: Rc<RefCell<Option<JsObject>>> =
+      Rc::new(RefCell::new(None));
+    let server_global_clone = server_global.clone();
+
+    test.runtime.with_scope(|scope| {
+      let server_fn =
+        v8::Local::new(scope, &server_cons).cast::<v8::Function>();
+      let server = JsObject::construct(scope, server_fn, ());
+      *server_global_clone.borrow_mut() = Some(server.clone());
+
+      // Set up 'listening' handler that reports address info
+      let server_for_cb = server.clone();
+      let listening_cb = send_cb(scope, listening_tx, move |scope, _| {
+        let addr = server_for_cb
+          .call(scope, "address", ())
+          .cast::<v8::Object>();
+        let host = addr
+          .get(scope, internalized(scope, "address").into())
+          .unwrap()
+          .to_rust_string_lossy(scope);
+        let port = addr
+          .get(scope, internalized(scope, "port").into())
+          .unwrap()
+          .uint32_value(scope)
+          .unwrap() as u16;
+        (host, port)
+      });
+      server.call(scope, "on", ("listening", listening_cb));
+
+      // Create options object { port: 0, host: '127.0.0.1' }
+      let options = v8::Object::new(scope);
+      let port_key = internalized(scope, "port");
+      let host_key = internalized(scope, "host");
+      let port_val = v8::Integer::new(scope, 0);
+      let host_val = v8::String::new(scope, "127.0.0.1").unwrap();
+      options.set(scope, port_key.into(), port_val.into());
+      options.set(scope, host_key.into(), host_val.into());
+
+      // listen(options)
+      server.call(scope, "listen", (options,));
+    });
+
+    let (host, port) = test
+      .run_until(listening_rx)
+      .await
+      .expect("should start listening with options object");
+    assert_eq!(host, "127.0.0.1");
+    assert!(port > 0);
+
+    // Clean up
+    test.runtime.with_scope(|scope| {
+      if let Some(server) = server_global.borrow().as_ref() {
+        server.call(scope, "close", ());
+      }
+    });
+  }
+
+  #[tokio::test(flavor = "current_thread")]
+  async fn server_listen_options_with_callback() {
+    let mut test = NetTest::new();
+
+    let server_cons =
+      import_from(&mut test.runtime, "node:net", "Server").unwrap();
+
+    let (listening_tx, listening_rx) = oneshot::channel::<()>();
+
+    let server_global: Rc<RefCell<Option<JsObject>>> =
+      Rc::new(RefCell::new(None));
+    let server_global_clone = server_global.clone();
+
+    test.runtime.with_scope(|scope| {
+      let server_fn =
+        v8::Local::new(scope, &server_cons).cast::<v8::Function>();
+      let server = JsObject::construct(scope, server_fn, ());
+      *server_global_clone.borrow_mut() = Some(server.clone());
+
+      // Create options object { port: 0 }
+      let options = v8::Object::new(scope);
+      let port_key = internalized(scope, "port");
+      let port_val = v8::Integer::new(scope, 0);
+      options.set(scope, port_key.into(), port_val.into());
+
+      let cb = signal_cb(scope, listening_tx);
+      // listen(options, callback)
+      server.call(scope, "listen", (options, cb));
+    });
+
+    assert!(
+      test.run_until(listening_rx).await.is_some(),
+      "Callback passed to listen(options, callback) should be called"
+    );
+
+    // Clean up
+    test.runtime.with_scope(|scope| {
+      if let Some(server) = server_global.borrow().as_ref() {
+        server.call(scope, "close", ());
+      }
+    });
   }
 }

@@ -15,12 +15,25 @@ Object.setPrototypeOf(Socket.prototype, Duplex.prototype);
 Object.setPrototypeOf(Server, EventEmitter);
 Object.setPrototypeOf(Server.prototype, EventEmitter.prototype);
 
+function createServer(options?: unknown, connectionListener?: Function) {
+  if (typeof options === "function") {
+    connectionListener = options;
+    options = undefined;
+  }
+  const server = new Server();
+  if (connectionListener) {
+    server.on("connection", connectionListener);
+  }
+  return server;
+}
+
 export {
-  op_net_connect as connect,
-  op_net_connect as createConnection,
+  createServer,
   op_is_ip as isIP,
   op_is_ipv4 as isIPv4,
   op_is_ipv6 as isIPv6,
+  op_net_connect as connect,
+  op_net_connect as createConnection,
   Server,
   Socket,
 };
