@@ -4,6 +4,7 @@
     "jsr:@david/console-static-text@0.3": "0.3.0",
     "jsr:@david/dax@*": "0.44.2",
     "jsr:@david/dax@0.43.1": "0.43.1",
+    "jsr:@david/dax@0.45": "0.45.0",
     "jsr:@david/path@0.2": "0.2.0",
     "jsr:@david/which@~0.4.1": "0.4.1",
     "jsr:@std/bytes@^1.0.5": "1.0.6",
@@ -38,6 +39,18 @@
         "jsr:@david/which",
         "jsr:@std/fmt",
         "jsr:@std/fs@^1.0.20",
+        "jsr:@std/io",
+        "jsr:@std/path@1"
+      ]
+    },
+    "@david/dax@0.45.0": {
+      "integrity": "ac7565dc5c3e5be953a18b505e5dd0d8a30ed53656b65fd34a53bd8d2d5d6b1e",
+      "dependencies": [
+        "jsr:@david/console-static-text",
+        "jsr:@david/path",
+        "jsr:@david/which",
+        "jsr:@std/fmt",
+        "jsr:@std/fs@1",
         "jsr:@std/io",
         "jsr:@std/path@1"
       ]
@@ -80,5 +93,10 @@
         "jsr:@std/internal"
       ]
     }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@david/dax@0.45"
+    ]
   }
 }

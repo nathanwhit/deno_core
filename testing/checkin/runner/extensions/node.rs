@@ -315,6 +315,7 @@ deno_core::extension!(
   ],
   esm = [
     dir "checkin/runtime/node",
+    "module.ts",
     "next_tick.ts",
     "fixed_queue.ts",
     "__bootstrap.js",

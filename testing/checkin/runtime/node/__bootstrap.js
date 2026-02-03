@@ -4,6 +4,7 @@ import {
   op_set_next_tick_func,
   op_set_process_exit_event,
 } from "ext:core/ops";
+import { require, registerBuiltin } from "ext:checkin_node/module.ts";
 import {
   processTicksAndRejections,
   runNextTicks,
@@ -81,6 +82,20 @@ export function init(globalThis) {
     process.nextTick(func.bind(recv), ...args)
   );
   op_set_process_exit_event(dispatchProcessExitEvent);
+
+  // Register builtin modules for require()
+  registerBuiltin("assert", assert);
+  registerBuiltin("net", net);
+  registerBuiltin("http", http);
+  registerBuiltin("stream", stream);
+  registerBuiltin("events", events);
+  registerBuiltin("buffer", buffer);
+  registerBuiltin("process", process);
+
+  // Make require globally available
+  globalThis.require = require;
+  globalThis.module = { exports: {} };
+  globalThis.exports = globalThis.module.exports;
 }
 
 export default init;

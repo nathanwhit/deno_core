@@ -1,4 +1,5 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
-import { Socket, Stream } from "checkin:object";
-const obj = new Socket();
-console.log(obj instanceof Stream);
+process.on("exit", () => {
+  console.log("exit");
+});
+console.log(import.meta.url);

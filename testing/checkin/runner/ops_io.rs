@@ -132,3 +132,15 @@ pub fn op_path_to_url(#[string] path: &str) -> Result<String, std::io::Error> {
   let url = url::Url::from_file_path(path).unwrap();
   Ok(url.to_string())
 }
+
+#[op2]
+#[string]
+pub fn op_read_file_text_sync(#[string] path: &str) -> Result<String, std::io::Error> {
+  std::fs::read_to_string(path)
+}
+
+#[op2]
+#[string]
+pub fn op_cwd() -> Result<String, std::io::Error> {
+  std::env::current_dir().map(|p| p.to_string_lossy().to_string())
+}

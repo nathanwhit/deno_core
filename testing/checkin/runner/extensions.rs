@@ -39,6 +39,8 @@ deno_core::extension!(
     ops_io::op_pipe_create,
     ops_io::op_file_open,
     ops_io::op_path_to_url,
+    ops_io::op_read_file_text_sync,
+    ops_io::op_cwd,
     ops_async::op_task_submit,
     ops_async::op_async_yield,
     ops_async::op_async_barrier_create,

@@ -1,5 +1,5 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
-import $ from "jsr:@david/dax";
+import $ from "dax";
 
 await $`cargo build --profile=release-with-debug`;
 

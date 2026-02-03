@@ -1,5 +1,5 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
-import $ from "jsr:@david/dax@0.43.1";
+import $ from "dax";
 
 // Instrumented server script
 const serverScript = `
@@ -89,9 +89,10 @@ while (true) {
 }
 
 try {
-  const result = await $`socky benchmark -H 127.0.0.1 -p 3001 -c 1000 -j 50 -m 50 --read`
-    .timeout("20s")
-    .noThrow();
+  const result =
+    await $`socky benchmark -H 127.0.0.1 -p 3001 -c 1000 -j 50 -m 50 --read`
+      .timeout("20s")
+      .noThrow();
 
   if (result.code === 124) {
     console.error("TIMEOUT: Benchmark took longer than 20 seconds");
