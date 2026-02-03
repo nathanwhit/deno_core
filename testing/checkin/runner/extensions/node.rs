@@ -75,6 +75,28 @@ pub fn op_set_next_tick_func(
 }
 
 #[derive(Clone)]
+pub struct ProcessExitEmitEvent {
+  func: GlobalHandle<v8::Function>,
+}
+
+impl ProcessExitEmitEvent {
+  pub fn get<'s>(
+    &self,
+    scope: &v8::PinScope<'s, '_>,
+  ) -> v8::Local<'s, v8::Function> {
+    self.func.get(scope)
+  }
+}
+#[op2]
+pub fn op_set_process_exit_event(
+  op_state: &mut OpState,
+  #[global] func: v8::Global<v8::Function>,
+) {
+  op_state.put(ProcessExitEmitEvent {
+    func: GlobalHandle::new(func),
+  });
+}
+#[derive(Clone)]
 pub struct NextTickFunc {
   func: GlobalHandle<v8::Function>,
 }
@@ -277,6 +299,7 @@ deno_core::extension!(
     op_exit,
     op_set_constructors,
     op_set_next_tick_func,
+    op_set_process_exit_event,
     net::op_is_ipv4,
     net::op_is_ipv6,
     net::op_is_ip,

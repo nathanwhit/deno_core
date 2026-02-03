@@ -4,9 +4,11 @@ use clap::ArgMatches;
 use clap::builder::Arg;
 use clap::builder::Command;
 use deno_core::RequestedModuleType;
+use deno_core::ToV8;
 use deno_core::anyhow::Error;
 
 use deno_core::RuntimeOptions;
+use deno_core::convert::Smi;
 use deno_core::v8;
 use deno_core_testing::create_runtime_from_snapshot;
 
@@ -137,6 +139,18 @@ fn main() -> Result<(), Error> {
     let mod_id = js_runtime.load_main_es_module(&main_module).await?;
     let result = js_runtime.mod_evaluate(mod_id);
     js_runtime.run_event_loop(Default::default()).await?;
+
+    {
+      let process_exit_emit_event = js_runtime
+        .op_state()
+        .borrow()
+        .borrow::<deno_core_testing::ProcessExitEmitEvent>()
+        .clone();
+      deno_core::scope!(scope, &mut js_runtime);
+      let func = process_exit_emit_event.get(scope);
+      let arg = Smi(0).to_v8(scope).unwrap().into();
+      func.call(scope, v8::undefined(scope).into(), &[arg]);
+    }
     result.await
   };
   let result = runtime.block_on(future);

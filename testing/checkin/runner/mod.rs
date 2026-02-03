@@ -34,6 +34,8 @@ mod ts_module_loader;
 
 mod mem_info;
 
+pub use extensions::node::ProcessExitEmitEvent;
+
 #[derive(Clone, Default)]
 pub struct Output {
   pub lines: Arc<Mutex<Vec<String>>>,

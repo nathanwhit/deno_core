@@ -1,5 +1,9 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
-import { op_set_constructors, op_set_next_tick_func } from "ext:core/ops";
+import {
+  op_set_constructors,
+  op_set_next_tick_func,
+  op_set_process_exit_event,
+} from "ext:core/ops";
 import {
   processTicksAndRejections,
   runNextTicks,
@@ -32,6 +36,7 @@ import * as compose from "ext:checkin_node/internal/streams/compose.js";
 import * as http from "node:http";
 import * as net from "node:net";
 import * as assert from "node:assert";
+import { dispatchProcessExitEvent } from "node:process";
 
 addAbortSignal;
 duplexify;
@@ -75,6 +80,7 @@ export function init(globalThis) {
   op_set_next_tick_func((func, recv, ...args) =>
     process.nextTick(func.bind(recv), ...args)
   );
+  op_set_process_exit_event(dispatchProcessExitEvent);
 }
 
 export default init;
