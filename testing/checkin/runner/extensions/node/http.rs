@@ -34,6 +34,8 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::sync::oneshot;
 
+use crate::checkin::runner::extensions::node::internalized;
+
 use super::GlobalHandle;
 use super::net::Server;
 use super::net::{EventEmitter, OnAccept, ServerInner};
@@ -188,18 +190,6 @@ async fn push_chunk_with_backpressure(
     let _ = tx.send(ok);
   });
   rx.await.unwrap_or(true)
-}
-
-fn internalized<'a>(
-  scope: &v8::PinScope<'a, '_>,
-  s: &str,
-) -> v8::Local<'a, v8::String> {
-  v8::String::new_from_one_byte(
-    scope,
-    s.as_bytes(),
-    v8::NewStringType::Internalized,
-  )
-  .unwrap()
 }
 
 fn finish_request(
