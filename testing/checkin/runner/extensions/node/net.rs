@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use socket2::SockRef;
 
 use crate::checkin::runner::extensions::node::GlobalHandle;
 use crate::checkin::runner::extensions::node::JsMethod;
@@ -203,8 +204,11 @@ struct SocketInner {
   connected: Rc<ConnectedState>,
   scope_holder: ScopeHolder,
   should_read: Rc<ShouldReadState>,
+  destroyed: AtomicBool,
 
   this: GlobalHandle<v8::Object>,
+  /// Lazily created handle object for _handle property
+  handle_obj: RefCell<Option<v8::Global<v8::Object>>>,
 
   push_func: JsMethod,
   emit_func: JsMethod,
@@ -627,10 +631,12 @@ impl Socket {
         host: RefCell::new(host),
         port: RefCell::new(port),
         this,
+        handle_obj: RefCell::new(None),
         ref_tracker: RefTracker::new(ops_tracker),
         connected: Rc::new(ConnectedState::new()),
         scope_holder,
         should_read: Rc::new(ShouldReadState::new()),
+        destroyed: AtomicBool::new(false),
         emit_func,
         on_event_func,
         next_tick_func,
@@ -715,6 +721,104 @@ impl Socket {
     self.inner.ref_tracker.unref();
   }
 
+  #[getter]
+  #[rename("_handle")]
+  fn handle<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> v8::Local<'a, v8::Value> {
+    // Return null if destroyed
+    if self.inner.destroyed.load(std::sync::atomic::Ordering::Relaxed) {
+      return v8::null(scope).into();
+    }
+
+    // Lazily create and cache the handle object
+    let mut handle_obj = self.inner.handle_obj.borrow_mut();
+    if let Some(ref obj) = *handle_obj {
+      return v8::Local::new(scope, obj).into();
+    }
+
+    // Create a simple handle object
+    let obj = v8::Object::new(scope);
+    *handle_obj = Some(v8::Global::new(scope, obj));
+    obj.into()
+  }
+
+  #[rename("setNoDelay")]
+  fn set_no_delay(&self, enable: Option<bool>) {
+    let enable = enable.unwrap_or(true);
+    if let Some(guard) = self.inner.write.try_borrow_mut() {
+      if let Some(write) = guard.as_ref() {
+        let sock = SockRef::from(write.as_ref());
+        let _ = sock.set_nodelay(enable);
+      }
+    }
+  }
+
+  #[rename("setKeepAlive")]
+  fn set_keep_alive(&self, enable: Option<bool>, initial_delay: Option<u32>) {
+    let enable = enable.unwrap_or(false);
+    if let Some(guard) = self.inner.write.try_borrow_mut() {
+      if let Some(write) = guard.as_ref() {
+        let sock = SockRef::from(write.as_ref());
+        let _ = sock.set_keepalive(enable);
+        if enable {
+          if let Some(delay_ms) = initial_delay {
+            let duration = std::time::Duration::from_millis(delay_ms as u64);
+            let _ = sock.set_tcp_keepalive(
+              &socket2::TcpKeepalive::new().with_time(duration),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  #[getter]
+  #[rename("bufferSize")]
+  fn buffer_size(&self) -> u32 {
+    0
+  }
+
+  #[getter]
+  #[rename("remoteAddress")]
+  fn remote_address<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> v8::Local<'a, v8::Value> {
+    if let Some(host) = self.inner.host.borrow().as_ref() {
+      v8::String::new(scope, host).unwrap().into()
+    } else {
+      v8::undefined(scope).into()
+    }
+  }
+
+  #[getter]
+  #[rename("remotePort")]
+  fn remote_port<'a>(
+    &self,
+    scope: &mut v8::PinScope<'a, '_>,
+  ) -> v8::Local<'a, v8::Value> {
+    if let Some(port) = *self.inner.port.borrow() {
+      v8::Integer::new(scope, port as i32).into()
+    } else {
+      v8::undefined(scope).into()
+    }
+  }
+
+  #[to_v8]
+  fn address(&self) -> Option<SocketAddress> {
+    let host = self.inner.host.borrow();
+    let port = *self.inner.port.borrow();
+    match (&*host, port) {
+      (Some(host), Some(port)) => Some(SocketAddress {
+        address: host.to_string(),
+        port,
+      }),
+      _ => None,
+    }
+  }
+
   #[rename("_final")]
   fn final_(&self, #[global] cb: v8::Global<v8::Function>) {
     let inner = self.inner.clone();
@@ -743,6 +847,12 @@ impl Socket {
     self.inner.cancel.cancel();
     self.inner.should_read.clear_should_read();
     self.inner.connected.set_connected(false);
+    self
+      .inner
+      .destroyed
+      .store(true, std::sync::atomic::Ordering::Relaxed);
+    // Clear the handle object so _handle returns null
+    self.inner.handle_obj.borrow_mut().take();
     let inner = self.inner.clone();
 
     deno_core::unsync::spawn(async move {
@@ -1221,6 +1331,12 @@ pub(crate) struct ServerInner {
 
 #[derive(deno_core::ToV8)]
 pub struct ServerAddress {
+  pub address: String,
+  pub port: u16,
+}
+
+#[derive(deno_core::ToV8)]
+pub struct SocketAddress {
   pub address: String,
   pub port: u16,
 }

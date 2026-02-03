@@ -31,6 +31,7 @@ hyper-util = { version = "0.1.10", features = ["tokio"] }
 indexmap = "2"
 libc.workspace = true
 smallvec.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true

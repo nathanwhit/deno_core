@@ -746,6 +746,7 @@ dependencies = [
  "pretty_assertions",
  "prettyplease",
  "smallvec",
+ "socket2",
  "testing_macros",
  "thiserror 2.0.12",
  "tokio",
