@@ -16,6 +16,7 @@ use deno_core::serde_v8::V8Slice;
 use deno_core::v8;
 use deno_core::v8::cppgc::Traced;
 use deno_error::JsErrorBox;
+use socket2::SockRef;
 use std::cell::RefCell;
 use std::ops::DerefMut;
 use std::rc::Rc;
@@ -24,7 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use socket2::SockRef;
 
 use crate::checkin::runner::extensions::node::GlobalHandle;
 use crate::checkin::runner::extensions::node::JsMethod;
@@ -728,7 +728,11 @@ impl Socket {
     scope: &mut v8::PinScope<'a, '_>,
   ) -> v8::Local<'a, v8::Value> {
     // Return null if destroyed
-    if self.inner.destroyed.load(std::sync::atomic::Ordering::Relaxed) {
+    if self
+      .inner
+      .destroyed
+      .load(std::sync::atomic::Ordering::Relaxed)
+    {
       return v8::null(scope).into();
     }
 

@@ -5,6 +5,10 @@ function inspect(obj) {
   return JSON.stringify(obj);
 }
 
+function noop() {}
+
+const localhostIPv4 = "127.0.0.1";
+
 const mustCallChecks = [];
 
 function runCallChecks(exitCode) {
@@ -34,6 +38,18 @@ function runCallChecks(exitCode) {
 
 function mustCall(fn, exact) {
   return _mustCallInner(fn, exact, "exact");
+}
+
+function mustNotCall(msg) {
+  const callSite = inspect(new Error());
+  return function mustNotCall(...args) {
+    const argsInfo = args.length > 0
+      ? `\ncalled with arguments: ${args.map((arg) => inspect(arg)).join(", ")}`
+      : "";
+    throw new Error(
+      `${msg || "function should not have been called"} at ${callSite}${argsInfo}`,
+    );
+  };
 }
 
 function _mustCallInner(fn, criteria = 1, field) {
@@ -88,5 +104,7 @@ function _mustCallInner(fn, criteria = 1, field) {
 }
 
 module.exports = {
+  localhostIPv4,
   mustCall,
+  mustNotCall,
 };
