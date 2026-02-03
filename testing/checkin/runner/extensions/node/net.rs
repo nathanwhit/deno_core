@@ -9,6 +9,7 @@ use deno_core::ToV8;
 use deno_core::convert::Smi;
 use deno_core::convert::Uint8Array;
 use deno_core::error::JsError;
+use deno_core::error::dispatch_exception;
 use deno_core::op2;
 use deno_core::serde;
 use deno_core::serde_v8::V8Slice;
@@ -1607,9 +1608,15 @@ pub trait EventEmitter: GetThis {
     scope: &mut v8::PinScope,
     args: &[v8::Local<v8::Value>],
   ) {
-    let this = self.this(scope);
-    let emit_func = self.cached_emit_func(scope);
-    emit_func.call(scope, this.into(), args);
+    v8::tc_scope!(let tc_scope, scope);
+    let this = self.this(tc_scope);
+    let emit_func = self.cached_emit_func(tc_scope);
+    let result = emit_func.call(tc_scope, this.into(), args);
+    if result.is_none() {
+      if let Some(exception) = tc_scope.exception() {
+        dispatch_exception(tc_scope, exception, false);
+      }
+    }
   }
   fn cached_on_event_func<'s>(
     &self,
