@@ -44,15 +44,32 @@ pub(crate) fn generate_dispatch_slow_call(
   // the scope/opstate in the intermediate stages.
   let mut args = TokenStream::new();
   let mut deferred = TokenStream::new();
+  // HandleScope bindings (`let argN = &mut scope;`) must come last among
+  // deferred args. Other deferred args like #[this] temporarily borrow scope
+  // and release it, but the HandleScope binding creates a long-lived &mut
+  // borrow that would conflict if emitted first.
+  let mut deferred_scope = TokenStream::new();
 
   for (index, (arg, attrs)) in signature.args.iter().enumerate() {
-    let arg_span = signature.arg_spans.get(index).copied().unwrap_or_else(Span::call_site);
+    let arg_span = signature
+      .arg_spans
+      .get(index)
+      .copied()
+      .unwrap_or_else(Span::call_site);
     let arg_mapped = from_arg(generator_state, index, arg, &signature.ret_val)
       .map_err(|s| {
-        V8SignatureMappingError::NoArgMapping(arg_span, s, Box::new(arg.clone()))
+        V8SignatureMappingError::NoArgMapping(
+          arg_span,
+          s,
+          Box::new(arg.clone()),
+        )
       })?;
     if arg.is_virtual() {
-      deferred.extend(arg_mapped);
+      if matches!(arg, Arg::Ref(_, Special::HandleScope)) {
+        deferred_scope.extend(arg_mapped);
+      } else {
+        deferred.extend(arg_mapped);
+      }
     } else {
       args.extend(extract_arg(generator_state, attrs, index, input_index));
       args.extend(arg_mapped);
@@ -61,6 +78,7 @@ pub(crate) fn generate_dispatch_slow_call(
   }
 
   args.extend(deferred);
+  args.extend(deferred_scope);
   args.extend(call(generator_state, &signature.ret_val));
   Ok(args)
 }
@@ -661,8 +679,8 @@ pub fn from_arg(
     }
     Arg::FromV8(ty, true) => {
       *needs_scope = true;
-      let ty =
-        syn::parse_str::<syn::Type>(ty).map_err(|_| "failed to reparse type")?;
+      let ty = syn::parse_str::<syn::Type>(ty)
+        .map_err(|_| "failed to reparse type")?;
       let scope = scope.clone();
       let err = format_ident!("{}_err", arg_ident);
       let throw_exception = throw_type_error_string(generator_state, &err);
@@ -681,8 +699,8 @@ pub fn from_arg(
       }
     }
     Arg::FromV8(ty, false) => {
-      let ty =
-        syn::parse_str::<syn::Type>(ty).map_err(|_| "failed to reparse type")?;
+      let ty = syn::parse_str::<syn::Type>(ty)
+        .map_err(|_| "failed to reparse type")?;
       let err = format_ident!("{}_err", arg_ident);
       let throw_exception = throw_type_error_string(generator_state, &err);
       quote! {
@@ -696,8 +714,8 @@ pub fn from_arg(
     }
     Arg::WebIDL(ty, options, default) => {
       *needs_scope = true;
-      let ty =
-        syn::parse_str::<syn::Type>(ty).map_err(|_| "failed to reparse type")?;
+      let ty = syn::parse_str::<syn::Type>(ty)
+        .map_err(|_| "failed to reparse type")?;
       let scope = scope.clone();
       let err = format_ident!("{}_err", arg_ident);
       let throw_exception = throw_type_error_string(generator_state, &err);
@@ -798,8 +816,8 @@ pub fn from_arg(
 
       let scope = &generator_state.scope;
       let try_unwrap_cppgc = &generator_state.try_unwrap_cppgc;
-      let ty =
-        syn::parse_str::<syn::Path>(ty).map_err(|_| "failed to reparse type")?;
+      let ty = syn::parse_str::<syn::Path>(ty)
+        .map_err(|_| "failed to reparse type")?;
       if ret_val.is_async() {
         let tokens = quote! {
           let Some(mut #arg_ident) = deno_core::_ops::#try_unwrap_cppgc::<#ty>(&mut #scope, #from_ident) else {
@@ -824,8 +842,8 @@ pub fn from_arg(
       *needs_scope = true;
       let throw_exception =
         throw_type_error(generator_state, format!("expected {}", &ty));
-      let ty =
-        syn::parse_str::<syn::Path>(ty).map_err(|_| "failed to reparse type")?;
+      let ty = syn::parse_str::<syn::Path>(ty)
+        .map_err(|_| "failed to reparse type")?;
       let scope = &generator_state.scope;
       let try_unwrap_cppgc = &generator_state.try_unwrap_cppgc;
       if ret_val.is_async() {
