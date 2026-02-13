@@ -2325,7 +2325,7 @@ impl EventLoopPendingState {
   }
 
   pub fn is_pending(&self) -> bool {
-    self.has_pending_refed_ops
+    let result = self.has_pending_refed_ops
       || self.has_pending_dyn_imports
       || self.has_pending_dyn_module_evaluation
       || self.has_pending_module_evaluation
@@ -2333,7 +2333,8 @@ impl EventLoopPendingState {
       || self.has_tick_scheduled
       || self.has_refed_immediates > 0
       || self.has_pending_promise_events
-      || self.has_pending_external_ops
+      || self.has_pending_external_ops;
+    result
   }
 }
 

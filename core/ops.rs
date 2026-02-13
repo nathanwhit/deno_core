@@ -209,6 +209,7 @@ impl OpCtx {
 #[derive(Debug, Clone)]
 pub struct ExternalOpsTracker {
   counter: Arc<AtomicUsize>,
+  waker: Arc<AtomicWaker>,
 }
 
 impl ExternalOpsTracker {
@@ -217,12 +218,19 @@ impl ExternalOpsTracker {
   }
 
   pub fn unref_op(&self) {
-    let _ =
+    let result =
       self
         .counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
           if x == 0 { None } else { Some(x - 1) }
         });
+    if let Ok(prev) = result {
+      if prev == 1 {
+        // Counter went from 1 → 0. Wake the event loop so it can
+        // re-check `has_pending_ops()` and potentially exit.
+        self.waker.wake();
+      }
+    }
   }
 
   pub(crate) fn has_pending_ops(&self) -> bool {
@@ -250,13 +258,15 @@ pub struct OpState {
 
 impl OpState {
   pub fn new(op_stack_trace_callback: Option<OpStackTraceCallback>) -> OpState {
+    let waker = Arc::new(AtomicWaker::new());
     OpState {
       resource_table: Default::default(),
       gotham_state: Default::default(),
-      waker: Arc::new(AtomicWaker::new()),
       external_ops_tracker: ExternalOpsTracker {
         counter: Arc::new(AtomicUsize::new(0)),
+        waker: waker.clone(),
       },
+      waker,
       op_stack_trace_callback,
       unrefed_ops: Default::default(),
       unrefed_resources: Default::default(),
